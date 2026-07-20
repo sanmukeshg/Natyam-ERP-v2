@@ -171,16 +171,28 @@ node tools/check-fields.cjs     # record fields read that are never written
 npm install fake-indexeddb jsdom   # test dependencies only
 node tools/smoke.mjs            # 31 service tests against a real database
 node tools/render-qa.mjs        # 48 DOM tests: every page, control and form
+node tools/navigation-qa.mjs    # 25 tests: the real router, driven by the URL
 ```
 
 The application itself has no dependencies. `fake-indexeddb` and `jsdom` exist
 solely so the suites can run outside a browser and are never shipped to users.
 
-**Run both suites before every release.** Between them they have caught a backup
-format defect that would have destroyed a school's database on restore, four
-capability strings that silently disabled features for every role, and three
-screens whose field names disagreed with the records they displayed. None of
+**Run all three suites before every release.** Between them they have caught a
+backup format defect that would have destroyed a school's database on restore,
+four capability strings that silently disabled features for every role, three
+screens whose field names disagreed with the records they displayed, and a
+routing defect that sent fifteen of sixteen screens to the dashboard. None of
 those were visible by reading the code.
+
+`navigation-qa.mjs` earns its place separately from `render-qa.mjs`, and the
+distinction matters. The render suite constructs pages directly — `new
+StudentsPage().render(container)` — which proves each page works but never asks
+the router *which page a URL resolves to*. That gap hid a live outage: a stray
+`/:id` pattern matched every top-level path, so every sidebar click changed the
+URL, highlighted the right item, logged no error, and rendered the dashboard.
+The navigation suite never constructs a page. It sets `window.location.hash` and
+asserts the viewport contents actually became the right screen. If you add a
+route, add it to `NAVIGATION` and this suite will cover it automatically.
 
 `check-fields.cjs` is a heuristic and reports false positives — computed and
 service-decorated fields legitimately appear. It is meant to produce a short
@@ -190,7 +202,7 @@ list worth eyeballing, not a verdict.
 
 ## Known limitations
 
-- **No real-browser test pass.** Both suites run against jsdom, which has no
+- **No real-browser test pass.** All three suites run against jsdom, which has no
   layout engine. Logic, wiring, event handling and accessibility structure are
   covered; nothing visual is. Anything depending on measured geometry —
   sticky positioning, scroll containers, print pagination — should be checked by
