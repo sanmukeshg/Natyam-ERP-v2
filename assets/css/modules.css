@@ -1,0 +1,535 @@
+/* ============================================================================
+   NATYAM ERP 2.0 — MODULE STYLES
+   ----------------------------------------------------------------------------
+   Patterns that belong to one screen and would be noise in components.css:
+   the attendance register, the weekly timetable, the report browser, the
+   notification feed and the command palette.
+
+   Everything here uses the same tokens as the shared components. A module is
+   allowed its own layout; it is not allowed its own colours or spacing scale.
+   ============================================================================ */
+
+/* ============================================================================
+   ATTENDANCE REGISTER
+   ----------------------------------------------------------------------------
+   Designed for a teacher marking forty children on a phone, standing up, with
+   the class in front of them. The touch targets are deliberately large and the
+   marks are a single row of buttons rather than a dropdown: one tap per child,
+   no menus, no scrolling sideways.
+   ============================================================================ */
+
+.register {
+    display: flex;
+    flex-direction: column;
+}
+
+.register-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+}
+.register-row:last-child { border-bottom: 0; }
+.register-row:hover { background: var(--surface-hover); }
+
+.register-who { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
+.register-who .avatar { flex-shrink: 0; }
+
+.register-marks { display: flex; gap: var(--space-1); flex-shrink: 0; }
+
+.mark-btn {
+    width: 38px;
+    height: 38px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-semibold);
+    color: var(--text-tertiary);
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: background-color var(--duration-fast) var(--ease-standard),
+                color var(--duration-fast) var(--ease-standard),
+                border-color var(--duration-fast) var(--ease-standard);
+}
+.mark-btn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text-primary); }
+.mark-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.mark-btn.is-active[data-tone="positive"] {
+    background: var(--success-500); border-color: var(--success-500); color: #fff;
+}
+.mark-btn.is-active[data-tone="negative"] {
+    background: var(--danger-500); border-color: var(--danger-500); color: #fff;
+}
+.mark-btn.is-active[data-tone="caution"] {
+    background: var(--warning-500); border-color: var(--warning-500); color: #fff;
+}
+.mark-btn.is-active[data-tone="neutral"] {
+    background: var(--surface-inverse); border-color: var(--surface-inverse); color: var(--text-inverse);
+}
+
+/* The compact dot used in the month grid, where forty rows must fit a screen. */
+.mark-dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: var(--radius-full);
+    background: var(--surface-sunken);
+}
+.mark-dot[data-tone="positive"] { background: var(--success-500); }
+.mark-dot[data-tone="negative"] { background: var(--danger-500); }
+.mark-dot[data-tone="caution"]  { background: var(--warning-500); }
+.mark-dot[data-tone="neutral"]  { background: var(--neutral-300); }
+
+/* ============================================================================
+   TIMETABLE
+   ============================================================================ */
+
+.timetable {
+    display: grid;
+    gap: var(--space-3);
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.timetable-day {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    background: var(--surface-sunken);
+    border-radius: var(--radius-md);
+    min-height: 120px;
+}
+
+.timetable-day-label {
+    font-size: var(--text-2xs);
+    font-weight: var(--weight-semibold);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-caps);
+    color: var(--text-tertiary);
+}
+
+.timetable-slot {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: var(--space-2);
+    background: var(--surface-raised);
+    border: 1px solid var(--border-subtle);
+    border-left: 3px solid var(--accent-border);
+    border-radius: var(--radius-sm);
+    font-size: var(--text-xs);
+    cursor: pointer;
+    transition: box-shadow var(--duration-fast) var(--ease-standard);
+}
+.timetable-slot:hover { box-shadow: var(--shadow-sm); }
+
+.timetable-time {
+    display: block;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-tertiary);
+    font-size: var(--text-2xs);
+}
+
+/* ============================================================================
+   REPORTS
+   ----------------------------------------------------------------------------
+   A catalogue beside a result. The catalogue is a fixed rail because the point
+   of this screen is running several reports in a row and comparing them; a
+   dropdown would hide the choice you just made.
+   ============================================================================ */
+
+.report-layout {
+    display: grid;
+    gap: var(--space-5);
+    grid-template-columns: 240px minmax(0, 1fr);
+    align-items: start;
+}
+
+.report-nav {
+    position: sticky;
+    top: calc(var(--header-height) + var(--space-4));
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    max-height: calc(100dvh - var(--header-height) - var(--space-8));
+    overflow-y: auto;
+}
+
+.report-main { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+
+.report-group { display: flex; flex-direction: column; }
+
+.report-group-title {
+    font-size: var(--text-2xs);
+    font-weight: var(--weight-semibold);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-caps);
+    color: var(--text-tertiary);
+    padding: 0 var(--space-2) var(--space-2);
+}
+
+.report-list { display: flex; flex-direction: column; gap: 1px; list-style: none; margin: 0; padding: 0; }
+
+.report-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 100%;
+    text-align: left;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: background-color var(--duration-fast) var(--ease-standard);
+}
+.report-item:hover { background: var(--surface-hover); }
+.report-item.is-active {
+    background: var(--accent-subtle);
+    border-color: var(--accent-border);
+    color: var(--accent-text);
+}
+.report-item .type-caption {
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+}
+
+.report-meta {
+    padding: var(--space-3) var(--space-4);
+    background: var(--surface-sunken);
+    border-radius: var(--radius-md);
+    font-size: var(--text-xs);
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.report-total { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+
+/* ============================================================================
+   NOTIFICATIONS
+   ============================================================================ */
+
+.notice-list { list-style: none; margin: 0; padding: 0; }
+
+.notice {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+}
+.notice:last-child { border-bottom: 0; }
+.notice:hover { background: var(--surface-hover); }
+
+/* An unread notice carries a coloured edge rather than a bold background:
+   twenty bold rows is not emphasis, it is noise. */
+.notice.is-unread { border-left: 3px solid var(--accent-border); }
+.notice.is-unread[data-tone="negative"] { border-left-color: var(--danger-500); }
+.notice.is-unread[data-tone="caution"]  { border-left-color: var(--warning-500); }
+.notice.is-unread[data-tone="positive"] { border-left-color: var(--success-500); }
+
+.notice-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px; height: 28px;
+    flex-shrink: 0;
+    border-radius: var(--radius-md);
+    background: var(--surface-sunken);
+    color: var(--text-tertiary);
+}
+.notice[data-tone="negative"] .notice-icon { background: var(--danger-50); color: var(--danger-600); }
+.notice[data-tone="caution"]  .notice-icon { background: var(--warning-50); color: var(--warning-600); }
+.notice[data-tone="positive"] .notice-icon { background: var(--success-50); color: var(--success-600); }
+
+.notice-body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+    cursor: pointer;
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+}
+
+.notice-title { font-weight: var(--weight-medium); color: var(--text-primary); }
+.notice-text  { font-size: var(--text-xs); color: var(--text-secondary); }
+.notice-meta  { display: flex; align-items: center; gap: var(--space-2); margin-top: 2px; }
+
+.announcement {
+    padding: var(--space-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+.announcement.is-pinned {
+    border-color: var(--brand-gold-300);
+    background: var(--brand-gold-100);
+}
+
+/* ============================================================================
+   COMMAND PALETTE
+   ----------------------------------------------------------------------------
+   shell.css styles the .cmd-* palette; these are the .palette-* elements the
+   runtime builds. Kept visually identical so the two can be reconciled into
+   one set later without a redesign.
+   ============================================================================ */
+
+.palette-region {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-palette);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 12vh;
+    background: var(--surface-scrim);
+    animation: palette-in var(--duration-fast) var(--ease-entrance);
+}
+.palette-region[hidden] { display: none; }
+
+@keyframes palette-in { from { opacity: 0; } to { opacity: 1; } }
+
+.palette {
+    width: min(620px, calc(100vw - var(--space-8)));
+    max-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface-overlay);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-xl);
+    overflow: hidden;
+}
+
+.palette-input-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+}
+.palette-input-icon { color: var(--text-tertiary); display: inline-flex; }
+
+.palette-input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: none;
+    font-size: var(--text-md);
+    color: var(--text-primary);
+    outline: none;
+}
+.palette-input::placeholder { color: var(--text-tertiary); }
+
+.palette-hint {
+    font-size: var(--text-2xs);
+    color: var(--text-tertiary);
+    padding: 2px var(--space-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+}
+
+.palette-results { flex: 1; overflow-y: auto; padding: var(--space-2); }
+
+.palette-group {
+    font-size: var(--text-2xs);
+    font-weight: var(--weight-semibold);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-caps);
+    color: var(--text-tertiary);
+    padding: var(--space-3) var(--space-3) var(--space-1);
+}
+
+.palette-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    width: 100%;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    text-align: left;
+    background: none;
+    border: 0;
+    font: inherit;
+    color: inherit;
+}
+.palette-item.is-active { background: var(--surface-selected); }
+.palette-item-icon { color: var(--text-tertiary); display: inline-flex; flex-shrink: 0; }
+.palette-item-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.palette-item-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.palette-item-hint  { font-size: var(--text-2xs); color: var(--text-tertiary); }
+
+.palette-enter {
+    font-size: var(--text-2xs);
+    color: var(--text-tertiary);
+    padding: 1px var(--space-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+}
+
+.palette-empty { padding: var(--space-8) var(--space-4); text-align: center; }
+
+.palette-footer {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    padding: var(--space-2) var(--space-4);
+    border-top: 1px solid var(--border-subtle);
+    background: var(--surface-sunken);
+    font-size: var(--text-2xs);
+    color: var(--text-tertiary);
+}
+.palette-footer kbd {
+    padding: 1px 5px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-xs);
+    background: var(--surface-raised);
+    margin-right: 2px;
+}
+
+/* ============================================================================
+   SHELL SUPPORT
+   ============================================================================ */
+
+.viewport { flex: 1; display: flex; flex-direction: column; min-width: 0; outline: none; }
+
+.nav-list { list-style: none; margin: 0; padding: 0; }
+
+.scrim {
+    position: fixed;
+    inset: 0;
+    background: var(--surface-scrim);
+    z-index: var(--z-sidebar);
+    border: 0;
+}
+.scrim[hidden] { display: none; }
+
+/* Prevents the page behind an overlay from scrolling under it. */
+.has-overlay { overflow: hidden; }
+
+/* ============================================================================
+   FATAL ERROR
+   ----------------------------------------------------------------------------
+   Shown when the database will not open. Styled with its own values rather
+   than tokens, because the reason it is on screen may be that nothing else
+   loaded.
+   ============================================================================ */
+
+.fatal {
+    max-width: 520px;
+    margin: 12vh auto;
+    padding: 32px;
+    text-align: center;
+    font-family: system-ui, sans-serif;
+    color: #14141c;
+}
+.fatal h1 { font-size: 20px; margin-bottom: 12px; color: #b4231f; }
+.fatal p  { font-size: 14px; line-height: 1.6; color: #5c5c6e; margin-bottom: 12px; }
+.fatal pre {
+    text-align: left;
+    padding: 12px;
+    background: #f3f3f0;
+    border-radius: 8px;
+    font-size: 12px;
+    overflow-x: auto;
+    margin-bottom: 12px;
+}
+.fatal button {
+    padding: 8px 18px;
+    font-size: 14px;
+    color: #fff;
+    background: #2f2a6b;
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+/* ============================================================================
+   RESPONSIVE
+   ----------------------------------------------------------------------------
+   The sidebar becomes an overlay below 900px, and the multi-column layouts
+   collapse to one. A school office runs this on a laptop; teachers open it on
+   a phone at the side of the hall, and the register has to work there.
+   ============================================================================ */
+
+@media (max-width: 1100px) {
+    .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .report-layout { grid-template-columns: 200px minmax(0, 1fr); }
+}
+
+@media (max-width: 900px) {
+    .app-shell { grid-template-columns: minmax(0, 1fr); }
+
+    .app-sidebar {
+        position: fixed;
+        top: 0; bottom: 0; left: 0;
+        width: var(--sidebar-width);
+        transform: translateX(-100%);
+        transition: transform var(--duration-normal) var(--ease-standard);
+    }
+    .app-shell[data-nav="open"] .app-sidebar { transform: translateX(0); }
+
+    .header-nav-toggle { display: inline-flex; }
+
+    .grid-2, .grid-3, .grid-2-1 { grid-template-columns: minmax(0, 1fr); }
+
+    .report-layout { grid-template-columns: minmax(0, 1fr); }
+    .report-nav { position: static; max-height: none; }
+    .report-list { flex-direction: row; overflow-x: auto; gap: var(--space-2); }
+    .report-item { min-width: 180px; }
+
+    .profile-btn .brand-text { display: none; }
+    .header-search-btn span { display: none; }
+}
+
+@media (max-width: 640px) {
+    .grid-4, .grid-6 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+    .page-header { flex-direction: column; align-items: stretch; }
+    .page-actions { width: 100%; }
+
+    /* The register stacks its marks under the name rather than shrinking the
+       touch targets, which is the one thing that must not get smaller. */
+    .register-row { flex-direction: column; align-items: stretch; gap: var(--space-2); }
+    .register-marks { justify-content: space-between; }
+    .mark-btn { flex: 1; }
+
+    .palette-region { padding-top: 0; }
+    .palette { width: 100vw; max-height: 100dvh; height: 100dvh; border-radius: 0; }
+}
+
+/* ============================================================================
+   MOTION AND PRINT
+   ============================================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
+}
+
+@media print {
+    .app-sidebar, .app-header, .app-footer, .page-actions,
+    .filter-bar, .table-toolbar, .pagination, .palette-region { display: none !important; }
+
+    .app-shell { grid-template-columns: minmax(0, 1fr); }
+    .card { border: 1px solid #ddd; box-shadow: none; break-inside: avoid; }
+    .page-body { padding: 0; }
+}

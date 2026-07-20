@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="NATYAM">
+    <rect width="512" height="512" rx="96" fill="#2f2a6b"/>
+    <!-- A stylised ghungroo: the bells worn at the ankle, which is the one
+         object every Kuchipudi student owns and recognises instantly. -->
+    <circle cx="256" cy="196" r="86" fill="none" stroke="#c9a227" stroke-width="18"/>
+    <circle cx="256" cy="196" r="34" fill="#c9a227"/>
+    <path d="M120 330h272" stroke="#c9a227" stroke-width="18" stroke-linecap="round"/>
+    <circle cx="152" cy="378" r="26" fill="#d97757"/>
+    <circle cx="224" cy="392" r="26" fill="#d97757"/>
+    <circle cx="296" cy="392" r="26" fill="#d97757"/>
+    <circle cx="368" cy="378" r="26" fill="#d97757"/>
+</svg>
