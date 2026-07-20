@@ -45,6 +45,20 @@ function serialise(value) {
 
 /** Renders an html`` result into a container. */
 export function render(container, content) {
+    // A missing target is a normal outcome, not a programming error. Pages
+    // render into named regions of their own markup after an await:
+    //
+    //     const data = await service();
+    //     render(this.container.querySelector('[data-role="body"]'), view(data));
+    //
+    // If the person navigated away while that request was in flight, the router
+    // has already replaced the viewport and the region no longer exists. There
+    // is nothing to update and nobody to show it to, so the only correct
+    // behaviour is to discard the content. Throwing here produced a console
+    // error on five screens and a half-written page on none of them, because
+    // the write was landing nowhere either way.
+    if (!container) return null;
+
     container.innerHTML = content instanceof RawHtml ? content.value : escapeHtml(content);
     return container;
 }

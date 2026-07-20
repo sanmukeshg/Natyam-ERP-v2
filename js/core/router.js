@@ -41,7 +41,20 @@ class Router {
      * @param {string}  [options.title]
      */
     register(pattern, options) {
-        this.routes.push({ pattern, ...options, matcher: compile(pattern) });
+        this.routes.push({
+            pattern,
+            ...options,
+            matcher: compile(pattern),
+            shape: shapeOf(pattern)
+        });
+
+        // Kept in specificity order so matching never depends on the order
+        // routes happened to be registered in. A single misplaced ':param'
+        // route used to shadow every static route registered after it, and the
+        // failure was invisible: the shadowing route rendered perfectly well,
+        // just for the wrong URL. Sorting here makes that impossible rather
+        // than merely unlikely.
+        this.routes.sort(bySpecificity);
         return this;
     }
 
@@ -266,6 +279,28 @@ class Router {
  * Deliberately tiny: this app has fewer than thirty routes and none of them
  * need optional segments or wildcards.
  */
+/**
+ * A route's shape: 0 for a literal segment, 1 for a parameter. '/students/:id'
+ * is [0, 1]. Used to rank routes, since a literal is always more specific than
+ * a parameter at the same position.
+ */
+function shapeOf(pattern) {
+    return pattern.split('/').filter(Boolean).map((s) => (s.startsWith(':') ? 1 : 0));
+}
+
+/**
+ * Longer patterns first, then literals before parameters position by position,
+ * so '/students/new' wins over '/students/:id' and '/students' can never be
+ * captured by '/:anything'.
+ */
+function bySpecificity(a, b) {
+    if (a.shape.length !== b.shape.length) return b.shape.length - a.shape.length;
+    for (let i = 0; i < a.shape.length; i += 1) {
+        if (a.shape[i] !== b.shape[i]) return a.shape[i] - b.shape[i];
+    }
+    return 0;
+}
+
 function compile(pattern) {
     const segments = pattern.split('/').filter(Boolean);
 
@@ -298,6 +333,16 @@ export class Page {
         this.events = bus.scope();
         this.disposers = [];
         this.container = null;
+
+        /**
+         * Set once the router has moved on. A page's in-flight work outlives
+         * the page — a slow query started before the user clicked away will
+         * still resolve — and anything user-visible it does at that point
+         * belongs to a screen nobody is looking at. DOM writes discard
+         * themselves harmlessly, but a toast or a redirect would not, so
+         * long-running handlers should check this before acting.
+         */
+        this.disposed = false;
     }
 
     /** Registers a teardown function. */
@@ -308,6 +353,7 @@ export class Page {
     }
 
     destroy() {
+        this.disposed = true;
         this.events.dispose();
         this.disposers.forEach((fn) => {
             try { fn(); } catch (err) { console.error('disposer failed', err); }

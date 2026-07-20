@@ -80,8 +80,17 @@ function registerRoutes() {
 
         // Detail routes are registered alongside their list route so a page can
         // own both /students and /students/:id without a second config entry.
-        if (route.detail !== false) {
-            router.register(`${route.path === '/' ? '' : route.path}/:id`, {
+        //
+        // The root route is excluded deliberately. Appending '/:id' to '/' does
+        // not produce '//:id' — it produces '/:id', a single-segment catch-all
+        // that matches /students, /fees and every other top-level path. Because
+        // the dashboard is registered first and the matcher takes the first
+        // hit, that one pattern silently routed fifteen of sixteen screens to
+        // the dashboard: the URL changed, the sidebar highlighted, nothing
+        // errored, and the content never moved. The dashboard has no detail
+        // view, so there is nothing to register.
+        if (route.detail !== false && route.path !== '/') {
+            router.register(`${route.path}/:id`, {
                 load: route.load,
                 cap: route.cap,
                 title: route.label
