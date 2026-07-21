@@ -1,0 +1,260 @@
+/* ============================================================================
+   NATYAM ERP 2.0 — BASE LAYER
+   Reset, document defaults, typography, layout primitives, utilities.
+   Depends on tokens.css. Contains no component styling.
+   ============================================================================ */
+
+/* ------------------------------------------------------------------- RESET */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, div, span, h1, h2, h3, h4, h5, h6, p, blockquote, pre,
+a, abbr, address, cite, code, del, dfn, em, img, ins, kbd, q, samp,
+small, strong, sub, sup, var, b, i, dl, dt, dd, ol, ul, li,
+fieldset, form, label, legend, table, caption, tbody, tfoot, thead,
+tr, th, td, article, aside, canvas, details, figcaption, figure,
+footer, header, menu, nav, output, section, summary {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    font: inherit;
+    vertical-align: baseline;
+}
+
+html {
+    font-size: 16px;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+}
+
+body {
+    font-family: var(--font-ui);
+    font-size: var(--text-base);
+    font-weight: var(--weight-regular);
+    line-height: var(--leading-normal);
+    letter-spacing: var(--tracking-tight);
+    color: var(--text-primary);
+    background: var(--surface-canvas);
+    min-height: 100vh;
+    min-height: 100dvh;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-variant-numeric: tabular-nums;
+    transition: background-color var(--duration-normal) var(--ease-standard),
+                color var(--duration-normal) var(--ease-standard);
+}
+
+ol, ul { list-style: none; }
+table { border-collapse: collapse; border-spacing: 0; width: 100%; }
+img, svg, video, canvas { display: block; max-width: 100%; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { background: none; cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+a { color: var(--text-link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+[hidden], .hidden { display: none !important; }
+
+/* -------------------------------------------------------------- TYPOGRAPHY */
+
+h1, h2, h3, h4, h5, h6 {
+    font-weight: var(--weight-semibold);
+    line-height: var(--leading-tight);
+    letter-spacing: var(--tracking-tight);
+    color: var(--text-primary);
+}
+
+.type-page-title  { font-size: var(--text-xl);  font-weight: var(--weight-semibold); line-height: var(--leading-tight); }
+.type-section     { font-size: var(--text-lg);  font-weight: var(--weight-semibold); line-height: var(--leading-snug); }
+.type-card-title  { font-size: var(--text-md);  font-weight: var(--weight-semibold); line-height: var(--leading-snug); }
+.type-body        { font-size: var(--text-base); line-height: var(--leading-normal); }
+.type-body-sm     { font-size: var(--text-sm);  line-height: var(--leading-normal); }
+.type-caption     { font-size: var(--text-xs);  line-height: var(--leading-snug); color: var(--text-secondary); }
+.type-micro       { font-size: var(--text-2xs); line-height: var(--leading-snug); color: var(--text-tertiary); }
+
+/* Eyebrow labels above KPI figures and section groups. Uppercase carries the
+   hierarchy so the figure below it can stay unadorned. */
+.type-eyebrow {
+    font-size: var(--text-2xs);
+    font-weight: var(--weight-semibold);
+    letter-spacing: var(--tracking-caps);
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+}
+
+/* Figures, currency and counts. Tabular so columns of numbers align. */
+.type-figure {
+    font-size: var(--text-2xl);
+    font-weight: var(--weight-semibold);
+    line-height: var(--leading-tight);
+    letter-spacing: var(--tracking-tight);
+    font-variant-numeric: tabular-nums;
+}
+
+.type-mono {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    letter-spacing: var(--tracking-normal);
+}
+
+/* Reserved for the wordmark and certificate output. Not a UI face. */
+.type-display {
+    font-family: var(--font-display);
+    font-weight: var(--weight-semibold);
+    letter-spacing: var(--tracking-normal);
+}
+
+.text-muted     { color: var(--text-secondary); }
+.text-subtle    { color: var(--text-tertiary); }
+.text-success   { color: var(--success-500); }
+.text-warning   { color: var(--warning-600); }
+.text-danger    { color: var(--danger-500); }
+.text-accent    { color: var(--accent-text); }
+.text-right     { text-align: right; }
+.text-center    { text-align: center; }
+.text-nowrap    { white-space: nowrap; }
+.text-truncate  { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+.text-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+/* -------------------------------------------------------- FOCUS & A11Y */
+
+/* Mouse users never see a ring; keyboard users always do. */
+:focus { outline: none; }
+
+:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+}
+
+.sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+.skip-link {
+    position: fixed;
+    top: var(--space-2);
+    left: -9999px;
+    z-index: var(--z-boot);
+    padding: var(--space-3) var(--space-5);
+    background: var(--surface-raised);
+    color: var(--accent-text);
+    font-weight: var(--weight-semibold);
+    border: 1px solid var(--accent-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+}
+.skip-link:focus { left: var(--space-2); text-decoration: none; }
+
+/* --------------------------------------------------------- LAYOUT PRIMITIVES */
+
+.stack        { display: flex; flex-direction: column; }
+.stack-1      { gap: var(--space-1); }
+.stack-2      { gap: var(--space-2); }
+.stack-3      { gap: var(--space-3); }
+.stack-4      { gap: var(--space-4); }
+.stack-6      { gap: var(--space-6); }
+.stack-8      { gap: var(--space-8); }
+
+.row          { display: flex; align-items: center; }
+.row-start    { align-items: flex-start; }
+.row-baseline { align-items: baseline; }
+.row-wrap     { flex-wrap: wrap; }
+.row-1        { gap: var(--space-1); }
+.row-2        { gap: var(--space-2); }
+.row-3        { gap: var(--space-3); }
+.row-4        { gap: var(--space-4); }
+.row-6        { gap: var(--space-6); }
+
+.spread       { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); }
+.push-right   { margin-left: auto; }
+.grow         { flex: 1 1 auto; min-width: 0; }
+.shrink-0     { flex-shrink: 0; }
+
+/* Responsive card grid. auto-fit collapses columns without media queries, so
+   the same grid serves 1440px desktop and 360px phone. */
+.grid { display: grid; gap: var(--space-4); }
+.grid-auto-sm { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.grid-auto-md { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.grid-auto-lg { grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); }
+.grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+.col-span-2 { grid-column: span 2; }
+.col-span-3 { grid-column: span 3; }
+.col-span-full { grid-column: 1 / -1; }
+
+@media (max-width: 1100px) {
+    .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 720px) {
+    .grid-2, .grid-3, .grid-4 { grid-template-columns: minmax(0, 1fr); }
+    .col-span-2, .col-span-3 { grid-column: span 1; }
+}
+
+/* Spacing utilities — deliberately few. Layout belongs in components; these
+   exist for the handful of one-off adjustments that would otherwise spawn a
+   single-use class. */
+.mt-0 { margin-top: 0; }
+.mt-2 { margin-top: var(--space-2); }
+.mt-4 { margin-top: var(--space-4); }
+.mt-6 { margin-top: var(--space-6); }
+.mb-2 { margin-bottom: var(--space-2); }
+.mb-4 { margin-bottom: var(--space-4); }
+.mb-6 { margin-bottom: var(--space-6); }
+
+/* ---------------------------------------------------------------- SCROLLBARS */
+
+* { scrollbar-width: thin; scrollbar-color: var(--border-default) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+    background: var(--border-default);
+    border-radius: var(--radius-full);
+    border: 2px solid transparent;
+    background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--border-strong); background-clip: content-box; }
+
+/* ------------------------------------------------------------ REDUCED MOTION */
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* ------------------------------------------------------------------- PRINT */
+
+@media print {
+    :root { --surface-canvas: #fff; --surface-raised: #fff; }
+    body { background: #fff; color: #000; font-size: 11pt; }
+    .app-sidebar, .app-header, .app-footer, .no-print,
+    .toast-region, .btn, .cmd-palette { display: none !important; }
+    .app-main { margin: 0 !important; padding: 0 !important; }
+    .card, .panel { box-shadow: none !important; border: 1px solid #999 !important; break-inside: avoid; }
+    table { break-inside: auto; }
+    tr { break-inside: avoid; break-after: auto; }
+    thead { display: table-header-group; }
+    a[href^="#"]::after { content: ""; }
+}
