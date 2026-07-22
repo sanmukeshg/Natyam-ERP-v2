@@ -32,7 +32,7 @@ import { STUDENT_STATUS } from '../../config/app.config.js';
 
 import {
     listStudents, listFilters, profile, enrol, updateStudent, assignToBatch,
-    bulkAssign, promote, setStatus, archive, restore, household, contactSheet,
+    bulkAssign, promote, setStatus, archive, restore, deleteStudent, deletionImpact, household, contactSheet,
     levels as LEVELS
 } from '../../services/students.service.js';
 import { listBatches } from '../../services/batches.service.js';
@@ -183,6 +183,7 @@ export default class StudentsPage extends Page {
                 if (act === 'edit') return await this.editStudent(student);
                 if (act === 'archive') return await this.archiveStudent(student);
                 if (act === 'restore') return await this.profileAction('restore', student);
+                if (act === 'delete') return await this.deleteStudentRow(student);
             } catch (err) {
                 toast.error(err.message);
             }
@@ -288,8 +289,10 @@ export default class StudentsPage extends Page {
                                 ${row.deletedAt
                                     ? html`<button class="btn btn-sm btn-ghost" data-student-act="restore" data-id="${row.id}"
                                                    title="Restore student" aria-label="Restore ${row.name}">Restore</button>`
-                                    : html`<button class="btn btn-sm btn-danger-quiet" data-student-act="archive" data-id="${row.id}"
-                                                   title="Archive student" aria-label="Archive ${row.name}">Archive</button>`}
+                                    : html`<button class="btn btn-sm btn-ghost" data-student-act="archive" data-id="${row.id}"
+                                                   title="Archive — keeps the record" aria-label="Archive ${row.name}">Archive</button>`}
+                                <button class="btn btn-sm btn-danger-quiet" data-student-act="delete" data-id="${row.id}"
+                                        title="Delete permanently" aria-label="Delete ${row.name}">Delete</button>
                             ` : ''}
                         </span>
                     `
@@ -731,6 +734,33 @@ export default class StudentsPage extends Page {
 
         await archive(student.id);
         toast.success(`${student.name} archived.`);
+        await this.load();
+    }
+
+    async deleteStudentRow(student) {
+        // Say plainly what will be destroyed. Deleting a student who has paid
+        // fees removes that history, which is rarely what someone wants.
+        const impact = await deletionImpact(student.id);
+        const lines = [
+            impact.invoices ? `${impact.invoices} invoice${impact.invoices === 1 ? '' : 's'}` : null,
+            impact.attendance ? `${impact.attendance} attendance record${impact.attendance === 1 ? '' : 's'}` : null,
+            impact.certificates ? `${impact.certificates} certificate${impact.certificates === 1 ? '' : 's'}` : null
+        ].filter(Boolean);
+
+        const ok = await confirm({
+            title: `Delete ${student.name} permanently?`,
+            message: lines.length
+                ? `This also deletes ${lines.join(', ')}${impact.paid > 0
+                    ? `, including ${formatMoney(impact.paid)} already collected` : ''}. `
+                  + 'This cannot be undone — use Archive instead to keep the record.'
+                : 'This cannot be undone. Use Archive instead if the record should be kept.',
+            confirmLabel: 'Delete permanently',
+            danger: true
+        });
+        if (!ok) return;
+
+        await deleteStudent(student.id);
+        toast.success(`${student.name} deleted.`);
         await this.load();
     }
 

@@ -36,7 +36,7 @@ import { PROGRAM_TYPES, EXPENSE_CATEGORIES, STORE_NAMES, curriculum, levelLabel,
 import {
     institute, updateInstitute, listBranches, createBranch, updateBranch, closeBranch,
     listAcademicYears, createAcademicYear, setCurrentYear,
-    listFeePlans, createFeePlan, updateFeePlan, retireFeePlan,
+    listFeePlans, createFeePlan, updateFeePlan, deleteFeePlan,
     listUsers, createUser, updateUser, deactivateUser,
     roleMatrix, preferences, setPreference, storageStatus, requestPersistence
 } from '../../services/settings.service.js';
@@ -152,7 +152,7 @@ export default class SettingsPage extends Page {
             'set-year': () => this.setYear(dataset.id),
             'new-plan': () => this.editPlan(null),
             'edit-plan': () => this.editPlan(dataset.id),
-            'retire-plan': () => this.retirePlan(dataset.id),
+            'delete-plan': () => this.deletePlan(dataset.id),
             'new-user': () => this.editUser(null),
             'edit-user': () => this.editUser(dataset.id),
             'deactivate-user': () => this.deactivateUserFlow(dataset.id),
@@ -417,7 +417,7 @@ export default class SettingsPage extends Page {
                 <div class="card-body card-body-flush">
                     <div class="table-wrap"><table class="table">
                         <thead><tr>
-                            <th scope="col">Plan</th><th scope="col">Level</th>
+                            <th scope="col">Plan</th>
                             <th scope="col" class="text-right">Monthly fee</th>
                             <th scope="col" class="text-right">Year total</th>
                             <th scope="col">Status</th><th scope="col"></th>
@@ -425,17 +425,7 @@ export default class SettingsPage extends Page {
                         <tbody>
                             ${plans.map((plan) => html`
                                 <tr>
-                                    <th scope="row">
-                                        ${plan.name}
-                                        ${plan.registrationFee || plan.costumeFee ? html`
-                                            <div class="type-caption type-muted">
-                                                plus ${[
-                                                    plan.registrationFee ? `${formatMoney(plan.registrationFee)} registration` : null,
-                                                    plan.costumeFee ? `${formatMoney(plan.costumeFee)} costume` : null
-                                                ].filter(Boolean).join(' and ')}
-                                            </div>` : ''}
-                                    </th>
-                                    <td>${levelLabel(plan.level, 'Any')}</td>
+                                    <th scope="row">${plan.name}</th>
                                     <td class="text-right type-strong">${formatMoney(plan.amount)}</td>
                                     <td class="text-right type-muted">${formatMoney(plan.yearlyTotal)}</td>
                                     <td><span class="badge ${plan.status === 'active' ? 'badge-success' : 'badge-neutral'}">
@@ -445,10 +435,8 @@ export default class SettingsPage extends Page {
                                             <div class="row row-tight">
                                                 <button class="btn btn-sm btn-ghost"
                                                         data-do="edit-plan" data-id="${plan.id}">Edit</button>
-                                                ${plan.status === 'active' ? html`
-                                                    <button class="btn btn-sm btn-danger-quiet"
-                                                            data-do="retire-plan" data-id="${plan.id}">Retire</button>
-                                                ` : ''}
+                                                <button class="btn btn-sm btn-danger-quiet"
+                                                        data-do="delete-plan" data-id="${plan.id}">Delete</button>
                                             </div>
                                         ` : ''}
                                     </td>
@@ -469,12 +457,7 @@ export default class SettingsPage extends Page {
             title: plan ? `Edit ${plan.name}` : 'New fee plan',
             fields: [
                 { name: 'name', label: 'Name', required: true, value: plan?.name,
-                  placeholder: 'Prarambhika — annual' },
-                {
-                    name: 'level', label: 'Level', type: 'select', width: 'half', value: plan?.level,
-                    placeholder: 'Any level',
-                    options: curriculum().map((l) => ({ value: l.value, label: l.label }))
-                },
+                  placeholder: 'Foundation — monthly' },
                 { name: 'amount', label: 'Monthly fee', type: 'money', required: true,
                   width: 'half', value: plan?.amount,
                   hint: 'Collected every month of the academic year.' },
@@ -487,10 +470,6 @@ export default class SettingsPage extends Page {
                     width: 'half', value: plan?.frequency || DEFAULT_FEE_FREQUENCY,
                     options: exposedFeeFrequencies().map((f) => ({ value: f.value, label: f.label }))
                 }] : []),
-                { name: 'registrationFee', label: 'One-off registration fee', type: 'money',
-                  width: 'half', value: plan?.registrationFee },
-                { name: 'costumeFee', label: 'Costume fee', type: 'money',
-                  width: 'half', value: plan?.costumeFee },
                 { name: 'description', label: 'Notes', type: 'textarea', rows: 2,
                   value: plan?.description }
             ],
@@ -503,18 +482,18 @@ export default class SettingsPage extends Page {
         }
     }
 
-    async retirePlan(id) {
+    async deletePlan(id) {
         const ok = await confirm({
-            title: 'Retire this fee plan?',
-            message: 'It stops being offered for new students. Students already on it keep their invoices '
-                + 'and continue to be billed.',
-            confirmLabel: 'Retire plan',
+            title: 'Delete this fee plan?',
+            message: 'The plan is removed for good. Students already billed keep their existing '
+                + 'invoices, but the plan can no longer be assigned to anyone.',
+            confirmLabel: 'Delete plan',
             danger: true
         });
         if (!ok) return;
 
-        await retireFeePlan(id);
-        toast.success('Fee plan retired.');
+        await deleteFeePlan(id);
+        toast.success('Fee plan deleted.');
         await this.paint();
     }
 
@@ -834,6 +813,7 @@ export default class SettingsPage extends Page {
                         <label class="check check-block">
                             <input type="checkbox" data-pref="confirmDestructive"
                                    ${prefs.confirmDestructive ? 'checked' : ''}>
+                            <span class="check-box" aria-hidden="true"></span>
                             <span>
                                 <span class="type-strong">Confirm before anything destructive</span>
                                 <span class="type-caption type-muted">

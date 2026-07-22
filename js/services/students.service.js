@@ -20,6 +20,7 @@ import { session } from '../core/session.js';
 import { db, request } from '../core/db.js';
 import { uid, sequenceNumber } from '../utils/id.js';
 import { localDate, nowISO, academicYearOf, ageFrom, daysBetween, addDays } from '../utils/date.js';
+import { formatMoney } from '../utils/money.js';
 import { STUDENT_STATUS, LEVELS, INVOICE_STATUS, levelLabel } from '../config/app.config.js';
 import {
     students$, batches$, invoices$, payments$, attendance$, certificates$,
@@ -188,12 +189,74 @@ export async function archive(studentId) {
     const student = await students$.findOrFail(studentId);
     const outstanding = (await invoices$.forStudent(studentId)).reduce((s, i) => s + (i.balance || 0), 0);
     if (outstanding > 0) {
-        throw new Error(`${student.name} has ₹${(outstanding / 100).toFixed(2)} outstanding. Settle or waive it before archiving.`);
+        throw new Error(`${student.name} has ${formatMoney(outstanding)} outstanding. Settle or waive it before archiving.`);
     }
 
     await students$.remove(studentId);
     bus.emit(EVENTS.STUDENT_REMOVED, { student });
     return true;
+}
+
+/**
+ * Permanently removes a student and everything that belongs only to them.
+ *
+ * Archiving hides a student but keeps the record, which is right for a pupil
+ * who may return. Deleting is for a record that should never have existed — a
+ * duplicate or a test entry — and it has to take the dependent rows with it,
+ * or the school is left with attendance and invoices pointing at a student who
+ * is gone. Financial history is reported separately so the caller can warn
+ * before anything is destroyed.
+ */
+export async function deleteStudent(studentId) {
+    session.require('student.delete', 'delete a student');
+
+    const student = await students$.findOrFail(studentId);
+    const [invoiceRows, attendanceRows, certificateRows, documentRows] = await Promise.all([
+        invoices$.forStudent(studentId),
+        attendance$.forStudent(studentId),
+        certificates$.forStudent(studentId),
+        documents$.forOwner(studentId)
+    ]);
+
+    // Payments hang off invoices, so they are collected through them.
+    const paymentRows = (await Promise.all(
+        invoiceRows.map((invoice) => payments$.where('invoiceId', invoice.id))
+    )).flat();
+
+    for (const row of paymentRows)     await payments$.remove(row.id, { hard: true });
+    for (const row of invoiceRows)     await invoices$.remove(row.id, { hard: true });
+    for (const row of attendanceRows)  await attendance$.remove(row.id, { hard: true });
+    for (const row of certificateRows) await certificates$.remove(row.id, { hard: true });
+    for (const row of documentRows)    await documents$.remove(row.id, { hard: true });
+    await students$.remove(studentId, { hard: true });
+
+    bus.emit(EVENTS.STUDENT_REMOVED, { student });
+    return {
+        student,
+        removed: {
+            invoices: invoiceRows.length,
+            payments: paymentRows.length,
+            attendance: attendanceRows.length,
+            certificates: certificateRows.length,
+            documents: documentRows.length
+        }
+    };
+}
+
+/** What deleting this student would destroy — for the confirmation prompt. */
+export async function deletionImpact(studentId) {
+    const [invoiceRows, attendanceRows, certificateRows] = await Promise.all([
+        invoices$.forStudent(studentId),
+        attendance$.forStudent(studentId),
+        certificates$.forStudent(studentId)
+    ]);
+    const paid = invoiceRows.reduce((sum, i) => sum + (i.paidAmount || 0), 0);
+    return {
+        invoices: invoiceRows.length,
+        attendance: attendanceRows.length,
+        certificates: certificateRows.length,
+        paid
+    };
 }
 
 export async function restore(studentId) {

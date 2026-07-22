@@ -15,7 +15,7 @@
 import { db } from '../core/db.js';
 import { uid, sequenceNumber } from '../utils/id.js';
 import { localDate, addDays, monthKey, academicYearOf, nowISO } from '../utils/date.js';
-import { toPaise } from '../utils/money.js';
+import { toAmount } from '../utils/money.js';
 import {
     STUDENT_STATUS, ADMISSION_STATUS, ATTENDANCE_STATUS,
     INVOICE_STATUS, PAYMENT_STATUS, LEVELS, EXPENSE_CATEGORIES
@@ -64,6 +64,14 @@ function emailFor(name) {
    ========================================================================== */
 
 export async function seedIfEmpty() {
+    // An empty database is not always a new one. "Erase everything" leaves this
+    // mark behind precisely so the demonstration data is not rebuilt underneath
+    // a school that has just cleared it out on purpose.
+    const installation = await db.get('settings', 'installation').catch(() => null);
+    if (installation?.value?.demoData === false) {
+        return { seeded: false, erased: true };
+    }
+
     const existing = await db.count('branches');
     if (existing > 0) return { seeded: false };
 
@@ -193,7 +201,7 @@ async function migrateFromV1() {
                 studentId: null,
                 invoiceId: null,
                 branchId: null,
-                amount: toPaise(r.amount || 0),
+                amount: toAmount(r.amount || 0),
                 mode: String(r.paymentMode || 'cash').toLowerCase(),
                 paidOn: r.date || localDate(),
                 status: PAYMENT_STATUS.CLEARED,
@@ -314,7 +322,7 @@ async function seedStaff(branches) {
         phone: phone(),
         email: emailFor(t.name),
         joinedOn: t.since,
-        monthlySalary: toPaise(t.role === 'teacher' ? between(28000, 46000) : between(18000, 30000)),
+        monthlySalary: toAmount(t.role === 'teacher' ? between(28000, 46000) : between(18000, 30000)),
         status: 'active',
         searchKey: `${t.name} ${t.specialisation}`.toLowerCase()
     }));
@@ -329,10 +337,10 @@ async function seedFeePlans(year) {
         name: `${level.label} — annual tuition`,
         level: level.value,
         academicYearId: year.id,
-        amount: toPaise(1000 + index * 375),
+        amount: toAmount(1000 + index * 375),
         frequency: 'monthly',
-        registrationFee: toPaise(index === 0 ? 2500 : 0),
-        costumeFee: toPaise(index >= 2 ? 3500 : 0),
+        registrationFee: toAmount(index === 0 ? 2500 : 0),
+        costumeFee: toAmount(index >= 2 ? 3500 : 0),
         status: 'active',
         description: level.description
     }));
@@ -345,14 +353,14 @@ async function seedBatches(branches, staff) {
     const teachers = staff.filter((s) => s.role === 'teacher');
 
     const definitions = [
-        { code: 'HYD-PRA-A', name: 'Prarambhika — weekday morning', level: 'prarambhika', branch: 0, days: ['Mon', 'Wed', 'Fri'], start: '06:30', end: '08:00' },
-        { code: 'HYD-PRA-B', name: 'Prarambhika — weekend', level: 'prarambhika', branch: 0, days: ['Sat', 'Sun'], start: '08:00', end: '10:00' },
-        { code: 'HYD-PRV-A', name: 'Praveshika — evening', level: 'praveshika', branch: 0, days: ['Tue', 'Thu'], start: '17:30', end: '19:30' },
-        { code: 'HYD-MAD-A', name: 'Madhyama — advanced evening', level: 'madhyama', branch: 0, days: ['Mon', 'Wed', 'Fri'], start: '18:00', end: '20:00' },
-        { code: 'HYD-VIS-A', name: 'Visharada — margam intensive', level: 'visharada', branch: 0, days: ['Sat'], start: '15:00', end: '18:00' },
-        { code: 'SEC-PRA-A', name: 'Prarambhika — Secunderabad morning', level: 'prarambhika', branch: 1, days: ['Tue', 'Thu', 'Sat'], start: '07:00', end: '08:30' },
-        { code: 'SEC-PRV-A', name: 'Praveshika — Secunderabad', level: 'praveshika', branch: 1, days: ['Mon', 'Fri'], start: '17:00', end: '19:00' },
-        { code: 'HYD-ALK-A', name: 'Alankara — performance diploma', level: 'alankara', branch: 0, days: ['Sun'], start: '10:00', end: '13:00' }
+        { code: 'HYD-PRA-A', name: 'Foundation Level 1 — weekday morning', level: 'foundation-1', branch: 0, days: ['Mon', 'Wed', 'Fri'], start: '06:30', end: '08:00' },
+        { code: 'HYD-PRA-B', name: 'Foundation Level 1 — weekend', level: 'foundation-1', branch: 0, days: ['Sat', 'Sun'], start: '08:00', end: '10:00' },
+        { code: 'HYD-PRV-A', name: 'Foundation Level 5 — evening', level: 'foundation-5', branch: 0, days: ['Tue', 'Thu'], start: '17:30', end: '19:30' },
+        { code: 'HYD-MAD-A', name: 'Intermediate Certificate — advanced evening', level: 'intermediate-certificate', branch: 0, days: ['Mon', 'Wed', 'Fri'], start: '18:00', end: '20:00' },
+        { code: 'HYD-VIS-A', name: 'Intermediate Diploma — margam intensive', level: 'intermediate-diploma', branch: 0, days: ['Sat'], start: '15:00', end: '18:00' },
+        { code: 'SEC-PRA-A', name: 'Foundation Level 1 — Secunderabad morning', level: 'foundation-1', branch: 1, days: ['Tue', 'Thu', 'Sat'], start: '07:00', end: '08:30' },
+        { code: 'SEC-PRV-A', name: 'Foundation Level 5 — Secunderabad', level: 'foundation-5', branch: 1, days: ['Mon', 'Fri'], start: '17:00', end: '19:00' },
+        { code: 'HYD-ALK-A', name: 'Advanced Masters — performance diploma', level: 'advanced-masters', branch: 0, days: ['Sun'], start: '10:00', end: '13:00' }
     ];
 
     const batches = definitions.map((definition, index) => stamp({
@@ -384,10 +392,10 @@ async function seedStudents(branches, batches, plans) {
         // Weighted toward the lower levels, which is how a real school's
         // pyramid looks — most beginners, few at diploma.
         const roll = random();
-        const level = roll < 0.4 ? 'prarambhika'
-            : roll < 0.68 ? 'praveshika'
-            : roll < 0.86 ? 'madhyama'
-            : roll < 0.96 ? 'visharada' : 'alankara';
+        const level = roll < 0.4 ? 'foundation-1'
+            : roll < 0.68 ? 'foundation-5'
+            : roll < 0.86 ? 'intermediate-certificate'
+            : roll < 0.96 ? 'intermediate-diploma' : 'advanced-masters';
 
         const candidates = batches.filter((b) => b.level === level);
         const batch = candidates.length ? pick(candidates) : null;
@@ -674,13 +682,13 @@ async function seedFinance(branches, staff, invoices) {
 
         expenses.push(stamp({
             id: uid('EXP'), branchId: branches[0].id, date: `${key}-05`,
-            category: 'Rent', amount: toPaise(45000),
+            category: 'Rent', amount: toAmount(45000),
             description: 'Central campus — monthly rent', paidTo: 'Sri Venkateswara Properties',
             mode: 'bank', status: 'paid', period: key
         }));
         expenses.push(stamp({
             id: uid('EXP'), branchId: branches[1].id, date: `${key}-05`,
-            category: 'Rent', amount: toPaise(22000),
+            category: 'Rent', amount: toAmount(22000),
             description: 'Secunderabad — monthly rent', paidTo: 'Nrityalaya Trust',
             mode: 'bank', status: 'paid', period: key
         }));
@@ -692,7 +700,7 @@ async function seedFinance(branches, staff, invoices) {
                 branchId: pick(branches).id,
                 date: `${key}-${String(between(2, 27)).padStart(2, '0')}`,
                 category,
-                amount: toPaise(between(800, 18000)),
+                amount: toAmount(between(800, 18000)),
                 description: `${category} — ${pick(['monthly', 'annual programme', 'replacement', 'routine'])}`,
                 paidTo: pick(['Local vendor', 'Sangeet Stores', 'Kalanjali', 'Online purchase']),
                 mode: pick(['upi', 'cash', 'bank']),
@@ -718,7 +726,7 @@ async function seedPrograms(branches) {
     const programs = [
         { name: 'Annual Day — Rangapravesham', type: 'performance', offset: 34, venue: 'Ravindra Bharathi' },
         { name: 'Bhama Kalapam intensive workshop', type: 'workshop', offset: 12, venue: 'Central Campus, Hall A' },
-        { name: 'Level examinations — Praveshika', type: 'examination', offset: 21, venue: 'Central Campus' },
+        { name: 'Level examinations — Foundation Level 5', type: 'examination', offset: 21, venue: 'Central Campus' },
         { name: 'Inter-school Kuchipudi competition', type: 'competition', offset: 58, venue: 'Shilpakala Vedika' },
         { name: 'Dasara Utsav performance', type: 'performance', offset: -26, venue: 'Chilkur Temple' },
         { name: 'Guru Purnima recital', type: 'performance', offset: -62, venue: 'Central Campus' }

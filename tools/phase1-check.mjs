@@ -107,16 +107,16 @@ function renderField(config) {
 
     // Item 4: a create with a branch succeeds; without one, the clear message.
     let created = false, msgWithoutBranch = '';
-    try { const r = await bs.createBatch({ name: 'P1 Test', code: 'P1-' + Math.random().toString(36).slice(2, 5).toUpperCase(), level: 'prarambhika', branchId: branches[0].id, days: ['Mon'], startTime: '07:00', endTime: '08:00', capacity: 5, teacherId: null }); created = !!r.batch; } catch (e) { msgWithoutBranch = e.message; }
+    try { const r = await bs.createBatch({ name: 'P1 Test', code: 'P1-' + Math.random().toString(36).slice(2, 5).toUpperCase(), level: 'foundation-1', branchId: branches[0].id, days: ['Mon'], startTime: '07:00', endTime: '08:00', capacity: 5, teacherId: null }); created = !!r.batch; } catch (e) { msgWithoutBranch = e.message; }
     ok('batch creates when a branch is supplied', created);
-    try { await bs.createBatch({ name: 'No Branch', code: 'NB-' + Math.random().toString(36).slice(2, 5).toUpperCase(), level: 'prarambhika', branchId: undefined, days: ['Mon'], startTime: '07:00', endTime: '08:00', capacity: 5 }); } catch (e) { msgWithoutBranch = e.message; }
+    try { await bs.createBatch({ name: 'No Branch', code: 'NB-' + Math.random().toString(36).slice(2, 5).toUpperCase(), level: 'foundation-1', branchId: undefined, days: ['Mon'], startTime: '07:00', endTime: '08:00', capacity: 5 }); } catch (e) { msgWithoutBranch = e.message; }
     ok('missing branch still gives the clear message', /branch/i.test(msgWithoutBranch));
 
     // Item 3: a stored batch with a malformed (non-array) days must not throw a TypeError during conflict search.
-    await db.put('batches', { id: 'BCH-BAD', name: 'Legacy', code: 'LGC', branchId: branches[0].id, level: 'prarambhika', days: null, startTime: '07:00', endTime: '08:00', status: 'active', teacherId: null, createdAt: new Date().toISOString() });
+    await db.put('batches', { id: 'BCH-BAD', name: 'Legacy', code: 'LGC', branchId: branches[0].id, level: 'foundation-1', days: null, startTime: '07:00', endTime: '08:00', status: 'active', teacherId: null, createdAt: new Date().toISOString() });
     let typeError = false;
     try {
-        await bs.createBatch({ name: 'Overlap', code: 'OV-' + Math.random().toString(36).slice(2, 5).toUpperCase(), level: 'prarambhika', branchId: branches[0].id, days: ['Mon'], startTime: '07:00', endTime: '08:00', capacity: 5, teacherId: null }, { allowConflicts: true });
+        await bs.createBatch({ name: 'Overlap', code: 'OV-' + Math.random().toString(36).slice(2, 5).toUpperCase(), level: 'foundation-1', branchId: branches[0].id, days: ['Mon'], startTime: '07:00', endTime: '08:00', capacity: 5, teacherId: null }, { allowConflicts: true });
     } catch (e) { if (/is not a function|Cannot read/i.test(e.message)) typeError = true; }
     ok('legacy non-array days never throws a TypeError in conflict search', !typeError);
 }

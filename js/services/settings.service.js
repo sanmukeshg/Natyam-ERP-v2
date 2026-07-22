@@ -18,7 +18,7 @@ import { bus, EVENTS } from '../core/bus.js';
 import { session } from '../core/session.js';
 import { db } from '../core/db.js';
 import { localDate } from '../utils/date.js';
-import { toPaise } from '../utils/money.js';
+import { toAmount } from '../utils/money.js';
 import { CAPABILITIES, PREFERENCE_DEFAULTS, curriculum, levelLabel, roleTable, roleCapabilities, roleLabel, configureCurriculum, configureRoles, DEFAULT_FEE_FREQUENCY, feeFrequency } from '../config/app.config.js';
 import {
     settings$, branches$, academicYears$, feePlans$, users$, students$, staff$, batches$, invoices$
@@ -276,13 +276,26 @@ export async function updateFeePlan(id, changes) {
 }
 
 /** Retires a plan. Students already on it keep their existing invoices. */
-export async function retireFeePlan(id) {
-    session.require('settings.edit', 'retire a fee plan');
+/**
+ * Removes a fee plan outright. Retiring left inactive plans cluttering the
+ * list with no way to clear them; a plan that was created by mistake should be
+ * gone. Invoices already raised are untouched — they carry their own amounts —
+ * and any student still pointing at the plan is unlinked so nothing references
+ * a row that no longer exists.
+ */
+export async function deleteFeePlan(id) {
+    session.require('settings.edit', 'delete a fee plan');
 
-    const inUse = await feePlans$.usageCount(id);
-    const plan = await feePlans$.update(id, { status: 'inactive', retiredOn: localDate() });
+    const plan = await feePlans$.findOrFail(id);
+    // students has no feePlanId index, so scan rather than index-lookup.
+    const assigned = (await students$.all()).filter((student) => student.feePlanId === id);
+    for (const student of assigned) {
+        await students$.update(student.id, { feePlanId: null });
+    }
+    await feePlans$.remove(id, { hard: true });
 
-    return { plan, inUse };
+    bus.emit(EVENTS.SETTINGS_CHANGED, { key: 'feePlans', value: null });
+    return { plan, unlinked: assigned.length };
 }
 
 function normalisePlan(data) {
@@ -291,7 +304,7 @@ function normalisePlan(data) {
     const supplied = data.amount != null
         ? data.amount
         : (data.annualAmount != null ? Math.round(Number(data.annualAmount) / 12) : 0);
-    const amount = typeof supplied === 'number' ? supplied : toPaise(supplied || 0);
+    const amount = toAmount(supplied);
     const record = {
         ...data,
         name: String(data.name || '').trim(),

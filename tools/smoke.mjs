@@ -150,7 +150,7 @@ await check('an application can be submitted and enrolled', async () => {
         guardianRelation: 'Mother',
         guardianPhone: '9876500000',
         branchId: branch.id,
-        level: 'prarambhika',
+        level: 'foundation-1',
         feePlanId: plans[0]?.id
     });
     assert(application.id, 'no application id');
@@ -159,7 +159,7 @@ await check('an application can be submitted and enrolled', async () => {
 
     // eligibleBatches is what the wizard offers; picking any open batch would
     // hit the level-match rule, which is the service doing its job.
-    const eligible = await admissions.eligibleBatches('prarambhika', branch.id);
+    const eligible = await admissions.eligibleBatches('foundation-1', branch.id);
     assert(eligible.length > 0, 'no eligible batch for a Prarambhika beginner');
 
     const result = await admissions.enrolApplicant(application.id, {
@@ -438,7 +438,7 @@ await check('settings expose the institute, branches and role matrix', async () 
 
 await check('CSV import validates before writing and then writes', async () => {
     const csv = 'name,level,guardianName,guardianPhone\n'
-        + 'Import One,prarambhika,Parent One,9800000001\n'
+        + 'Import One,foundation-1,Parent One,9800000001\n'
         + 'Import Bad,notalevel,Parent Two,9800000002\n';
 
     const parsed = importer.parseCSV(csv);

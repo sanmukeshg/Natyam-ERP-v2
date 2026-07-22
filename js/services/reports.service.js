@@ -26,7 +26,7 @@
 
 import { session } from '../core/session.js';
 import { localDate, startOfMonth, endOfMonth, monthKey, formatDate, formatDateTime, formatMonth, academicYearOf } from '../utils/date.js';
-import { formatMoney, toRupees } from '../utils/money.js';
+import { formatMoney, toAmount } from '../utils/money.js';
 import { escapeHtml, downloadFile } from '../utils/dom.js';
 import { LEVELS, ATTENDANCE_STATUS, levelLabel } from '../config/app.config.js';
 import {
@@ -683,7 +683,7 @@ export function toCSV(result) {
             const raw = row[column.key];
             // Money and counts export as plain numbers so the spreadsheet can
             // sum them; formatting is for reading, not for arithmetic.
-            if (column.numeric) return String(toRupees(raw || 0));
+            if (column.numeric) return String(toAmount(raw || 0));
             return csvCell(column.format ? column.format(raw) : raw);
         }).join(','));
     }
@@ -727,7 +727,7 @@ export function toSpreadsheetXML(result) {
 
     const body = rows.map((row) => `<Row>${report.columns.map((column) => {
         const raw = row[column.key];
-        if (column.numeric) return `<Cell ss:StyleID="money"><Data ss:Type="Number">${toRupees(raw || 0)}</Data></Cell>`;
+        if (column.numeric) return `<Cell ss:StyleID="money"><Data ss:Type="Number">${toAmount(raw || 0)}</Data></Cell>`;
         return cell(column.format ? column.format(raw) : raw);
     }).join('')}</Row>`).join('');
 

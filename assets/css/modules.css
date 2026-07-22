@@ -575,3 +575,73 @@
     .card { border: 1px solid #ddd; box-shadow: none; break-inside: avoid; }
     .page-body { padding: 0; }
 }
+
+/* ============================================================================
+   FINANCE SUMMARY
+   The headline figure a principal looks for first, with income, expenditure
+   and margin beside it rather than competing with it as four equal cards.
+   ============================================================================ */
+
+.finance-summary {
+    background: var(--surface-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-5);
+}
+
+.finance-summary-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-5);
+}
+
+.finance-summary-label {
+    margin: 0;
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-tertiary);
+}
+
+.finance-summary-value {
+    margin: var(--space-1) 0 0;
+    font-size: var(--text-xl);
+    font-weight: 650;
+    line-height: 1.1;
+}
+
+.finance-summary-value[data-tone="positive"] { color: var(--success-700); }
+.finance-summary-value[data-tone="negative"] { color: var(--danger-700); }
+
+.finance-summary-meta {
+    margin: var(--space-2) 0 0;
+    font-size: var(--text-xs);
+    color: var(--text-tertiary);
+}
+
+.finance-summary-split {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-5);
+}
+
+.finance-stat { display: flex; flex-direction: column; gap: var(--space-1); min-width: 7rem; }
+
+.finance-stat-label {
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-tertiary);
+}
+
+.finance-stat-value { font-size: var(--text-md); font-weight: 600; }
+.finance-stat-value[data-tone="positive"] { color: var(--success-700); }
+.finance-stat-value[data-tone="negative"] { color: var(--danger-700); }
+
+@media (max-width: 640px) {
+    .finance-summary { padding: var(--space-4); }
+    .finance-summary-split { gap: var(--space-4); }
+    .finance-stat { min-width: 5.5rem; }
+}

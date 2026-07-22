@@ -20,7 +20,7 @@
 
 import { session } from '../core/session.js';
 import { localDate } from '../utils/date.js';
-import { toPaise } from '../utils/money.js';
+import { toAmount } from '../utils/money.js';
 import { LEVELS, STUDENT_STATUS } from '../config/app.config.js';
 import { enrol } from './students.service.js';
 import { hire, STAFF_ROLES } from './staff.service.js';
@@ -103,8 +103,8 @@ export const IMPORTERS = Object.freeze([
         optional: ['admissionNo', 'dateOfBirth', 'gender', 'batch', 'joinedOn', 'guardianEmail',
             'guardianRelation', 'alternatePhone', 'address', 'medicalNotes', 'notes'],
         sample: {
-            name: 'Ananya Rao', level: 'prarambhika', guardianName: 'Lakshmi Rao',
-            guardianPhone: '9876543210', batch: 'Prarambhika Morning', joinedOn: '2026-06-01'
+            name: 'Ananya Rao', level: 'foundation-1', guardianName: 'Lakshmi Rao',
+            guardianPhone: '9876543210', batch: 'Foundation Level 1 Morning', joinedOn: '2026-06-01'
         }
     },
     {
@@ -290,7 +290,7 @@ const MAPPERS = {
             email: (pick(row, 'email', 'Email') || '').toLowerCase() || null,
             address: clean(pick(row, 'address', 'Address')) || null,
             joinedOn: normaliseDate(pick(row, 'joinedOn', 'Joined')) || localDate(),
-            monthlySalary: salary ? toPaise(Number(String(salary).replace(/[^\d.]/g, ''))) : null
+            monthlySalary: salary ? toAmount(salary) : null
         };
     }
 };

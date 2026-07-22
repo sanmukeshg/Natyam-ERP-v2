@@ -1,50 +1,32 @@
 /**
  * Money.
  *
- * Amounts are stored as integer paise. Storing rupees as floats and rounding
- * on display is how a ledger ends up 0.03 out after four hundred part-payments,
- * and there is no way to find the error afterwards. Every arithmetic operation
- * in the fee and finance modules goes through this module.
+ * The school works in whole rupees. Fees, salaries and expenses are never
+ * quoted in paise, and nothing in the application asks for a decimal amount.
+ *
+ * Amounts were previously stored as scaled integer paise, which produced a
+ * compounding error: a form rendered the stored value straight into a rupee
+ * input and then multiplied it again on save, so ₹1,500 became ₹150,000 and
+ * then ₹15,00,000. The scaling is gone. What is typed, what is stored and what
+ * is displayed are now the same whole number, so there is no factor left to
+ * apply twice.
  */
 
-/** Rupees (number or numeric string) → integer paise. */
-export function toPaise(rupees) {
-    const n = Number(rupees);
-    if (!Number.isFinite(n)) return 0;
-    // Round the scaled value, not the input: 19.99 * 100 is 1998.9999... in
-    // IEEE754, and truncation would lose a paisa on a very common amount.
-    return Math.round(n * 100);
+/** Any input — typed, imported or already numeric — to a whole-rupee integer. */
+export function toAmount(value) {
+    if (value === null || value === undefined || value === '') return 0;
+    // Imports arrive with separators and symbols; strip anything that is not
+    // part of a number before parsing.
+    const n = typeof value === 'number' ? value : Number(String(value).replace(/[^\d.-]/g, ''));
+    return Number.isFinite(n) ? Math.round(n) : 0;
 }
 
-/** Integer paise → rupees as a number. Display only, never for arithmetic. */
-export function toRupees(paise) {
-    return Math.round(Number(paise) || 0) / 100;
-}
-
-export function addPaise(...values) {
-    return values.reduce((sum, v) => sum + (Math.round(Number(v)) || 0), 0);
-}
-
-export function subPaise(a, b) {
-    return (Math.round(Number(a)) || 0) - (Math.round(Number(b)) || 0);
-}
-
-/**
- * Percentage of an amount, rounded half-up to the paisa. Used for discounts
- * and scholarship rates.
- */
-export function percentOf(paise, percent) {
-    return Math.round(((Math.round(Number(paise)) || 0) * (Number(percent) || 0)) / 100);
+/** Percentage of an amount, rounded to the rupee. Used for discounts. */
+export function percentOf(amount, percent) {
+    return Math.round((toAmount(amount) * (Number(percent) || 0)) / 100);
 }
 
 /* ------------------------------------------------------------- FORMATTING */
-
-const INR = new Intl.NumberFormat('en-IN', {
-    style: 'currency',
-    currency: 'INR',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2
-});
 
 const INR_WHOLE = new Intl.NumberFormat('en-IN', {
     style: 'currency',
@@ -56,17 +38,16 @@ const INR_WHOLE = new Intl.NumberFormat('en-IN', {
 const PLAIN = new Intl.NumberFormat('en-IN');
 
 /** ₹1,23,456.00 — Indian grouping, which Intl handles correctly for en-IN. */
-export function formatMoney(paise, { whole = false } = {}) {
-    const rupees = toRupees(paise);
-    return whole || Number.isInteger(rupees) ? INR_WHOLE.format(rupees) : INR.format(rupees);
+export function formatMoney(amount) {
+    return INR_WHOLE.format(toAmount(amount));
 }
 
 /**
  * Compact form for KPI cards and chart axes, using lakh and crore rather than
  * K/M. A registrar in Hyderabad reads ₹4.2L instantly and ₹420K not at all.
  */
-export function formatMoneyShort(paise) {
-    const rupees = toRupees(paise);
+export function formatMoneyShort(amount) {
+    const rupees = toAmount(amount);
     const abs = Math.abs(rupees);
     const sign = rupees < 0 ? '-' : '';
 
@@ -116,11 +97,11 @@ function threeDigits(n) {
     return parts.join(' and ');
 }
 
-export function amountInWords(paise) {
-    const rupees = Math.floor(toRupees(paise));
-    const paiseRemainder = Math.round(Number(paise)) % 100;
+export function amountInWords(amount) {
+    // Whole rupees only — receipts never carry a paise line.
+    const rupees = toAmount(amount);
 
-    if (rupees === 0 && !paiseRemainder) return 'Zero rupees only';
+    if (rupees === 0) return 'Zero rupees only';
 
     const groups = [
         [Math.floor(rupees / 10000000), 'crore'],
@@ -134,7 +115,6 @@ export function amountInWords(paise) {
         .map(([value, unit]) => `${threeDigits(value)}${unit ? ` ${unit}` : ''}`)
         .join(' ');
 
-    let out = words ? `${words} rupees` : '';
-    if (paiseRemainder) out += `${out ? ' and ' : ''}${twoDigits(paiseRemainder)} paise`;
+    const out = words ? `${words} rupees` : '';
     return `${out.charAt(0).toUpperCase()}${out.slice(1)} only`;
 }

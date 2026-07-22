@@ -216,11 +216,17 @@ export async function exportStore(storeName, { pretty = true } = {}) {
 }
 
 /**
- * Wipes everything and starts again with fresh seed data. Genuinely useful
- * when a school has been trialling the app and wants to begin for real, and
- * genuinely dangerous, so it demands a safety copy first like a restore does.
+ * Wipes everything and leaves a genuinely empty installation.
+ *
+ * The previous behaviour cleared every store and then, on the next boot,
+ * `seedIfEmpty` saw an empty database and rebuilt the entire demonstration
+ * dataset — so an erase appeared to succeed and the sample students, staff and
+ * batches were back a second later. The clear now records that the database
+ * was emptied deliberately, and the seeder honours that mark. Browser storage
+ * is cleared too, or the previously selected branch and preferences would
+ * outlive the data they refer to.
  */
-export async function resetEverything({ safetyCopy = true } = {}) {
+export async function resetEverything({ safetyCopy = true, keepInstitute = true } = {}) {
     session.require(CAPABILITIES.BACKUP_MANAGE, 'erase all data');
 
     if (safetyCopy) {
@@ -230,9 +236,29 @@ export async function resetEverything({ safetyCopy = true } = {}) {
         }
     }
 
+    // Keep the school's own identity if asked — it is configuration, not data.
+    const institute = keepInstitute ? await settings$.get('institute', null) : null;
+
     for (const store of STORE_NAMES) {
         await db.clear(store);
     }
+
+    // Written after the clear so it survives it. `seedIfEmpty` checks this
+    // before deciding whether an empty database is a fresh install or a
+    // deliberate erase.
+    await db.put('settings', {
+        key: 'installation',
+        value: { erasedAt: nowISO(), demoData: false }
+    });
+    await db.put('settings', {
+        key: 'sequences',
+        value: { admission: 0, application: 0, invoice: 0, receipt: 0, certificate: 0 }
+    });
+    if (institute) await settings$.set('institute', institute);
+
+    try {
+        localStorage.removeItem('natyam.session');
+    } catch { /* private mode or storage disabled — nothing to clear */ }
 
     bus.emit(EVENTS.DATA_IMPORTED, { reset: true });
     return true;

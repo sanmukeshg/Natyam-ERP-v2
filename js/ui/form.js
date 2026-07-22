@@ -17,9 +17,9 @@
  * full batch, is the service layer's answer and this file must never guess it.
  */
 
-import { html, render, el, escapeHtml } from '../utils/dom.js';
+import { html, render, el, raw, escapeHtml } from '../utils/dom.js';
 import { overlay } from './overlay.js';
-import { toPaise, toRupees } from '../utils/money.js';
+import { toAmount } from '../utils/money.js';
 
 /* ==========================================================================
    FIELD MARKUP
@@ -165,21 +165,22 @@ export function field(config) {
             </select>
         `;
     } else {
-        // `money` is a decimal rupee input; the caller receives paise.
+        // `money` is a whole-rupee input. No scaling happens on the way in or
+        // out, so a value cannot be multiplied twice by being re-saved.
         const inputType = type === 'money' ? 'number' : type;
-        const inputStep = type === 'money' ? '0.01' : step;
+        const inputStep = type === 'money' ? '1' : step;
 
         control = html`
             <input class="input" type="${inputType}" name="${name}" id="${id}"
                    value="${value ?? ''}" placeholder="${placeholder}"
-                   ${min !== undefined ? `min="${min}"` : ''}
-                   ${max !== undefined ? `max="${max}"` : ''}
-                   ${inputStep !== undefined ? `step="${inputStep}"` : ''}
-                   ${autocomplete ? `autocomplete="${autocomplete}"` : ''}
+                   ${raw(min !== undefined ? `min="${min}"` : '')}
+                   ${raw(max !== undefined ? `max="${max}"` : '')}
+                   ${raw(inputStep !== undefined ? `step="${inputStep}"` : '')}
+                   ${raw(autocomplete ? `autocomplete="${autocomplete}"` : '')}
                    ${required ? 'required' : ''} ${disabled ? 'disabled' : ''}
                    ${autofocus ? 'autofocus' : ''}
-                   ${type === 'money' ? 'data-money="1" inputmode="decimal"' : ''}
-                   ${describedBy ? `aria-describedby="${describedBy}"` : ''}>
+                   ${raw(type === 'money' ? 'data-money="1" inputmode="numeric" min="0"' : '')}
+                   ${raw(describedBy ? `aria-describedby="${describedBy}"` : '')}>
         `;
     }
 
@@ -252,7 +253,7 @@ export function readForm(root, list) {
             }
             case 'money': {
                 const raw = control.value.trim();
-                values[config.name] = raw === '' ? null : toPaise(Number(raw));
+                values[config.name] = raw === '' ? null : toAmount(raw);
                 break;
             }
             case 'number': {
@@ -489,9 +490,9 @@ export function optionsFrom(rows, { value = 'id', label = 'name', note = null, d
     }));
 }
 
-/** Rupee value for pre-filling a money field from stored paise. */
-export function moneyValue(paise) {
-    return paise === null || paise === undefined ? '' : String(toRupees(paise));
+/** Value for pre-filling a money field. Stored and shown identically. */
+export function moneyValue(amount) {
+    return amount === null || amount === undefined ? '' : String(toAmount(amount));
 }
 
 /** A read-only summary block, used in confirmation steps. */

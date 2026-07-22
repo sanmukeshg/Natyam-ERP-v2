@@ -8,7 +8,7 @@
 
 export const APP = Object.freeze({
     name: 'Natyam ERP',
-    version: '2.2.1',
+    version: '2.2.2',
     organisation: 'NATYAM — School of Kuchipudi',
     locale: 'en-IN',
     currency: 'INR',
@@ -26,7 +26,7 @@ export const APP = Object.freeze({
 
 export const SCHEMA = Object.freeze({
     name: 'natyam_erp',
-    version: 4,
+    version: 6,
 
     stores: {
         branches:       { keyPath: 'id', indexes: [['code', 'code', { unique: true }], ['status', 'status']] },
@@ -218,6 +218,85 @@ export const SCHEMA = Object.freeze({
                     cursor.continue();
                 };
             }
+        },
+        {
+            to: 5,
+            note: 'Monetary amounts move from scaled paise to whole rupees.',
+            /* Amounts were stored as paise but entered and shown as rupees, and
+               a saved form re-scaled its own value — ₹1,500 became ₹150,000 and
+               then ₹15,00,000. Storage is now the same whole number the user
+               types, which removes the factor entirely. Existing rows are
+               divided by a hundred once. `moneyMigratedAt` marks a record so a
+               re-run can never divide it twice. */
+            upgrade(db, tx) {
+                const MONEY_FIELDS = {
+                    feePlans:     ['amount', 'registrationFee', 'costumeFee', 'legacyAnnualAmount'],
+                    invoices:     ['amount', 'paidAmount', 'balance', 'discount'],
+                    payments:     ['amount'],
+                    ledgerEntries:['amount', 'debit', 'credit'],
+                    expenses:     ['amount'],
+                    salaries:     ['amount', 'gross', 'net', 'allowances', 'deductions', 'monthlySalary'],
+                    staff:        ['monthlySalary', 'allowances', 'deductions'],
+                    admissions:   ['registrationFee', 'amount'],
+                    programs:     ['totalCost', 'budget', 'fee']
+                };
+                const at = new Date().toISOString();
+
+                Object.entries(MONEY_FIELDS).forEach(([storeName, fields]) => {
+                    if (!db.objectStoreNames.contains(storeName)) return;
+                    const store = tx.objectStore(storeName);
+                    const request = store.openCursor();
+                    request.onsuccess = (event) => {
+                        const cursor = event.target.result;
+                        if (!cursor) return;
+                        const row = cursor.value;
+                        if (row && !row.moneyMigratedAt) {
+                            const next = { ...row, moneyMigratedAt: at };
+                            let touched = false;
+                            fields.forEach((f) => {
+                                if (typeof next[f] === 'number' && Number.isFinite(next[f])) {
+                                    next[f] = Math.round(next[f] / 100);
+                                    touched = true;
+                                }
+                            });
+                            if (touched) cursor.update(next);
+                        }
+                        cursor.continue();
+                    };
+                });
+            }
+        },
+        {
+            to: 6,
+            note: 'Dance levels move to the approved Foundation / Intermediate / Advanced ladder.',
+            /* The five Sanskrit grades are replaced by the school's actual
+               qualification ladder. Existing students, batches, admissions and
+               plans are mapped onto the equivalent rung so nobody loses their
+               placement; anything unrecognised is left untouched rather than
+               guessed at, and shows as-is until someone corrects it. */
+            upgrade(db, tx) {
+                const MAP = {
+                    prarambhika: 'foundation-1',
+                    praveshika:  'foundation-5',
+                    madhyama:    'intermediate-certificate',
+                    visharada:   'intermediate-diploma',
+                    alankara:    'advanced-masters'
+                };
+                ['students', 'batches', 'admissions', 'feePlans', 'certificates'].forEach((storeName) => {
+                    if (!db.objectStoreNames.contains(storeName)) return;
+                    const store = tx.objectStore(storeName);
+                    const request = store.openCursor();
+                    request.onsuccess = (event) => {
+                        const cursor = event.target.result;
+                        if (!cursor) return;
+                        const row = cursor.value;
+                        if (row && MAP[row.level]) {
+                            cursor.update({ ...row, level: MAP[row.level], updatedAt: new Date().toISOString() });
+                        }
+                        cursor.continue();
+                    };
+                });
+            }
         }
     ]
 });
@@ -343,12 +422,25 @@ export const PAYMENT_MODES = Object.freeze([
  * The Kuchipudi curriculum ladder. Order matters — promotion, certificate
  * eligibility and fee banding all read this sequence.
  */
+/* The school's Level / Qualification ladder.
+   "Foundation", "Intermediate" and "Advanced" are part of each name, not
+   separate fields or a second selector — a student holds exactly one of these
+   values. The list is the default; a school can override it (see
+   configureCurriculum) without any code change. */
 export const LEVELS = Object.freeze([
-    { value: 'prarambhika', label: 'Prarambhika', order: 1, years: 2, description: 'Foundation — adavus and basic nritta' },
-    { value: 'praveshika',  label: 'Praveshika',  order: 2, years: 2, description: 'Entry — jatiswaram, shabdam' },
-    { value: 'madhyama',    label: 'Madhyama',    order: 3, years: 2, description: 'Intermediate — varnam, abhinaya' },
-    { value: 'visharada',   label: 'Visharada',   order: 4, years: 2, description: 'Advanced — full margam, Bhama Kalapam' },
-    { value: 'alankara',    label: 'Alankara',    order: 5, years: 1, description: 'Performance diploma' }
+    { value: 'foundation-1', label: 'Foundation Level 1', order: 1,  years: 1, description: 'Foundation — first year exam' },
+    { value: 'foundation-2', label: 'Foundation Level 2', order: 2,  years: 1, description: 'Foundation — second year exam' },
+    { value: 'foundation-3', label: 'Foundation Level 3', order: 3,  years: 1, description: 'Foundation — third year exam' },
+    { value: 'foundation-4', label: 'Foundation Level 4', order: 4,  years: 1, description: 'Foundation — fourth year exam' },
+    { value: 'foundation-5', label: 'Foundation Level 5', order: 5,  years: 1, description: 'Foundation — fifth year exam' },
+    { value: 'foundation-6', label: 'Foundation Level 6', order: 6,  years: 1, description: 'Foundation — sixth year exam' },
+    { value: 'foundation-7', label: 'Foundation Level 7', order: 7,  years: 1, description: 'Foundation — seventh year exam' },
+    { value: 'foundation-8', label: 'Foundation Level 8', order: 8,  years: 1, description: 'Foundation — eighth year exam' },
+    { value: 'intermediate-certificate', label: 'Intermediate Certificate', order: 9,  years: 1, description: 'Intermediate — certificate' },
+    { value: 'intermediate-diploma',     label: 'Intermediate Diploma',     order: 10, years: 1, description: 'Intermediate — diploma' },
+    { value: 'advanced-masters',   label: 'Advanced Masters',   order: 11, years: 1, description: 'Advanced — masters' },
+    { value: 'advanced-theory',    label: 'Advanced Theory',    order: 12, years: 1, description: 'Advanced — theory course' },
+    { value: 'advanced-practical', label: 'Advanced Practical', order: 13, years: 1, description: 'Advanced — practical course' }
 ]);
 
 export const EXPENSE_CATEGORIES = Object.freeze([

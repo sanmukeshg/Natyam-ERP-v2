@@ -9,6 +9,64 @@ project aims to follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [2.2.2] — 2026-07-22 — Final Stabilization
+
+Resolves every item in the manual UAT report. Money moves to whole rupees, the
+Level / Qualification ladder is replaced, and "Erase everything" now leaves a
+genuinely empty installation. Three automatic migrations run on first open;
+existing records are converted, not discarded.
+
+### Fixed
+- **Amounts no longer multiply themselves.** A monthly fee of ₹1,500 stayed
+  ₹1,500 on the form but was stored scaled, so re-saving turned it into
+  ₹1,50,000 and then ₹15,00,000, and the fee-collection screen offered 637500
+  where 6375 was due. Amounts are now stored, entered and displayed as the same
+  whole number, so there is no factor left to apply twice. Existing amounts are
+  converted once on upgrade.
+- **Students can be deleted from the list.** View, Edit and Delete sit on each
+  row, alongside Archive for a pupil who may return. Deleting also removes that
+  student's invoices, payments, attendance, certificates and documents, so
+  nothing is left pointing at a record that no longer exists, and the
+  confirmation says exactly what will go.
+- **"Erase everything" really empties the application.** The erase cleared every
+  table, and the next page load rebuilt the entire demonstration dataset —
+  which is why staff, batches and registers appeared to survive it. An erase is
+  now recorded, the seeder honours it, browser storage is cleared and the
+  invoice and receipt counters are reset.
+- **Every student can be cast in a programme.** The picker's tick boxes were
+  invisible because the control was missing the element the stylesheet draws,
+  and examinations were restricted to a single level so most of the roll arrived
+  marked ineligible. Programmes are open to the whole school.
+- **The "confirm before anything destructive" setting is visible again** — the
+  same missing control element.
+- **Form attributes are written correctly.** `step`, `inputmode`, `min`, `max`
+  and `autocomplete` were being escaped into the markup as literal text, so a
+  number field never had its step or keypad hint.
+
+### Changed
+- **Level / Qualification is the approved ladder:** Foundation Level 1 to 8,
+  Intermediate Certificate, Intermediate Diploma, Advanced Masters, Advanced
+  Theory, Advanced Practical. It is one flat, editable list — "Foundation",
+  "Intermediate" and "Advanced" are part of each name, not separate fields.
+  Existing students, batches, admissions and certificates are mapped onto the
+  equivalent rung.
+- **Fee plans are simpler.** Level, one-off registration fee and costume fee are
+  gone. "Retire" is replaced by **Delete**, which removes the plan outright and
+  unlinks any student still pointing at it.
+- **The finance summary leads with the net position**, with income, expenditure
+  and margin beside it and the period stated, instead of four competing cards.
+
+### Added
+- Sample data for testing: a full dataset (10 students across 3 batches, 3
+  staff, attendance, fee plans and invoices, one programme) that loads through
+  Settings → Data → Restore, plus student and staff CSVs for the importer.
+- `tools/v222-check.mjs` — 48 assertions covering every issue above.
+
+### Database / schema
+- Schema version `4 → 6`. One migration converts stored amounts from scaled
+  paise to whole rupees (marked per record so it cannot run twice), one maps the
+  old dance grades onto the new ladder. Both are additive; no store is reshaped.
+
 ## [2.2.1] — 2026-07-22 — Stabilization Release
 
 Fixes eight defects found in manual acceptance testing of v2.2.0 and replaces

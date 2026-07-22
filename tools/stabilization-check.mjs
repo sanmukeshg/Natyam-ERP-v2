@@ -187,7 +187,7 @@ console.log('\n== Issue 6: branch is selectable wherever it is required ==');
 
     // The repository requires a branch; enrolling without a batch must work.
     const created = await enrol({
-        name: 'Branch Field Check', level: 'prarambhika', branchId: branches[0].id,
+        name: 'Branch Field Check', level: 'foundation-1', branchId: branches[0].id,
         guardianName: 'G', guardianPhone: '9000000001'
     }, { raiseFees: false });
     ok('a student can be enrolled with no batch when a branch is given',
@@ -216,7 +216,7 @@ console.log('\n== Issue 5: batch days select, validate, save and edit ==');
     ok('code is required in the form, matching the service rule', code?.required === true);
 
     const { batch } = await createBatch({
-        name: 'Stabilisation Batch', code: 'STB-1', branchId: branches[0].id, level: 'prarambhika',
+        name: 'Stabilisation Batch', code: 'STB-1', branchId: branches[0].id, level: 'foundation-1',
         days: ['Mon', 'Wed'], startTime: '17:00', endTime: '18:00', startsOn: '2026-06-01'
     }, { allowConflicts: true });
     ok('a batch saves with the days chosen', JSON.stringify(batch.days) === JSON.stringify(['Mon', 'Wed']));
@@ -271,16 +271,16 @@ console.log('\n== Issue 2: monthly fee structure ==');
     ok('a yearly total is derived, not stored as the primary figure',
         plans.every((p) => p.yearlyTotal === p.amount * 12));
 
-    const created = await createFeePlan({ name: 'Stabilisation Plan', level: 'prarambhika', amount: 150000 });
+    const created = await createFeePlan({ name: 'Stabilisation Plan', level: 'foundation-1', amount: 150000 });
     ok('a plan can be created with a monthly amount', created.amount === 150000 && created.frequency === 'monthly');
 
     // Legacy plan (yearly, pre-migration shape) must still resolve.
-    const legacy = await feePlans$.create({ name: 'Legacy Yearly', level: 'praveshika', annualAmount: 1200000 });
+    const legacy = await feePlans$.create({ name: 'Legacy Yearly', level: 'foundation-5', annualAmount: 1200000 });
     ok('a legacy yearly plan converts to a monthly amount', legacy.amount === 100000, `got ${legacy.amount}`);
 
     // Schedule generation is monthly and driven by the frequency table.
     const student = await enrol({
-        name: 'Monthly Fee Check', level: 'prarambhika', branchId: branches[0].id,
+        name: 'Monthly Fee Check', level: 'foundation-1', branchId: branches[0].id,
         guardianName: 'G', guardianPhone: '9000000002', feePlanId: created.id
     }, { raiseFees: false });
     const schedule = await raiseSchedule(student.student.id, { feePlanId: created.id, includeExtras: false });

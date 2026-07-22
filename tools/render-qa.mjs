@@ -426,7 +426,7 @@ const { listFeePlans, createFeePlan, listAcademicYears, createAcademicYear,
 await check('a fee plan can be created from the settings form fields', async () => {
     const before = (await listFeePlans({ includeInactive: true })).length;
     const created = await createFeePlan({
-        name: 'QA plan', level: 'prarambhika',
+        name: 'QA plan', level: 'foundation-1',
         annualAmount: 2400000, instalments: 12,
         registrationFee: 100000, costumeFee: 0,
         description: 'created by render QA'

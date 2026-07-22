@@ -2,7 +2,7 @@
  * NATYAM ERP 2.0 — Certificate service
  *
  * A certificate is the only artefact this system produces that leaves the
- * building and outlives it. A parent will present a Praveshika certificate to
+ * building and outlives it. A parent will present a Foundation Level 5 certificate to
  * a college admissions officer in eleven years' time, and the only thing
  * standing behind it will be a serial number this module minted.
  *
@@ -74,12 +74,12 @@ export const TEMPLATES = Object.freeze([
     {
         id: 'diploma',
         name: 'Performance diploma',
-        title: () => 'Diploma in Kuchipudi — Alankara',
+        title: () => 'Diploma in Kuchipudi — Advanced Masters',
         body: (ctx) =>
             `This is to certify that ${ctx.student.name} has completed the full course of study at ` +
-            `NATYAM — School of Kuchipudi, culminating in the Alankara performance diploma, ` +
+            `NATYAM — School of Kuchipudi, culminating in the Advanced Masters performance diploma, ` +
             `having trained under the school since ${formatDateLong(ctx.student.joinedOn)}.`,
-        requires: { minAttendance: 80, minTenureDays: 1460, onlyLevel: 'alankara' },
+        requires: { minAttendance: 80, minTenureDays: 1460, onlyLevel: 'advanced-masters' },
         signatories: ['Principal', 'Guru', 'Examiner']
     }
 ]);

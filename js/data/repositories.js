@@ -491,7 +491,6 @@ class FeePlanRepository extends Repository {
 
     validate(record) {
         if (!record.name?.trim()) throw new Error('A fee plan needs a name.');
-        if (!record.level) throw new Error('A fee plan applies to a level.');
         if (record.amount <= 0) throw new Error('The monthly fee must be more than zero.');
         if (!feeFrequency(record.frequency)) throw new Error('That fee frequency is not recognised.');
     }

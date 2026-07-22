@@ -206,23 +206,27 @@ export async function removeParticipant(id, studentId) {
  * rather than in the picker means the rule is the same whether a cast is set
  * from the programme page, from a bulk action, or from a report.
  */
-export async function eligibleStudents(programOrId, { level = null } = {}) {
+/**
+ * Students who can take part in a programme.
+ *
+ * Programmes are open to the whole school. An earlier rule gated examinations
+ * to a single level, which meant most of the roll arrived flagged ineligible
+ * and could not be cast at all. Level is still reported so the picker can show
+ * it, but it never excludes anyone.
+ */
+export async function eligibleStudents(programOrId) {
     const program = typeof programOrId === 'string' ? await programs$.findOrFail(programOrId) : programOrId;
     const roster = await students$.active(program.branchId);
     const chosen = new Set(program.participants || []);
-
-    const gate = program.type === 'examination' ? (level || program.level) : null;
 
     return roster
         .map((student) => ({
             ...student,
             selected: chosen.has(student.id),
-            eligible: !gate || student.level === gate,
-            reason: gate && student.level !== gate
-                ? `At ${levelLabel(student.level)}, not ${levelLabel(gate)}`
-                : null
+            eligible: true,
+            reason: null
         }))
-        .sort((a, b) => Number(b.eligible) - Number(a.eligible) || a.name.localeCompare(b.name, 'en-IN'));
+        .sort((a, b) => a.name.localeCompare(b.name, 'en-IN'));
 }
 
 /* ==========================================================================

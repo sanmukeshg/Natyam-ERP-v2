@@ -431,7 +431,7 @@ export default class ProgramsPage extends Page {
 
         await drawer({
             title: `Cast for ${program.name}`,
-            description: `${students.length} eligible students`,
+            description: `${students.length} students · any level may take part`,
             size: 'md',
             content: html`
                 <div class="filter-bar">
@@ -448,10 +448,11 @@ export default class ProgramsPage extends Page {
                             <label class="check check-block" data-name="${student.name.toLowerCase()}">
                                 <input type="checkbox" value="${student.id}"
                                        ${chosen.has(student.id) ? 'checked' : ''}>
+                                <span class="check-box" aria-hidden="true"></span>
                                 <span>
                                     <span class="type-strong">${student.name}</span>
                                     <span class="type-caption type-muted">
-                                        ${student.level}${student.batchName ? ` · ${student.batchName}` : ''}
+                                        ${levelLabel(student.level)}${student.batchName ? ` · ${student.batchName}` : ''}
                                     </span>
                                 </span>
                             </label>

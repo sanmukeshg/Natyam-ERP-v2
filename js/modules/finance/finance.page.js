@@ -158,12 +158,34 @@ export default class FinancePage extends Page {
         ]);
 
         return html`
-            <div class="grid grid-4">
-                ${kpiCard('Income', formatMoney(pl.totalIncome), `${formatNumber(pl.entryCount)} entries`)}
-                ${kpiCard('Expenditure', formatMoney(pl.totalExpense))}
-                ${kpiCard('Net', formatMoney(pl.net), pl.net >= 0 ? 'surplus' : 'deficit', { tone: pl.net >= 0 ? 'positive' : 'negative' })}
-                ${kpiCard('Margin', pl.margin === null ? '—' : `${pl.margin}%`)}
-            </div>
+            <section class="finance-summary">
+                <div class="finance-summary-head">
+                    <div>
+                        <p class="finance-summary-label">Net position</p>
+                        <p class="finance-summary-value" data-tone="${pl.net >= 0 ? 'positive' : 'negative'}">
+                            ${formatMoney(pl.net)}
+                        </p>
+                        <p class="finance-summary-meta">
+                            ${formatDate(pl.from)} — ${formatDate(pl.to)}
+                            · ${formatNumber(pl.entryCount)} ledger entries
+                        </p>
+                    </div>
+                    <div class="finance-summary-split">
+                        <div class="finance-stat">
+                            <span class="finance-stat-label">Income</span>
+                            <span class="finance-stat-value" data-tone="positive">${formatMoney(pl.totalIncome)}</span>
+                        </div>
+                        <div class="finance-stat">
+                            <span class="finance-stat-label">Expenditure</span>
+                            <span class="finance-stat-value" data-tone="negative">${formatMoney(pl.totalExpense)}</span>
+                        </div>
+                        <div class="finance-stat">
+                            <span class="finance-stat-label">Margin</span>
+                            <span class="finance-stat-value">${pl.margin === null ? '—' : `${pl.margin}%`}</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
 
             <div class="card">
                 <div class="card-header">

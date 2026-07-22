@@ -202,7 +202,7 @@ let curriculumId = null;
 
     // Independence: a student can be enrolled with a curriculum and no batch.
     const { student: fresh } = await enrol({
-        name: 'Curriculum Only Student', level: 'prarambhika',
+        name: 'Curriculum Only Student', level: 'foundation-1',
         guardianName: 'Guardian', guardianPhone: '9000000000',
         branchId: branches[0].id, curriculumId
     }, { raiseFees: false });
