@@ -1,481 +1,547 @@
 /**
- * DataTable.
+ * NATYAM ERP 2.0 — Form builder
  *
- * Every list in the ERP is this component with a different column definition.
- * In 1.0, each module hand-wrote its own <table> markup; that produced six
- * subtly different empty states, no sorting anywhere, and no pagination, so
- * the students page rendered all 80 rows and would have rendered all 8,000.
+ * Thirteen module pages need forms. Without this file each of them writes its
+ * own `<div class="field"><label…` by hand, and within a month the label sits
+ * above the input on nine screens and beside it on four, half of them forget
+ * `aria-describedby` on the error text, and the required marker is a red
+ * asterisk in some places and the word "required" in others.
  *
- * Design decisions worth stating:
- *   - Rendering is a full innerHTML replacement of the <tbody> only. For page
- *     sizes of 25–100 rows this measures faster than diffing and is far less
- *     code to be wrong.
- *   - Row actions use a single delegated listener on the table, so re-rendering
- *     does not churn listeners.
- *   - Sorting and filtering happen over the supplied row array. Where a store
- *     is large, the caller passes an already-paginated slice and sets
- *     `serverSide: true`.
+ * So forms are declared as data here and rendered once. A page says what it
+ * wants collected; this module decides what that looks like and how it behaves
+ * when it is wrong.
+ *
+ * What this deliberately does NOT do is validate business rules. It checks
+ * that a required box has something in it and that a number is a number —
+ * shape, not meaning. Whether a fee may be waived, or a student may join a
+ * full batch, is the service layer's answer and this file must never guess it.
  */
 
-import { html, render, raw, escapeHtml, el, on, debounce, announce } from '../utils/dom.js';
-import { icon } from './icons.js';
+import { html, render, el, escapeHtml } from '../utils/dom.js';
+import { overlay } from './overlay.js';
+import { toPaise, toRupees } from '../utils/money.js';
 
-let instanceCount = 0;
+/* ==========================================================================
+   FIELD MARKUP
+   ========================================================================== */
 
-export class DataTable {
-    /**
-     * @param {object} config
-     * @param {Array}  config.columns  [{ key, label, align, sortable, width, render(row), exportValue(row) }]
-     * @param {Array}  [config.rows]
-     * @param {string} [config.rowId='id']
-     * @param {string} [config.emptyTitle]
-     * @param {string} [config.emptyMessage]
-     * @param {object} [config.emptyAction]  { label, onClick }
-     * @param {boolean}[config.selectable=false]
-     * @param {boolean}[config.searchable=true]
-     * @param {string} [config.searchPlaceholder]
-     * @param {number} [config.pageSize=25]
-     * @param {Function}[config.onRowClick]
-     * @param {Array}  [config.bulkActions]  [{ label, variant, onClick(ids) }]
-     * @param {Array}  [config.toolbar]      Raw html`` fragments placed in the toolbar.
-     */
-    constructor(config) {
-        this.id = `dt-${++instanceCount}`;
-        this.columns = config.columns;
-        this.rows = config.rows || [];
-        this.rowId = config.rowId || 'id';
-        this.emptyTitle = config.emptyTitle || 'Nothing here yet';
-        this.emptyMessage = config.emptyMessage || '';
-        this.emptyAction = config.emptyAction || null;
-        this.emptyIcon = config.emptyIcon || 'inbox';
-        this.selectable = config.selectable || false;
-        this.searchable = config.searchable !== false;
-        this.searchPlaceholder = config.searchPlaceholder || 'Search…';
-        this.pageSize = config.pageSize || 25;
-        this.onRowClick = config.onRowClick || null;
-        this.bulkActions = config.bulkActions || [];
-        this.toolbar = config.toolbar || [];
-        this.pinFirst = config.pinFirst !== false;
-        this.caption = config.caption || null;
+/**
+ * @typedef {object} Field
+ * @property {string} name
+ * @property {string} label
+ * @property {'text'|'textarea'|'select'|'number'|'money'|'date'|'time'|'tel'|'email'|'checkbox'|'switch'|'radio'|'hidden'|'static'|'divider'} [type='text']
+ * @property {*} [value]
+ * @property {boolean} [required]
+ * @property {string} [hint]
+ * @property {string} [placeholder]
+ * @property {Array}  [options]   For select/radio: [{ value, label, disabled, note }]
+ * @property {number} [min] @property {number} [max] @property {number} [step]
+ * @property {number} [rows]      For textarea.
+ * @property {string} [width]     Grid span hint: 'full' | 'half' | 'third'.
+ * @property {boolean}[autofocus]
+ * @property {boolean}[disabled]
+ */
 
-        this.state = {
-            search: '',
-            sortKey: config.defaultSort || null,
-            sortDir: config.defaultSortDir || 'asc',
-            page: 1,
-            selected: new Set()
-        };
+/** Renders one field. */
+export function field(config) {
+    const {
+        name, label, type = 'text', value = '', required = false, hint = '',
+        placeholder = '', options = [], rows = 3, min, max, step,
+        disabled = false, autofocus = false, autocomplete
+    } = config;
 
-        this.container = null;
-        this.disposers = [];
+    const id = `f-${name}`;
+    const describedBy = hint ? `${id}-hint` : '';
+
+    if (type === 'hidden') {
+        return html`<input type="hidden" name="${name}" value="${value ?? ''}">`;
     }
 
-    /* ------------------------------------------------------------------ DATA */
-
-    setRows(rows) {
-        this.rows = rows;
-        this.state.page = 1;
-        // Drop selections for rows that no longer exist.
-        this.state.selected = new Set([...this.state.selected].filter((id) => rows.some((r) => r[this.rowId] === id)));
-        this.refresh();
+    if (type === 'divider') {
+        return html`<div class="divider divider-labelled" data-label="${label || ''}"></div>`;
     }
 
-    /**
-     * Swap the column set. The reports module drives this: one table instance
-     * renders thirteen different reports, so the columns are data too. Sort and
-     * page state reset because a sort key from the previous report is
-     * meaningless against the new one.
-     */
-    setColumns(columns) {
-        this.columns = columns;
-        this.state.sortKey = null;
-        this.state.page = 1;
-        this.state.selected = new Set();
-        this.refresh();
-    }
-
-    /** Rows after search and sort, before pagination. */
-    get processed() {
-        let rows = this.rows;
-
-        const term = this.state.search.trim().toLowerCase();
-        if (term) {
-            rows = rows.filter((row) => this.columns.some((col) => {
-                const value = col.searchValue ? col.searchValue(row) : row[col.key];
-                return String(value ?? '').toLowerCase().includes(term);
-            }));
-        }
-
-        if (this.state.sortKey) {
-            const column = this.columns.find((c) => c.key === this.state.sortKey);
-            const direction = this.state.sortDir === 'asc' ? 1 : -1;
-            const accessor = column?.sortValue || ((row) => row[this.state.sortKey]);
-
-            rows = [...rows].sort((a, b) => {
-                const av = accessor(a);
-                const bv = accessor(b);
-                if (av === bv) return 0;
-                if (av === null || av === undefined) return 1;   // blanks always last,
-                if (bv === null || bv === undefined) return -1;  // in both directions
-                if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * direction;
-                return String(av).localeCompare(String(bv), 'en-IN', { numeric: true, sensitivity: 'base' }) * direction;
-            });
-        }
-
-        return rows;
-    }
-
-    get pageRows() {
-        const rows = this.processed;
-        const start = (this.state.page - 1) * this.pageSize;
-        return rows.slice(start, start + this.pageSize);
-    }
-
-    get pageCount() {
-        return Math.max(1, Math.ceil(this.processed.length / this.pageSize));
-    }
-
-    /* ---------------------------------------------------------------- RENDER */
-
-    mount(container) {
-        this.container = container;
-        render(container, this.markup());
-        this.bind();
-        return this;
-    }
-
-    /** Re-renders body, toolbar counts and pagination without rebuilding the head. */
-    refresh() {
-        if (!this.container) return;
-        // Clamp the page after a filter shrinks the result set.
-        if (this.state.page > this.pageCount) this.state.page = this.pageCount;
-
-        const body = this.container.querySelector('tbody');
-        if (body) body.innerHTML = String(this.bodyMarkup());
-
-        const pagination = this.container.querySelector('[data-dt-pagination]');
-        if (pagination) pagination.outerHTML = String(this.paginationMarkup());
-
-        const selectionBar = this.container.querySelector('[data-dt-selection]');
-        if (selectionBar) selectionBar.outerHTML = String(this.selectionMarkup());
-
-        this.syncSortIndicators();
-        this.syncSelectAll();
-    }
-
-    markup() {
+    if (type === 'static') {
         return html`
-            <div class="card" data-dt="${this.id}">
-                ${(this.searchable || this.toolbar.length) && html`
-                    <div class="table-toolbar">
-                        ${this.searchable && html`
-                            <div class="search-wrap">
-                                ${raw(icon('search', { size: 15, className: 'icon icon-search' }))}
-                                <input type="search" class="input input-search" data-dt-search
-                                       placeholder="${this.searchPlaceholder}"
-                                       aria-label="${this.searchPlaceholder}"
-                                       aria-controls="${this.id}-body">
-                            </div>`}
-                        ${this.toolbar}
-                    </div>`}
-
-                ${this.selectionMarkup()}
-
-                <div class="table-wrap">
-                    <table class="table ${this.pinFirst ? 'table-pin-first' : ''} ${this.onRowClick ? 'table-clickable' : ''}"
-                           id="${this.id}">
-                        ${this.caption && html`<caption class="sr-only">${this.caption}</caption>`}
-                        <thead>${this.headMarkup()}</thead>
-                        <tbody id="${this.id}-body">${this.bodyMarkup()}</tbody>
-                    </table>
-                </div>
-
-                ${this.paginationMarkup()}
+            <div class="field" data-width="${config.width || 'full'}">
+                <span class="field-label">${label}</span>
+                <p class="type-body">${value || '—'}</p>
+                ${hint ? html`<p class="field-hint">${hint}</p>` : ''}
             </div>
         `;
     }
 
-    headMarkup() {
-        return html`<tr>
-            ${this.selectable && html`
-                <th class="col-check" scope="col">
-                    <label class="check">
-                        <input type="checkbox" data-dt-select-all aria-label="Select all rows on this page">
-                        <span class="check-box"></span>
-                    </label>
-                </th>`}
-            ${this.columns.map((col) => html`
-                <th scope="col"
-                    class="${col.align === 'right' ? 'col-num' : ''} ${col.align === 'actions' ? 'col-actions' : ''} ${col.sortable ? 'th-sort' : ''}"
-                    ${col.width ? raw(`style="width:${escapeHtml(col.width)}"`) : ''}
-                    ${col.sortable ? raw(`data-dt-sort="${escapeHtml(col.key)}" aria-sort="none" tabindex="0" role="columnheader"`) : ''}>
-                    <span class="th-sort-inner">
-                        ${col.label}
-                        ${col.sortable && raw(icon('arrow-up', { size: 12 }))}
-                    </span>
-                </th>`)}
-        </tr>`;
+    if (type === 'checkbox' || type === 'switch') {
+        const controlBox = type === 'switch'
+            ? html`<span class="switch-track" aria-hidden="true"></span>`
+            : html`<span class="check-box" aria-hidden="true"></span>`;
+        return html`
+            <div class="field" data-width="${config.width || 'full'}">
+                <label class="${type === 'switch' ? 'switch' : 'check'}">
+                    <input type="checkbox" name="${name}" id="${id}"
+                           ${value ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+                    ${controlBox}
+                    <span>${label}</span>
+                </label>
+                ${hint ? html`<p class="field-hint" id="${id}-hint">${hint}</p>` : ''}
+                <p class="field-error" data-error-for="${name}" hidden></p>
+            </div>
+        `;
     }
 
-    bodyMarkup() {
-        const rows = this.pageRows;
-        const span = this.columns.length + (this.selectable ? 1 : 0);
-
-        if (!rows.length) {
-            const filtered = this.state.search.trim().length > 0;
-            return html`<tr><td colspan="${span}" class="empty-cell">
-                <div class="empty empty-compact">
-                    <div class="empty-glyph">${raw(icon(filtered ? 'search' : this.emptyIcon, { size: 22 }))}</div>
-                    <p class="empty-title">${filtered ? `Nothing matches “${this.state.search}”` : this.emptyTitle}</p>
-                    <p class="empty-text">${filtered ? 'Try a shorter search, or clear it to see everything.' : this.emptyMessage}</p>
-                    ${filtered
-                        ? html`<div class="empty-actions"><button type="button" class="btn btn-sm btn-secondary" data-dt-clear-search>Clear search</button></div>`
-                        : this.emptyAction && html`<div class="empty-actions"><button type="button" class="btn btn-sm btn-primary" data-dt-empty-action>${this.emptyAction.label}</button></div>`}
-                </div>
-            </td></tr>`;
-        }
-
-        return rows.map((row) => {
-            const id = row[this.rowId];
-            const selected = this.state.selected.has(id);
-            return html`<tr data-dt-row="${id}" ${selected ? raw('aria-selected="true"') : ''}
-                            ${this.onRowClick ? raw('tabindex="0"') : ''}>
-                ${this.selectable && html`
-                    <td class="col-check">
+    // A set of independent checkboxes returning an array — the "which days
+    // does this batch meet" shape. Added here rather than hand-rolled in the
+    // batch form because programmes and reports need exactly the same control.
+    if (type === 'checkbox-group') {
+        const selected = new Set((Array.isArray(value) ? value : []).map(String));
+        return html`
+            <fieldset class="field" data-width="${config.width || 'full'}">
+                <legend class="field-label">${label}${required ? requiredMark() : ''}</legend>
+                <div class="row row-wrap">
+                    ${options.map((option, index) => html`
                         <label class="check">
-                            <input type="checkbox" data-dt-select="${id}" ${selected ? raw('checked') : ''}
-                                   aria-label="Select this row">
-                            <span class="check-box"></span>
+                            <input type="checkbox" name="${name}" value="${option.value}"
+                                   ${selected.has(String(option.value)) ? 'checked' : ''}
+                                   ${option.disabled ? 'disabled' : ''}
+                                   ${autofocus && index === 0 ? 'autofocus' : ''}>
+                            <span class="check-box" aria-hidden="true"></span>
+                            <span>${option.label}</span>
                         </label>
-                    </td>`}
-                ${this.columns.map((col) => html`
-                    <td class="${col.align === 'right' ? 'col-num' : ''} ${col.align === 'actions' ? 'col-actions' : ''}">
-                        ${col.render ? col.render(row) : row[col.key] ?? html`<span class="text-subtle">—</span>`}
-                    </td>`)}
-            </tr>`;
-        });
+                    `)}
+                </div>
+                ${hint ? html`<p class="field-hint" id="${id}-hint">${hint}</p>` : ''}
+                <p class="field-error" data-error-for="${name}" hidden></p>
+            </fieldset>
+        `;
     }
 
-    selectionMarkup() {
-        const count = this.state.selected.size;
-        if (!this.selectable || !count) return html`<div data-dt-selection hidden></div>`;
-
-        return html`<div class="table-selection-bar" data-dt-selection>
-            <span>${count} selected</span>
-            <button type="button" class="btn btn-sm btn-ghost" data-dt-clear-selection>Clear</button>
-            <div class="push-right row row-2">
-                ${this.bulkActions.map((action, index) => html`
-                    <button type="button" class="btn btn-sm btn-${action.variant || 'secondary'}" data-dt-bulk="${index}">
-                        ${action.label}
-                    </button>`)}
-            </div>
-        </div>`;
+    if (type === 'radio') {
+        return html`
+            <fieldset class="field" data-width="${config.width || 'full'}">
+                <legend class="field-label">${label}${required ? requiredMark() : ''}</legend>
+                <div class="row row-wrap">
+                    ${options.map((option, index) => html`
+                        <label class="check">
+                            <input type="radio" name="${name}" value="${option.value}"
+                                   ${String(value) === String(option.value) ? 'checked' : ''}
+                                   ${option.disabled ? 'disabled' : ''}
+                                   ${autofocus && index === 0 ? 'autofocus' : ''}>
+                            <span class="check-box check-radio" aria-hidden="true"></span>
+                            <span>${option.label}</span>
+                        </label>
+                    `)}
+                </div>
+                ${hint ? html`<p class="field-hint" id="${id}-hint">${hint}</p>` : ''}
+                <p class="field-error" data-error-for="${name}" hidden></p>
+            </fieldset>
+        `;
     }
 
-    paginationMarkup() {
-        const total = this.processed.length;
-        const pageCount = this.pageCount;
+    let control;
 
-        if (total <= this.pageSize) {
-            return html`<div class="pagination" data-dt-pagination>
-                <span>${total} ${total === 1 ? 'record' : 'records'}</span>
-            </div>`;
-        }
+    if (type === 'textarea') {
+        control = html`<textarea class="textarea" name="${name}" id="${id}" rows="${rows}"
+                                 placeholder="${placeholder}"
+                                 ${required ? 'required' : ''} ${disabled ? 'disabled' : ''}
+                                 ${autofocus ? 'autofocus' : ''}
+                                 ${describedBy ? `aria-describedby="${describedBy}"` : ''}
+                       >${value ?? ''}</textarea>`;
+    } else if (type === 'select') {
+        control = html`
+            <select class="select" name="${name}" id="${id}"
+                    ${required ? 'required' : ''} ${disabled ? 'disabled' : ''}
+                    ${autofocus ? 'autofocus' : ''}
+                    ${describedBy ? `aria-describedby="${describedBy}"` : ''}>
+                ${config.placeholder !== false
+                    ? html`<option value="">${placeholder || 'Choose…'}</option>`
+                    : ''}
+                ${options.map((option) => html`
+                    <option value="${option.value}"
+                            ${String(value) === String(option.value) ? 'selected' : ''}
+                            ${option.disabled ? 'disabled' : ''}>
+                        ${option.label}${option.note ? ` — ${option.note}` : ''}
+                    </option>
+                `)}
+            </select>
+        `;
+    } else {
+        // `money` is a decimal rupee input; the caller receives paise.
+        const inputType = type === 'money' ? 'number' : type;
+        const inputStep = type === 'money' ? '0.01' : step;
 
-        const from = (this.state.page - 1) * this.pageSize + 1;
-        const to = Math.min(this.state.page * this.pageSize, total);
-
-        return html`<div class="pagination" data-dt-pagination>
-            <span>Showing ${from}–${to} of ${total}</span>
-            <div class="pagination-pages" role="navigation" aria-label="Pagination">
-                <button type="button" class="page-btn" data-dt-page="prev"
-                        ${this.state.page === 1 ? raw('disabled') : ''} aria-label="Previous page">
-                    ${raw(icon('chevron-left', { size: 14 }))}
-                </button>
-                ${pageNumbers(this.state.page, pageCount).map((entry) => entry === '…'
-                    ? html`<span class="page-ellipsis">…</span>`
-                    : html`<button type="button" class="page-btn" data-dt-page="${entry}"
-                                   ${entry === this.state.page ? raw('aria-current="page"') : ''}
-                                   aria-label="Page ${entry}">${entry}</button>`)}
-                <button type="button" class="page-btn" data-dt-page="next"
-                        ${this.state.page === pageCount ? raw('disabled') : ''} aria-label="Next page">
-                    ${raw(icon('chevron-right', { size: 14 }))}
-                </button>
-            </div>
-        </div>`;
+        control = html`
+            <input class="input" type="${inputType}" name="${name}" id="${id}"
+                   value="${value ?? ''}" placeholder="${placeholder}"
+                   ${min !== undefined ? `min="${min}"` : ''}
+                   ${max !== undefined ? `max="${max}"` : ''}
+                   ${inputStep !== undefined ? `step="${inputStep}"` : ''}
+                   ${autocomplete ? `autocomplete="${autocomplete}"` : ''}
+                   ${required ? 'required' : ''} ${disabled ? 'disabled' : ''}
+                   ${autofocus ? 'autofocus' : ''}
+                   ${type === 'money' ? 'data-money="1" inputmode="decimal"' : ''}
+                   ${describedBy ? `aria-describedby="${describedBy}"` : ''}>
+        `;
     }
 
-    /* ---------------------------------------------------------------- EVENTS */
-
-    bind() {
-        const root = this.container;
-
-        const search = root.querySelector('[data-dt-search]');
-        if (search) {
-            const run = debounce((value) => {
-                this.state.search = value;
-                this.state.page = 1;
-                this.refresh();
-                announce(`${this.processed.length} results`);
-            }, 200);
-            search.addEventListener('input', (event) => run(event.target.value));
-            this.disposers.push(() => run.cancel());
-        }
-
-        this.disposers.push(
-            on(root, 'click', '[data-dt-sort]', (_e, target) => this.sortBy(target.dataset.dtSort)),
-            on(root, 'keydown', '[data-dt-sort]', (event, target) => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    this.sortBy(target.dataset.dtSort);
-                }
-            }),
-            on(root, 'click', '[data-dt-page]', (_e, target) => {
-                const value = target.dataset.dtPage;
-                if (value === 'prev') this.state.page = Math.max(1, this.state.page - 1);
-                else if (value === 'next') this.state.page = Math.min(this.pageCount, this.state.page + 1);
-                else this.state.page = Number(value);
-                this.refresh();
-                // `?.scrollTo?.()` rather than `?.scrollTo()`: Element.scrollTo is absent
-                // in older Safari, and paging a table should not throw there.
-                root.querySelector('.table-wrap')?.scrollTo?.({ top: 0 });
-            }),
-            on(root, 'change', '[data-dt-select]', (_e, target) => {
-                const id = target.dataset.dtSelect;
-                if (target.checked) this.state.selected.add(id);
-                else this.state.selected.delete(id);
-                target.closest('tr')?.setAttribute('aria-selected', String(target.checked));
-                this.refreshSelectionBar();
-            }),
-            on(root, 'change', '[data-dt-select-all]', (_e, target) => {
-                for (const row of this.pageRows) {
-                    if (target.checked) this.state.selected.add(row[this.rowId]);
-                    else this.state.selected.delete(row[this.rowId]);
-                }
-                this.refresh();
-            }),
-            on(root, 'click', '[data-dt-clear-selection]', () => {
-                this.state.selected.clear();
-                this.refresh();
-            }),
-            on(root, 'click', '[data-dt-bulk]', async (_e, target) => {
-                const action = this.bulkActions[Number(target.dataset.dtBulk)];
-                if (!action) return;
-                target.dataset.loading = 'true';
-                try {
-                    await action.onClick([...this.state.selected]);
-                } finally {
-                    delete target.dataset.loading;
-                }
-            }),
-            on(root, 'click', '[data-dt-clear-search]', () => {
-                this.state.search = '';
-                const input = root.querySelector('[data-dt-search]');
-                if (input) input.value = '';
-                this.refresh();
-            }),
-            on(root, 'click', '[data-dt-empty-action]', () => this.emptyAction?.onClick())
-        );
-
-        if (this.onRowClick) {
-            this.disposers.push(
-                on(root, 'click', '[data-dt-row]', (event, target) => {
-                    // A click on a control inside the row belongs to that
-                    // control, not to the row.
-                    if (event.target.closest('button, a, input, label, select')) return;
-                    const row = this.rows.find((r) => String(r[this.rowId]) === target.dataset.dtRow);
-                    if (row) this.onRowClick(row, event);
-                }),
-                on(root, 'keydown', '[data-dt-row]', (event, target) => {
-                    if (event.key !== 'Enter') return;
-                    const row = this.rows.find((r) => String(r[this.rowId]) === target.dataset.dtRow);
-                    if (row) this.onRowClick(row, event);
-                })
-            );
-        }
-    }
-
-    refreshSelectionBar() {
-        const existing = this.container.querySelector('[data-dt-selection]');
-        if (existing) existing.outerHTML = String(this.selectionMarkup());
-    }
-
-    sortBy(key) {
-        if (this.state.sortKey === key) {
-            this.state.sortDir = this.state.sortDir === 'asc' ? 'desc' : 'asc';
-        } else {
-            this.state.sortKey = key;
-            this.state.sortDir = 'asc';
-        }
-        this.state.page = 1;
-        this.refresh();
-
-        const column = this.columns.find((c) => c.key === key);
-        announce(`Sorted by ${column?.label || key}, ${this.state.sortDir === 'asc' ? 'ascending' : 'descending'}`);
-    }
-
-    syncSortIndicators() {
-        for (const th of this.container.querySelectorAll('[data-dt-sort]')) {
-            const active = th.dataset.dtSort === this.state.sortKey;
-            th.setAttribute('aria-sort', active ? (this.state.sortDir === 'asc' ? 'ascending' : 'descending') : 'none');
-        }
-    }
-
-    syncSelectAll() {
-        const box = this.container.querySelector('[data-dt-select-all]');
-        if (!box) return;
-        const ids = this.pageRows.map((r) => r[this.rowId]);
-        const chosen = ids.filter((id) => this.state.selected.has(id)).length;
-        box.checked = chosen > 0 && chosen === ids.length;
-        box.indeterminate = chosen > 0 && chosen < ids.length;
-    }
-
-    /* ---------------------------------------------------------------- EXPORT */
-
-    /** Rows currently visible after search and sort — what the user sees. */
-    toCSV() {
-        const header = this.columns
-            .filter((c) => c.align !== 'actions')
-            .map((c) => csvCell(c.label));
-
-        const lines = this.processed.map((row) => this.columns
-            .filter((c) => c.align !== 'actions')
-            .map((c) => csvCell(c.exportValue ? c.exportValue(row) : row[c.key]))
-            .join(','));
-
-        return [header.join(','), ...lines].join('\r\n');
-    }
-
-    destroy() {
-        this.disposers.forEach((d) => d());
-        this.disposers = [];
-        this.container = null;
-    }
+    return html`
+        <div class="field" data-width="${config.width || 'full'}">
+            <label class="field-label" for="${id}">${label}${required ? requiredMark() : ''}</label>
+            ${type === 'money'
+                ? html`<div class="input-group"><span class="input-prefix">₹</span>${control}</div>`
+                : control}
+            ${hint ? html`<p class="field-hint" id="${id}-hint">${hint}</p>` : ''}
+            <p class="field-error" data-error-for="${name}" hidden></p>
+        </div>
+    `;
 }
 
-/** Excel interprets a leading =, +, - or @ as a formula. Prefix breaks that. */
-function csvCell(value) {
-    let text = value === null || value === undefined ? '' : String(value);
-    if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
-    return `"${text.replace(/"/g, '""')}"`;
+function requiredMark() {
+    return html`<span class="field-required" aria-hidden="true">*</span><span class="sr-only"> (required)</span>`;
 }
 
-/** 1 … 4 5 [6] 7 8 … 20 */
-function pageNumbers(current, total) {
-    if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
+/** Renders a list of fields into a responsive grid. */
+export function fields(list) {
+    return html`<div class="form-grid">${list.filter(Boolean).map((f) => field(f))}</div>`;
+}
 
-    const pages = new Set([1, total, current, current - 1, current + 1]);
-    if (current <= 3) [2, 3, 4].forEach((p) => pages.add(p));
-    if (current >= total - 2) [total - 1, total - 2, total - 3].forEach((p) => pages.add(p));
+/** A titled group of fields. */
+export function section(title, list, description = '') {
+    return html`
+        <section class="form-section">
+            <h3 class="form-section-title">${title}</h3>
+            ${description ? html`<p class="form-section-description">${description}</p>` : ''}
+            ${fields(list)}
+        </section>
+    `;
+}
 
-    const sorted = [...pages].filter((p) => p >= 1 && p <= total).sort((a, b) => a - b);
+/* ==========================================================================
+   READING VALUES BACK
+   ========================================================================== */
 
-    const out = [];
-    let previous = 0;
-    for (const page of sorted) {
-        if (page - previous > 1) out.push('…');
-        out.push(page);
-        previous = page;
+/**
+ * Reads a form's values, typed according to the field list that produced it.
+ *
+ * Typing here rather than at the call site is what stops a rupee amount
+ * reaching a service as the string "1200.50". Money always leaves this
+ * function as integer paise, numbers as numbers, empty text as null.
+ */
+export function readForm(root, list) {
+    const values = {};
+
+    for (const config of list.filter(Boolean)) {
+        if (!config.name || config.type === 'divider' || config.type === 'static') continue;
+
+        const control = root.querySelector(`[name="${CSS.escape(config.name)}"]`);
+        if (!control && config.type !== 'radio' && config.type !== 'checkbox-group') continue;
+
+        switch (config.type) {
+            case 'checkbox-group': {
+                const boxes = root.querySelectorAll(`[name="${CSS.escape(config.name)}"]:checked`);
+                values[config.name] = [...boxes].map((box) => box.value);
+                break;
+            }
+            case 'checkbox':
+            case 'switch':
+                values[config.name] = Boolean(control.checked);
+                break;
+            case 'radio': {
+                const checked = root.querySelector(`[name="${CSS.escape(config.name)}"]:checked`);
+                values[config.name] = checked ? checked.value : null;
+                break;
+            }
+            case 'money': {
+                const raw = control.value.trim();
+                values[config.name] = raw === '' ? null : toPaise(Number(raw));
+                break;
+            }
+            case 'number': {
+                const raw = control.value.trim();
+                values[config.name] = raw === '' ? null : Number(raw);
+                break;
+            }
+            default: {
+                const raw = String(control.value ?? '').trim();
+                values[config.name] = raw === '' ? null : raw;
+            }
+        }
     }
-    return out;
+
+    return values;
+}
+
+/** Shape-level validation only. Returns { ok, errors: { field: message } }. */
+export function validateShape(values, list) {
+    const errors = {};
+
+    for (const config of list.filter(Boolean)) {
+        if (!config.name) continue;
+        const value = values[config.name];
+
+        // An empty array is empty even though it is truthy.
+        if (config.required && Array.isArray(value) && value.length === 0) {
+            errors[config.name] = `${config.label} is needed.`;
+            continue;
+        }
+        if (config.required && (value === null || value === undefined || value === '' || value === false)) {
+            errors[config.name] = `${config.label} is needed.`;
+            continue;
+        }
+        if (value === null || value === undefined) continue;
+
+        if ((config.type === 'number' || config.type === 'money') && Number.isNaN(value)) {
+            errors[config.name] = 'This must be a number.';
+        }
+        if (config.type === 'money' && value !== null && value < 0) {
+            errors[config.name] = 'This cannot be negative.';
+        }
+        if (config.type === 'number' && config.min !== undefined && value < config.min) {
+            errors[config.name] = `This cannot be below ${config.min}.`;
+        }
+        if (config.type === 'number' && config.max !== undefined && value > config.max) {
+            errors[config.name] = `This cannot be above ${config.max}.`;
+        }
+        if (config.type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+            errors[config.name] = 'This does not look like an email address.';
+        }
+        if (config.type === 'tel' && String(value).replace(/\D/g, '').length < 10) {
+            errors[config.name] = 'A phone number needs at least ten digits.';
+        }
+    }
+
+    return { ok: Object.keys(errors).length === 0, errors };
+}
+
+/**
+ * Paints errors onto a rendered form and moves focus to the first one, so a
+ * failure on a long form does not leave the user hunting for the red text.
+ */
+export function showErrors(root, errors) {
+    root.querySelectorAll('[data-error-for]').forEach((node) => {
+        node.hidden = true;
+        node.textContent = '';
+    });
+    root.querySelectorAll('[aria-invalid]').forEach((node) => node.removeAttribute('aria-invalid'));
+
+    let first = null;
+
+    for (const [name, message] of Object.entries(errors || {})) {
+        const slot = root.querySelector(`[data-error-for="${CSS.escape(name)}"]`);
+        const control = root.querySelector(`[name="${CSS.escape(name)}"]`);
+
+        if (slot) {
+            slot.textContent = message;
+            slot.hidden = false;
+        }
+        if (control) {
+            control.setAttribute('aria-invalid', 'true');
+            control.setAttribute('aria-errormessage', `err-${name}`);
+            if (slot) slot.id = `err-${name}`;
+            if (!first) first = control;
+        }
+    }
+
+    first?.focus();
+    return first !== null;
+}
+
+/** Clears every error slot. */
+export function clearErrors(root) {
+    showErrors(root, {});
+}
+
+/* ==========================================================================
+   FORM OVERLAYS
+   ========================================================================== */
+
+/**
+ * A drawer or modal containing a form. Resolves with the submitted values, or
+ * null if the user backed out.
+ *
+ * The submit handler is given the typed values and may throw: a thrown error
+ * is shown inside the form rather than as a toast, because the user is looking
+ * at the form and an error about the form belongs there. If the handler
+ * returns a `{ errors }` object, those are painted onto the fields.
+ *
+ * @param {object} options
+ * @param {string} options.title
+ * @param {Field[]} options.fields
+ * @param {Function} options.onSubmit  async (values, helpers) => result
+ * @param {'modal'|'drawer'} [options.variant='drawer']
+ * @param {string} [options.submitLabel='Save']
+ * @param {Function} [options.onMount]  (body, helpers) => void — for live wiring.
+ */
+export function formOverlay({
+    title,
+    description = '',
+    fields: list,
+    onSubmit,
+    variant = 'drawer',
+    size = 'md',
+    submitLabel = 'Save',
+    cancelLabel = 'Cancel',
+    intro = '',
+    danger = false,
+    onMount = null
+}) {
+    let body = null;
+    let currentFields = list;
+
+    const helpers = {
+        /** Swaps the field list — for forms whose shape depends on a choice. */
+        setFields(next) {
+            currentFields = next;
+            const values = readForm(body, currentFields);
+            render(body.querySelector('[data-role="fields"]'), fields(next));
+            // Restore what the user had already typed into surviving fields.
+            for (const [name, value] of Object.entries(values)) {
+                const control = body.querySelector(`[name="${CSS.escape(name)}"]`);
+                if (control && value !== null && control.type !== 'checkbox') control.value = value;
+            }
+        },
+        values: () => readForm(body, currentFields),
+        setError(name, message) { showErrors(body, { [name]: message }); },
+        banner(message, tone = 'danger') {
+            const slot = body.querySelector('[data-role="form-banner"]');
+            if (!slot) return;
+            render(slot, message
+                ? html`<div class="alert alert-${tone}"><p class="alert-body">${message}</p></div>`
+                : '');
+        }
+    };
+
+    return overlay({
+        variant,
+        size,
+        title,
+        description,
+        content: html`
+            <form data-role="form" novalidate>
+                <div data-role="form-banner"></div>
+                ${intro ? html`<p class="type-body mb-4">${intro}</p>` : ''}
+                <div data-role="fields">${fields(list)}</div>
+            </form>
+        `,
+        actions: [
+            { label: cancelLabel, variant: 'secondary', value: null },
+            {
+                label: submitLabel,
+                variant: danger ? 'danger' : 'primary',
+                primary: true,
+                onClick: async ({ body: mounted, close, button }) => {
+                    void mounted; void close;
+                    const values = readForm(body, currentFields);
+                    const shape = validateShape(values, currentFields);
+
+                    // `false` is the overlay's "stay open" signal; every
+                    // validation failure below uses it.
+                    if (!shape.ok) {
+                        showErrors(body, shape.errors);
+                        return false;
+                    }
+                    clearErrors(body);
+
+                    const original = button.innerHTML;
+                    button.innerHTML = 'Working…';
+
+                    try {
+                        const result = await onSubmit(values, helpers);
+                        if (result && result.errors) {
+                            showErrors(body, result.errors);
+                            return false;
+                        }
+                        return result === undefined ? values : result;
+                    } catch (err) {
+                        console.error('Form submission failed', err);
+                        helpers.banner(err.message);
+                        body.scrollTo?.({ top: 0, behavior: 'smooth' });
+                        return false;
+                    } finally {
+                        button.innerHTML = original;
+                    }
+                }
+            }
+        ],
+        onMount: (mounted, api) => {
+            body = mounted;
+            // Enter submits, as it does in every other form the user has used.
+            mounted.querySelector('[data-role="form"]')?.addEventListener('submit', (event) => {
+                event.preventDefault();
+                mounted.closest('.modal, .drawer')?.querySelector('.btn-primary, .btn-danger')?.click();
+            });
+            onMount?.(mounted, { ...helpers, close: api.close });
+            mounted.querySelector('input, select, textarea')?.focus();
+        }
+    });
+}
+
+/* ==========================================================================
+   SMALL HELPERS PAGES REACH FOR
+   ========================================================================== */
+
+/** Turns a record list into select options. */
+export function optionsFrom(rows, { value = 'id', label = 'name', note = null, disabled = null } = {}) {
+    return rows.map((row) => ({
+        value: typeof value === 'function' ? value(row) : row[value],
+        label: typeof label === 'function' ? label(row) : row[label],
+        note: note ? (typeof note === 'function' ? note(row) : row[note]) : null,
+        disabled: disabled ? disabled(row) : false
+    }));
+}
+
+/** Rupee value for pre-filling a money field from stored paise. */
+export function moneyValue(paise) {
+    return paise === null || paise === undefined ? '' : String(toRupees(paise));
+}
+
+/** A read-only summary block, used in confirmation steps. */
+export function summaryList(pairs) {
+    return html`
+        <dl class="dl">
+            ${pairs.filter(([, value]) => value !== null && value !== undefined && value !== '')
+                .map(([term, value]) => html`<dt>${term}</dt><dd>${value}</dd>`)}
+        </dl>
+    `;
+}
+
+/** Escapes a value for use inside an attribute built by hand. */
+export const attr = escapeHtml;
+
+/**
+ * Filter-bar controls.
+ *
+ * These are deliberately separate from the form builder: a filter is not a
+ * form field. It has no validation, no submit, no dirty state, and it applies
+ * the instant it changes. Nine pages had hand-rolled the same label/select
+ * pairing with slightly different aria wiring — three of them had no
+ * accessible name at all — so it lives here now.
+ *
+ * Both emit `data-filter="<name>"`, which is the delegation hook every page
+ * listens on.
+ */
+export function filterSelect({ name, label, options, value = '', width = null }) {
+    return html`
+        <label class="filter-control" ${width ? `style="width:${width}"` : ''}>
+            <span class="sr-only">${label}</span>
+            <select class="select select-sm" data-filter="${name}" aria-label="${label}">
+                ${options.map((option) => html`
+                    <option value="${option.value}" ${String(value) === String(option.value) ? 'selected' : ''}>
+                        ${option.label}
+                    </option>
+                `)}
+            </select>
+        </label>
+    `;
+}
+
+/** The date half of the same pattern — used by every date-range filter bar. */
+export function filterDate({ name, label, value = '', min = null, max = null }) {
+    return html`
+        <label class="filter-control">
+            <span class="type-caption type-muted">${label}</span>
+            <input class="input input-sm" type="date" data-filter="${name}"
+                   value="${value || ''}" aria-label="${label}"
+                   ${min ? `min="${min}"` : ''} ${max ? `max="${max}"` : ''}>
+        </label>
+    `;
 }

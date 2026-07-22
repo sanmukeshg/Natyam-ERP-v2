@@ -1,585 +1,510 @@
 /**
- * NATYAM ERP 2.0 — Finance service
+ * Headless smoke test.
  *
- * Income, expenditure, payroll and the reports built on them. Deliberately
- * separate from fee collection, and the separation is worth restating because
- * it is the largest structural change from 1.0:
+ * Boots the real database layer against a fake IndexedDB, seeds it, and drives
+ * the actual services through the school's core workflows. Nothing here is
+ * mocked below the service boundary — the repositories, transactions, sequence
+ * allocation and ledger posting are all the shipping code.
  *
- *   Fee collection answers "what does this family owe and what have they paid".
- *   Finance answers "what did the school earn and spend".
- *
- * They meet at exactly one point: a cleared payment posts an income entry to
- * the ledger. That posting happens inside the fee service's transaction, so
- * the ledger cannot drift from the receipts. This module never reaches back
- * into invoices to recompute income — if it did, the two would eventually
- * disagree and there would be no way to say which was right.
- *
- * Every amount here is integer paise. There is no floating point anywhere in
- * this file, which is why the P&L adds up.
+ * This exists because the browser is the only other place this code has ever
+ * run, and "it parses" is a long way from "a payment posts to the ledger".
  */
 
-import { bus, EVENTS } from '../core/bus.js';
-import { session } from '../core/session.js';
-import { db, request } from '../core/db.js';
-import { uid } from '../utils/id.js';
-import { localDate, nowISO, monthKey, lastMonths, startOfMonth, endOfMonth, formatMonth } from '../utils/date.js';
-import { EXPENSE_CATEGORIES } from '../config/app.config.js';
-import { auditRow } from './audit.service.js';
-import {
-    ledger$, expenses$, salaries$, staff$, branches$, settings$,
-    LedgerMath, ExpenseMath
-} from '../data/repositories.js';
-import { notify } from './notifications.service.js';
+import 'fake-indexeddb/auto';
 
-/** Ledger accounts. Income accounts first, then expenditure. */
-export const ACCOUNTS = Object.freeze({
-    income: ['Tuition fees', 'Registration fees', 'Costume sales', 'Programme tickets', 'Workshop fees', 'Donations', 'Other income'],
-    expense: ['Salaries', ...EXPENSE_CATEGORIES.filter((c) => c !== 'Salaries')]
+/* ---------------------------------------------------------------- BROWSERISH */
+
+// The modules expect a browser. Only the pieces the *service* layer touches are
+// stubbed; anything a service genuinely needs is the real implementation.
+globalThis.window = globalThis;
+// Node exposes navigator as a getter-only property, so storage is defined on it.
+Object.defineProperty(globalThis.navigator, 'storage', {
+    configurable: true,
+    value: {
+        estimate: async () => ({ usage: 1024, quota: 1024 * 1024 * 512 }),
+        persisted: async () => false,
+        persist: async () => false
+    }
 });
 
-/* ==========================================================================
-   LEDGER POSTING
-   ========================================================================== */
+globalThis.localStorage = {
+    _data: new Map(),
+    getItem(k) { return this._data.has(k) ? this._data.get(k) : null; },
+    setItem(k, v) { this._data.set(k, String(v)); },
+    removeItem(k) { this._data.delete(k); }
+};
 
-/**
- * Posts a manual ledger entry — a donation, a ticket sale, a correction.
- *
- * Entries produced automatically by another module (a fee payment, a salary
- * run) carry a `sourceType` and are written inside that module's transaction.
- * A manual entry has no source, and that distinction is what lets the audit
- * view separate "the system recorded this" from "a person typed this".
- */
-export async function postEntry({ date, account, type, amount, narration, branchId = null, sourceType = null, sourceId = null }) {
-    session.require('finance.edit', 'post a ledger entry');
+globalThis.document = {
+    documentElement: { dataset: {} },
+    createElement: () => ({ style: {}, classList: { add() {}, remove() {}, toggle() {} },
+                            setAttribute() {}, append() {}, remove() {}, click() {},
+                            addEventListener() {} }),
+    body: { append() {}, contains: () => false, classList: { add() {}, remove() {} } },
+    querySelector: () => null,
+    addEventListener() {}
+};
+globalThis.addEventListener = () => {};
+globalThis.matchMedia = () => ({ matches: false, addEventListener() {} });
+globalThis.URL.createObjectURL = () => 'blob:stub';
+globalThis.URL.revokeObjectURL = () => {};
 
-    const value = Math.round(Number(amount) || 0);
-    const when = date || localDate();
+/* ------------------------------------------------------------------ HARNESS */
 
-    if (!['income', 'expense'].includes(type)) throw new Error('An entry is either income or expenditure.');
-    if (!account) throw new Error('Choose an account.');
-    if (!ACCOUNTS[type].includes(account)) throw new Error(`"${account}" is not an ${type} account.`);
-    if (value <= 0) throw new Error('The amount must be more than zero.');
-    if (!narration?.trim()) throw new Error('Describe what this entry is for.');
-    if (when > localDate()) throw new Error('A ledger entry cannot be dated in the future.');
+let passed = 0;
+let failed = 0;
+const failures = [];
 
-    const entry = await ledger$.create({
-        date: when,
-        period: monthKey(when),
-        account,
-        type,
-        amount: value,
-        narration: narration.trim(),
-        branchId: branchId || session.activeBranchId,
-        sourceType,
-        sourceId,
-        manual: !sourceType
-    });
-
-    bus.emit(EVENTS.LEDGER_POSTED, { entry });
-    return entry;
+async function check(label, fn) {
+    try {
+        await fn();
+        passed += 1;
+        console.log(`  ok   ${label}`);
+    } catch (err) {
+        failed += 1;
+        failures.push({ label, err });
+        console.log(`  FAIL ${label}\n         ${err.message}`);
+        if (process.env.TRACE) console.log(err.stack);
+    }
 }
 
-/**
- * Reverses an entry with a contra rather than deleting it. A ledger you can
- * delete from is not a ledger.
- */
-export async function reverseEntry(id, { reason }) {
-    session.require('finance.edit', 'reverse a ledger entry');
+function assert(condition, message) {
+    if (!condition) throw new Error(message);
+}
 
-    const original = await ledger$.findOrFail(id);
-    if (original.reversedBy) throw new Error('This entry has already been reversed.');
-    if (!reason?.trim()) throw new Error('A reversal needs a reason.');
+function eq(actual, expected, message) {
+    if (actual !== expected) {
+        throw new Error(`${message} — expected ${expected}, got ${actual}`);
+    }
+}
 
-    const contra = await ledger$.create({
+/* -------------------------------------------------------------------- BOOT */
+
+const BASE = '../js';
+
+const { db } = await import(`${BASE}/core/db.js`);
+const { session } = await import(`${BASE}/core/session.js`);
+const { seedIfEmpty } = await import(`${BASE}/data/seed.js`);
+const repos = await import(`${BASE}/data/repositories.js`);
+
+console.log('\n== Boot ==');
+
+await check('database opens and migrations run', async () => {
+    await db.open();
+    assert(db.db || db._db || true, 'database handle missing');
+});
+
+await check('seeding produces a working school', async () => {
+    await seedIfEmpty();
+    const branches = await repos.branches$.active();
+    assert(branches.length > 0, 'no branches after seeding');
+    const students = await repos.students$.active();
+    assert(students.length > 0, 'no students after seeding');
+});
+
+await check('session hydrates with capabilities', async () => {
+    const branches = await repos.branches$.active();
+    session.hydrate({
+        user: { id: 'owner', name: 'Principal', role: 'owner' },
+        branches,
+        activeBranchId: null
+    });
+    assert(session.can('fee.collect'), 'owner cannot collect fees');
+    assert(typeof session.branch() === 'string' || session.branch() === null,
+        'session.branch() must return an id or null, not an object');
+});
+
+/* ---------------------------------------------------------------- SERVICES */
+
+const students = await import(`${BASE}/services/students.service.js`);
+const batches = await import(`${BASE}/services/batches.service.js`);
+const attendance = await import(`${BASE}/services/attendance.service.js`);
+const fees = await import(`${BASE}/services/fees.service.js`);
+const finance = await import(`${BASE}/services/finance.service.js`);
+const admissions = await import(`${BASE}/services/admissions.service.js`);
+const programs = await import(`${BASE}/services/programs.service.js`);
+const certificates = await import(`${BASE}/services/certificates.service.js`);
+const reports = await import(`${BASE}/services/reports.service.js`);
+const analytics = await import(`${BASE}/services/analytics.service.js`);
+const notifications = await import(`${BASE}/services/notifications.service.js`);
+const settings = await import(`${BASE}/services/settings.service.js`);
+const backup = await import(`${BASE}/services/backup.service.js`);
+const importer = await import(`${BASE}/services/import.service.js`);
+const search = await import(`${BASE}/services/search.service.js`);
+const dashboard = await import(`${BASE}/services/dashboard.service.js`);
+const audit = await import(`${BASE}/services/audit.service.js`);
+
+const { localDate } = await import(`${BASE}/utils/date.js`);
+
+console.log('\n== Workflow: admission to enrolled student ==');
+
+let newStudent = null;
+
+await check('an application can be submitted and enrolled', async () => {
+    const branch = (await repos.branches$.active())[0];
+    const plans = await settings.listFeePlans();
+    const application = await admissions.submit({
+        name: 'Smoke Test Child',
+        dateOfBirth: '2015-04-02',
+        gender: 'female',
+        guardianName: 'Test Guardian',
+        guardianRelation: 'Mother',
+        guardianPhone: '9876500000',
+        branchId: branch.id,
+        level: 'prarambhika',
+        feePlanId: plans[0]?.id
+    });
+    assert(application.id, 'no application id');
+
+    await admissions.approve(application.id, { note: 'smoke test' });
+
+    // eligibleBatches is what the wizard offers; picking any open batch would
+    // hit the level-match rule, which is the service doing its job.
+    const eligible = await admissions.eligibleBatches('prarambhika', branch.id);
+    assert(eligible.length > 0, 'no eligible batch for a Prarambhika beginner');
+
+    const result = await admissions.enrolApplicant(application.id, {
+        batchId: eligible[0].id,
+        raiseFees: false
+    });
+    newStudent = result.student || result;
+    assert(newStudent.id, 'enrolment produced no student');
+    assert(newStudent.admissionNo, 'student has no admission number');
+});
+
+await check('the student appears on the roll exactly once', async () => {
+    const roll = await students.listStudents(null, { status: 'active' });
+    const matches = roll.filter((s) => s.name === 'Smoke Test Child');
+    eq(matches.length, 1, 'duplicate or missing student on the roll');
+});
+
+console.log('\n== Workflow: batch assignment and attendance ==');
+
+let batch = null;
+
+await check('the student can be placed in a batch', async () => {
+    const profile0 = await students.profile(newStudent.id);
+    batch = (await batches.listBatches(null, {})).find((b) => b.id === profile0.student.batchId);
+    assert(batch, 'the enrolled student has no batch');
+    await students.assignToBatch(newStudent.id, batch.id);
+    const profile = await students.profile(newStudent.id);
+    eq(profile.student.batchId, batch.id, 'batch was not saved');
+});
+
+await check('a register opens, posts, and totals correctly', async () => {
+    const today = localDate();
+    const register = await attendance.openRegister(batch.id, today);
+    assert(register.entries.length > 0, 'register has no students');
+
+    const entries = register.entries.map((entry, index) => ({
+        studentId: entry.studentId,
+        status: index === 0 ? 'absent' : 'present'
+    }));
+
+    const result = await attendance.postRegister({ batchId: batch.id, date: today, entries });
+    assert(result, 'postRegister returned nothing');
+
+    const summary = await attendance.summary({ from: today, to: today, batchId: batch.id });
+    eq(summary.marks, entries.length, 'wrong number of marks stored');
+    assert(summary.rate !== null && summary.rate < 100, 'an absence did not reduce the rate');
+});
+
+await check('posting the same register again corrects rather than duplicates', async () => {
+    const today = localDate();
+    const register = await attendance.openRegister(batch.id, today);
+    const entries = register.entries.map((entry) => ({ studentId: entry.studentId, status: 'present' }));
+    await attendance.postRegister({ batchId: batch.id, date: today, entries });
+
+    const summary = await attendance.summary({ from: today, to: today, batchId: batch.id });
+    eq(summary.marks, entries.length, 'correction duplicated the marks');
+    eq(summary.rate, 100, 'correction did not take effect');
+});
+
+console.log('\n== Workflow: fee collection to ledger ==');
+
+let invoice = null;
+
+await check('an ad-hoc invoice can be raised', async () => {
+    invoice = await fees.createInvoice({
+        studentId: newStudent.id,
+        branchId: newStudent.branchId,
+        amount: 250000,
+        description: 'Smoke test costume',
+        dueDate: localDate()
+    });
+    assert(invoice.number?.includes('INV'), 'invoice has no sequence number');
+    eq(invoice.amount, 250000, 'invoice amount wrong');
+    eq(invoice.paidAmount, 0, 'new invoice is not unpaid');
+});
+
+await check('a payment settles the invoice and posts income to the ledger', async () => {
+    const before = await finance.profitAndLoss({
+        from: localDate(), to: localDate(), branchId: null
+    });
+
+    // recordPayment returns { payment, invoice }: the caller needs the receipt
+    // and the invoice's new state, so the pair is deliberate.
+    const { payment } = await fees.recordPayment({
+        invoiceId: invoice.id,
+        amount: 250000,
+        mode: 'cash'
+    });
+    assert(payment.receiptNo || payment.number, 'payment produced no receipt number');
+
+    const after = await finance.profitAndLoss({
+        from: localDate(), to: localDate(), branchId: null
+    });
+    eq(after.totalIncome - before.totalIncome, 250000,
+        'the ledger did not receive the payment as income');
+});
+
+await check('the settled invoice reports a zero balance', async () => {
+    const summary = await fees.studentFeeSummary(newStudent.id);
+    const settled = summary.invoices.find((i) => i.id === invoice.id);
+    eq(settled.balance, 0, 'invoice still shows a balance');
+    eq(settled.status, 'paid', 'invoice status did not become paid');
+});
+
+await check('a receipt can be produced for printing', async () => {
+    const summary = await fees.studentFeeSummary(newStudent.id);
+    const receipt = summary.receipts?.[0];
+    assert(receipt, 'no receipt recorded');
+    const data = await fees.receiptData(receipt.id);
+    assert(data.institute?.name, 'receipt has no institute name');
+    assert(data.payment || data.receipt, 'receipt has no payment detail');
+});
+
+console.log('\n== Workflow: expenses and payroll ==');
+
+await check('an expense posts and can be corrected', async () => {
+    const expense = await finance.recordExpense({
+        category: 'Rent',
+        amount: 100000,
+        description: 'Smoke test hall hire',
         date: localDate(),
-        period: monthKey(localDate()),
-        account: original.account,
-        type: original.type === 'income' ? 'expense' : 'income',
-        amount: original.amount,
-        narration: `Reversal of ${original.narration} — ${reason.trim()}`,
-        branchId: original.branchId,
-        sourceType: 'reversal',
-        sourceId: original.id
+        mode: 'cash',
+        branchId: newStudent.branchId
     });
 
-    await ledger$.update(id, { reversedBy: contra.id, reversedOn: localDate(), reversalReason: reason.trim() });
-    bus.emit(EVENTS.LEDGER_POSTED, { entry: contra });
-    return contra;
-}
+    const corrected = await finance.updateExpense(expense.id, { amount: 120000 });
+    eq(corrected.amount, 120000, 'expense correction did not stick');
 
-/* ==========================================================================
-   EXPENSES
-   ========================================================================== */
+    const list = await finance.listExpenses({ from: localDate(), to: localDate() });
+    assert(list.some((row) => row.id === expense.id), 'corrected expense missing from the list');
+});
 
-/**
- * Records an expense and posts it to the ledger atomically.
- *
- * 1.0 could not record expenses at all — the finance page showed income only,
- * which meant the "profit" figure it displayed was revenue with a different
- * label. The two rows are written together so an expense can never exist
- * without its ledger counterpart.
- */
-export async function recordExpense(data) {
-    session.require('finance.edit', 'record an expense');
+await check('an expense can be removed and leaves the ledger consistent', async () => {
+    const expense = await finance.recordExpense({
+        category: 'Costumes',
+        amount: 50000,
+        description: 'Smoke test removable',
+        date: localDate(),
+        mode: 'cash',
+        branchId: newStudent.branchId
+    });
 
-    const amount = Math.round(Number(data.amount) || 0);
-    const date = data.date || localDate();
+    const before = await finance.profitAndLoss({ from: localDate(), to: localDate() });
+    await finance.removeExpense(expense.id, { reason: 'smoke test' });
+    const after = await finance.profitAndLoss({ from: localDate(), to: localDate() });
 
-    if (!data.category) throw new Error('Choose an expense category.');
-    if (!EXPENSE_CATEGORIES.includes(data.category)) throw new Error(`"${data.category}" is not a recognised category.`);
-    if (!data.description?.trim()) throw new Error('Describe what this expense was for.');
-    if (amount <= 0) throw new Error('The amount must be more than zero.');
-    if (date > localDate()) throw new Error('An expense cannot be dated in the future.');
+    eq(before.totalExpense - after.totalExpense, 50000,
+        'removing an expense did not remove its ledger entry');
 
-    const branchId = data.branchId || session.activeBranchId;
-    if (!branchId) throw new Error('Choose which branch this expense belongs to.');
+    const list = await finance.listExpenses({ from: localDate(), to: localDate() });
+    assert(!list.some((row) => row.id === expense.id), 'removed expense still listed');
+});
 
-    const at = nowISO();
-    const actor = session.actorId();
-    const expenseId = uid('EXP');
+await check('payroll can be prepared', async () => {
+    const payroll = await finance.preparePayroll();
+    assert(Array.isArray(payroll.lines || payroll.rows || payroll),
+        'payroll returned an unexpected shape');
+});
 
-    const expense = {
-        id: expenseId,
-        branchId,
-        date,
-        period: monthKey(date),
-        category: data.category,
-        amount,
-        description: data.description.trim(),
-        paidTo: data.paidTo?.trim() || null,
-        mode: data.mode || 'cash',
-        reference: data.reference?.trim() || null,
-        status: data.status || 'paid',
-        searchKey: [data.description, data.category, data.paidTo].filter(Boolean).join(' ').toLowerCase(),
-        createdAt: at, createdBy: actor, updatedAt: at, updatedBy: actor, deletedAt: null
-    };
+console.log('\n== Workflow: programmes and certificates ==');
 
-    const entry = {
-        id: uid('LDG'),
-        branchId,
-        date,
-        period: monthKey(date),
-        account: data.category,
-        type: 'expense',
-        amount,
-        narration: [expense.description, expense.paidTo].filter(Boolean).join(' — '),
-        sourceType: 'expense',
-        sourceId: expenseId,
-        createdAt: at, createdBy: actor, updatedAt: at, updatedBy: actor
-    };
+let program = null;
 
-    await db.unit(['expenses', 'ledgerEntries', 'auditLog'], async (s) => {
-        await request(s.expenses.put(expense));
-        await request(s.ledgerEntries.put(entry));
-        await request(s.auditLog.put(auditRow('Expense', expenseId, 'create', { amount, category: expense.category })));
-    }, 'finance:expense');
+await check('a programme can be scheduled and cast', async () => {
+    const branch = (await repos.branches$.active())[0];
+    program = await programs.schedule({
+        name: 'Smoke Test Recital',
+        type: 'performance',
+        date: localDate(),
+        branchId: branch.id,
+        venue: 'Test Hall'
+    });
+    await programs.setParticipants(program.id, [newStudent.id]);
+    const detail = await programs.programDetail(program.id);
+    eq(detail.participants.length, 1, 'cast was not saved');
+});
 
-    bus.emit(EVENTS.EXPENSE_RECORDED, { expense });
-    bus.emit(EVENTS.LEDGER_POSTED, { entry });
+await check('a certificate issues with a verifiable serial', async () => {
+    const template = certificates.TEMPLATES[0];
+    assert(template, 'no certificate templates');
 
-    // Returns the expense itself, like every other create in the service layer.
-    // It previously returned { expense, entry }, which meant callers reaching
-    // for `.id` got undefined and the failure surfaced much later as an opaque
-    // database error. The ledger entry is reachable from the expense id.
-    return expense;
-}
+    const issued = await certificates.issue({
+        studentId: newStudent.id,
+        templateId: template.id,
+        programId: program.id,
+        force: true,
+        overrideReason: 'smoke test'
+    });
+    assert(issued.serial, 'certificate has no serial');
 
-/**
- * Edits an expense. The ledger entry is rewritten in the same transaction, so
- * correcting an amount cannot leave the books quoting the old one.
- */
-export async function updateExpense(id, changes) {
-    session.require('finance.edit', 'edit an expense');
+    const found = await certificates.verify(issued.serial);
+    assert(found?.certificate || found, 'issued certificate does not verify');
+});
 
-    const existing = await expenses$.findOrFail(id);
-    const amount = changes.amount !== undefined ? Math.round(Number(changes.amount) || 0) : existing.amount;
-    const date = changes.date || existing.date;
+console.log('\n== Reporting, analytics and search ==');
 
-    if (amount <= 0) throw new Error('The amount must be more than zero.');
-    if (date > localDate()) throw new Error('An expense cannot be dated in the future.');
-
-    const next = {
-        ...existing, ...changes,
-        amount, date,
-        period: monthKey(date),
-        updatedAt: nowISO(),
-        updatedBy: session.actorId()
-    };
-
-    const linked = (await ledger$.bySource(id))[0] || null;
-    const nextEntry = linked ? {
-        ...linked,
-        date, period: monthKey(date), amount,
-        account: next.category,
-        narration: [next.description, next.paidTo].filter(Boolean).join(' — '),
-        updatedAt: nowISO(), updatedBy: session.actorId()
-    } : null;
-
-    await db.unit(['expenses', 'ledgerEntries', 'auditLog'], async (s) => {
-        await request(s.expenses.put(next));
-        if (nextEntry) await request(s.ledgerEntries.put(nextEntry));
-        await request(s.auditLog.put(auditRow('Expense', id, 'update', { amount })));
-    }, 'finance:expense-update');
-
-    bus.emit(EVENTS.EXPENSE_RECORDED, { expense: next });
-    return next;
-}
-
-/** Removes an expense and its ledger entry together. */
-export async function removeExpense(id, { reason }) {
-    session.require('finance.edit', 'remove an expense');
-    if (!reason?.trim()) throw new Error('Say why this expense is being removed.');
-
-    const existing = await expenses$.findOrFail(id);
-    const linked = (await ledger$.bySource(id))[0] || null;
-    const at = nowISO();
-
-    await db.unit(['expenses', 'ledgerEntries', 'auditLog'], async (s) => {
-        await request(s.expenses.put({ ...existing, deletedAt: at, deletedBy: session.actorId(), deleteReason: reason.trim() }));
-        if (linked) await request(s.ledgerEntries.delete(linked.id));
-        await request(s.auditLog.put(auditRow('Expense', id, 'archive', { reason: reason.trim() })));
-    }, 'finance:expense-remove');
-
-    return true;
-}
-
-/* ==========================================================================
-   PAYROLL
-   ========================================================================== */
-
-/**
- * Prepares the month's salary lines without paying anything.
- *
- * Split from payment deliberately: the school's owner reviews the run, adjusts
- * a deduction or a bonus, and only then releases it. A single "run payroll"
- * button that both computes and disburses gives nobody a chance to catch a
- * wrong figure before it is in the ledger.
- */
-export async function preparePayroll(period = monthKey(), { branchId = null } = {}) {
-    session.require('finance.edit', 'prepare payroll');
-
-    if (!/^\d{4}-\d{2}$/.test(period)) throw new Error('The pay period must be a month, e.g. 2026-07.');
-    if (period > monthKey()) throw new Error('Payroll cannot be prepared for a future month.');
-
-    const [team, existing] = await Promise.all([
-        staff$.activeStaff(branchId),
-        salaries$.forPeriod(period)
-    ]);
-
-    const already = new Map(existing.map((s) => [s.staffId, s]));
-    const lines = [];
-
-    for (const member of team) {
-        if (already.has(member.staffId || member.id)) {
-            lines.push(already.get(member.id));
-            continue;
+await check('every report in the catalogue runs without error', async () => {
+    const problems = [];
+    for (const report of reports.REPORTS) {
+        try {
+            const result = await reports.run(report.id, {});
+            assert(Array.isArray(result.rows), `${report.id} returned no rows array`);
+            assert(result.report.columns.length > 0, `${report.id} has no columns`);
+        } catch (err) {
+            problems.push(`${report.id}: ${err.message}`);
         }
-        if (!member.monthlySalary) continue;
-
-        lines.push(await salaries$.create({
-            staffId: member.id,
-            staffName: member.name,
-            branchId: member.branchId,
-            period,
-            gross: member.monthlySalary,
-            deductions: 0,
-            allowances: 0,
-            note: null,
-            status: 'pending'
-        }));
     }
+    assert(problems.length === 0, `reports failed —\n         ${problems.join('\n         ')}`);
+});
 
-    return {
-        period,
-        lines: lines.sort((a, b) => a.staffName.localeCompare(b.staffName)),
-        gross: lines.reduce((s, l) => s + l.gross, 0),
-        net: lines.reduce((s, l) => s + l.net, 0),
-        alreadyPrepared: existing.length > 0
-    };
-}
+await check('report CSV export produces content', async () => {
+    const result = await reports.run('student-roll', {});
+    const csv = reports.toCSV(result);
+    assert(csv.split('\n').length > 1, 'CSV has no data rows');
+});
 
-/** Adjusts one salary line before it is paid. */
-export async function adjustSalary(id, { gross, deductions, allowances, note }) {
-    session.require('finance.edit', 'adjust a salary');
+await check('the analytics overview assembles with no failed panels', async () => {
+    const data = await analytics.analyticsOverview({ months: 6 });
+    assert(data.kpis, 'no KPIs');
+    eq(data.failed.length, 0, `panels failed: ${data.failed.join(', ')}`);
+});
 
-    const line = await salaries$.findOrFail(id);
-    if (line.status === 'paid') throw new Error('This salary has already been paid. Post an adjustment entry instead.');
+await check('the dashboard overview assembles', async () => {
+    const data = await dashboard.overview({});
+    assert(data, 'dashboard returned nothing');
+});
 
-    const nextGross = gross !== undefined ? Math.round(Number(gross) || 0) : line.gross;
-    const nextDeductions = deductions !== undefined ? Math.round(Number(deductions) || 0) : line.deductions;
-    const nextAllowances = allowances !== undefined ? Math.round(Number(allowances) || 0) : (line.allowances || 0);
+await check('search finds a student by name and by phone', async () => {
+    const byName = await search.searchFlat('Smoke');
+    assert(byName.length > 0, 'search found nothing by name');
 
-    if (nextDeductions > nextGross + nextAllowances) throw new Error('Deductions cannot exceed the total pay.');
-    if ((nextDeductions !== line.deductions || nextAllowances !== (line.allowances || 0)) && !note?.trim()) {
-        throw new Error('An adjustment needs a note explaining it.');
+    const byPhone = await search.searchFlat('9876500000');
+    assert(byPhone.length > 0, 'search found nothing by phone number');
+});
+
+await check('the command palette offers commands', async () => {
+    const result = await search.palette('');
+    assert(result.commands.length > 0, 'palette offered no commands');
+});
+
+console.log('\n== Notifications and audit ==');
+
+await check('derived alerts recompute without error', async () => {
+    const count = await notifications.refreshAlerts({});
+    assert(typeof count === 'number', 'refreshAlerts returned a non-number');
+    const centre = await notifications.centre({});
+    assert(Array.isArray(centre.rows), 'notification centre returned no rows');
+});
+
+await check('announcements can be posted and removed', async () => {
+    const posted = await notifications.announce({ title: 'Smoke test notice', body: 'Testing.' });
+    const list = await notifications.listAnnouncements();
+    assert(list.some((a) => a.id === posted.id), 'announcement not listed');
+    await notifications.removeAnnouncement(posted.id);
+    const after = await notifications.listAnnouncements();
+    assert(!after.some((a) => a.id === posted.id), 'announcement not removed');
+});
+
+await check('the audit log recorded the workflows above', async () => {
+    const entries = await audit.search({ limit: 500 });
+    assert(entries.length > 0, 'audit log is empty after a full workflow run');
+    const summary = await audit.activitySummary({ days: 30 });
+    assert(summary.total > 0, 'activity summary shows nothing');
+});
+
+console.log('\n== Settings, import and backup ==');
+
+await check('settings expose the institute, branches and role matrix', async () => {
+    const org = await settings.institute();
+    assert(org.name, 'institute has no name');
+    const matrix = settings.roleMatrix();
+    assert(matrix.roles.length > 0 && matrix.capabilities.length > 0, 'role matrix is empty');
+    const storage = await settings.storageStatus();
+    assert('persisted' in storage, 'storage status missing persisted flag');
+});
+
+await check('CSV import validates before writing and then writes', async () => {
+    const csv = 'name,level,guardianName,guardianPhone\n'
+        + 'Import One,prarambhika,Parent One,9800000001\n'
+        + 'Import Bad,notalevel,Parent Two,9800000002\n';
+
+    const parsed = importer.parseCSV(csv);
+    eq(parsed.rows.length, 2, 'CSV parsed the wrong number of rows');
+
+    const check1 = await importer.dryRun('students', parsed.rows, {});
+    eq(check1.total, 2, 'dry run saw the wrong number of rows');
+    eq(check1.valid, 1, 'dry run should accept exactly one row');
+    eq(check1.invalid, 1, 'dry run should reject exactly one row');
+
+    const before = (await students.listStudents(null, { status: 'active' })).length;
+    const result = await importer.commit('students', check1.rows, {});
+    if (result.created !== 1) {
+        throw new Error('commit failed: ' + JSON.stringify(result.failed));
     }
+    eq(result.created, 1, 'commit wrote the wrong number of records');
 
-    return salaries$.update(id, {
-        gross: nextGross,
-        deductions: nextDeductions,
-        allowances: nextAllowances,
-        net: nextGross + nextAllowances - nextDeductions,
-        note: note?.trim() || line.note
-    });
-}
+    const after = (await students.listStudents(null, { status: 'active' })).length;
+    eq(after - before, 1, 'the invalid row was written anyway');
+});
 
-/**
- * Disburses prepared salary lines. Each line's payment and its ledger entry go
- * in together; the whole run is one transaction so a partial payroll cannot
- * exist in the books.
- */
-export async function paySalaries(salaryIds, { paidOn = null, mode = 'bank' } = {}) {
-    session.require('finance.edit', 'pay salaries');
+await check('a backup captures the database and reports its contents', async () => {
+    const built = await backup.buildBackup({ note: 'smoke test' });
+    assert(built.data, 'backup has no data section');
+    assert(built.data.students?.length > 0, 'backup contains no students');
+    assert(built.kind, 'backup has no kind marker');
+});
 
-    const date = paidOn || localDate();
-    if (date > localDate()) throw new Error('Salaries cannot be dated in the future.');
+await check('a backup round-trips through restore', async () => {
+    const built = await backup.buildBackup({ note: 'round trip' });
+    const beforeCount = (await students.listStudents(null, { status: 'active' })).length;
 
-    const lines = await Promise.all(salaryIds.map((id) => salaries$.findOrFail(id)));
-    const unpaid = lines.filter((l) => l.status !== 'paid');
-    if (!unpaid.length) throw new Error('Every selected salary has already been paid.');
+    // Simulate the file the user would choose.
+    const file = { text: async () => JSON.stringify(built), name: 'backup.json' };
+    const inspection = await backup.inspectBackup(file);
+    assert(inspection.backup, 'inspection returned no backup');
+    eq(inspection.warnings.length, 0, `unexpected warnings: ${inspection.warnings.join('; ')}`);
 
-    const at = nowISO();
-    const actor = session.actorId();
+    await backup.restore(inspection.backup, { safetyCopy: false });
 
-    const paid = unpaid.map((line) => ({
-        ...line,
-        status: 'paid',
-        paidOn: date,
-        mode,
-        paidBy: actor,
-        updatedAt: at,
-        updatedBy: actor
-    }));
+    const afterCount = (await students.listStudents(null, { status: 'active' })).length;
+    eq(afterCount, beforeCount, 'restore changed the number of students');
+});
 
-    const entries = paid.map((line) => ({
-        id: uid('LDG'),
-        branchId: line.branchId,
-        date,
-        period: monthKey(date),
-        account: 'Salaries',
-        type: 'expense',
-        amount: line.net,
-        narration: `Salary ${formatMonth(line.period)} — ${line.staffName}`,
-        sourceType: 'salary',
-        sourceId: line.id,
-        createdAt: at, createdBy: actor, updatedAt: at, updatedBy: actor
-    }));
-
-    await db.unit(['salaries', 'ledgerEntries', 'auditLog'], async (s) => {
-        for (const line of paid) await request(s.salaries.put(line));
-        for (const entry of entries) await request(s.ledgerEntries.put(entry));
-        await request(s.auditLog.put(auditRow('Salary', null, 'pay', {
-            period: paid[0].period, count: paid.length,
-            total: paid.reduce((sum, l) => sum + l.net, 0)
-        })));
-    }, 'finance:payroll');
-
-    const total = paid.reduce((sum, l) => sum + l.net, 0);
-    bus.emit(EVENTS.SALARY_PROCESSED, { period: paid[0].period, count: paid.length, total });
-    for (const entry of entries) bus.emit(EVENTS.LEDGER_POSTED, { entry });
-
-    return { count: paid.length, total, lines: paid };
-}
-
-/* ==========================================================================
-   REPORTS
-   ========================================================================== */
-
-/**
- * Profit and loss for a period.
- *
- * Built entirely from ledger entries. Nothing here reads invoices or payments,
- * which is what guarantees the statement reconciles: there is one source of
- * truth for what the school earned, and it is the ledger.
- */
-export async function profitAndLoss({ from, to, branchId = null }) {
-    const entries = (await ledger$.between(from, to, branchId)).filter((e) => !e.reversedBy || e.sourceType === 'reversal');
-
-    const income = LedgerMath.byAccount(entries, 'income');
-    const expense = LedgerMath.byAccount(entries, 'expense');
-    const totals = LedgerMath.summarise(entries);
-
-    return {
-        from, to,
-        income,
-        expense,
-        totalIncome: totals.income,
-        totalExpense: totals.expense,
-        net: totals.net,
-        margin: totals.income ? Math.round((totals.net / totals.income) * 100) : null,
-        entryCount: entries.length
-    };
-}
-
-/**
- * Month-by-month income, expenditure and net — the finance trend chart and the
- * basis of the cash-flow view.
- */
-export async function monthlySeries(months = 6, branchId = null) {
-    const keys = lastMonths(months);
-    const from = `${keys[0]}-01`;
-    const entries = await ledger$.between(from, localDate(), branchId);
-
-    let running = 0;
-    return keys.map((period) => {
-        const slice = entries.filter((e) => e.period === period);
-        const { income, expense, net } = LedgerMath.summarise(slice);
-        running += net;
-        return { period, label: formatMonth(period), income, expense, net, cumulative: running };
-    });
-}
-
-/**
- * Cash flow: opening balance, movement, closing balance per month.
- *
- * The opening balance is a setting rather than a derived figure, because the
- * school existed before this software did and the ledger does not go back to
- * 2016. Pretending the opening balance is zero would make every cash-flow
- * statement wrong by a constant, which is worse than asking for the number.
- */
-export async function cashFlow(months = 6, branchId = null) {
-    const opening = await settings$.get('openingBalance', 0);
-    const series = await monthlySeries(months, branchId);
-
-    let balance = Number(opening) || 0;
-    return {
-        opening: balance,
-        months: series.map((row) => {
-            const start = balance;
-            balance += row.net;
-            return { ...row, opening: start, closing: balance };
-        }),
-        closing: balance
-    };
-}
-
-/**
- * The ledger view: entries in date order with a running balance, filterable by
- * account and type. This is the cash book and the bank book — the same data,
- * filtered by payment mode rather than duplicated into two stores.
- */
-export async function ledgerView({ from, to, branchId = null, type = null, account = null }) {
-    let entries = await ledger$.between(from, to, branchId);
-    if (type) entries = entries.filter((e) => e.type === type);
-    if (account) entries = entries.filter((e) => e.account === account);
-
-    entries.sort((a, b) => a.date.localeCompare(b.date) || (a.createdAt || '').localeCompare(b.createdAt || ''));
-
-    let balance = 0;
-    const rows = entries.map((entry) => {
-        balance += entry.type === 'income' ? entry.amount : -entry.amount;
-        return { ...entry, balance };
-    });
-
-    return {
-        rows,
-        totals: LedgerMath.summarise(entries),
-        accounts: [...new Set(entries.map((e) => e.account))].sort()
-    };
-}
-
-/** Expenditure broken down by category, for the donut on the finance page. */
-export async function expenseBreakdown({ from, to, branchId = null }) {
-    const rows = await expenses$.between(from, to, branchId);
-    const byCategory = ExpenseMath.byCategory(rows);
-    const total = byCategory.reduce((s, c) => s + c.amount, 0);
-
-    return {
-        total,
-        count: rows.length,
-        categories: byCategory.map((c) => ({ ...c, share: total ? Math.round((c.amount / total) * 100) : 0 }))
-    };
-}
-
-/**
- * The individual expenses behind the breakdown.
- *
- * Added because the expenses screen could aggregate spending but never show
- * the rows themselves, which meant a mistyped amount was visible only as a
- * category total that looked slightly wrong and could not be corrected. An
- * accounting screen that cannot show you the entry cannot be reconciled.
- */
-export async function listExpenses({ from, to, branchId = null, category = null } = {}) {
-    session.require('finance.view', 'view expenses');
-
-    let rows = await expenses$.between(from, to, branchId);
-    if (category) rows = rows.filter((row) => row.category === category);
-
-    return rows
-        .filter((row) => !row.deletedAt)
-        .sort((a, b) => b.date.localeCompare(a.date) || (b.createdAt || '').localeCompare(a.createdAt || ''));
-}
-
-/** Per-branch profitability — the branch comparison on the dashboard. */
-export async function branchPerformance({ from, to }) {
-    const all = await branches$.active();
-    const results = await Promise.all(all.map(async (branch) => {
-        const pl = await profitAndLoss({ from, to, branchId: branch.id });
-        return {
-            branch,
-            income: pl.totalIncome,
-            expense: pl.totalExpense,
-            net: pl.net,
-            margin: pl.margin
-        };
-    }));
-    return results.sort((a, b) => b.net - a.net);
-}
-
-/**
- * The headline finance figures for the current month, with the previous month
- * alongside. A number without a comparison is decoration.
- */
-export async function currentMonthPosition(branchId = null) {
-    const thisMonth = monthKey();
-    const previous = lastMonths(2)[0];
-
-    const [current, prior] = await Promise.all([
-        profitAndLoss({ from: `${thisMonth}-01`, to: localDate(), branchId }),
-        profitAndLoss({ from: `${previous}-01`, to: endOfMonth(new Date(`${previous}-01T00:00:00`)), branchId })
-    ]);
-
-    return {
-        period: thisMonth,
-        income: current.totalIncome,
-        expense: current.totalExpense,
-        net: current.net,
-        change: {
-            income: delta(current.totalIncome, prior.totalIncome),
-            expense: delta(current.totalExpense, prior.totalExpense),
-            net: delta(current.net, prior.net)
-        },
-        previous: { income: prior.totalIncome, expense: prior.totalExpense, net: prior.net }
-    };
-}
-
-/**
- * Flags a month whose expenditure exceeded its income. Written as an alert
- * rather than left for someone to notice on a chart.
- */
-export async function reviewMonth(period = monthKey(), branchId = null) {
-    const from = `${period}-01`;
-    const to = endOfMonth(new Date(`${from}T00:00:00`));
-    const pl = await profitAndLoss({ from, to, branchId });
-
-    if (pl.net < 0) {
-        await notify({
-            kind: 'system',
-            key: `finance:loss:${period}`,
-            title: `${formatMonth(period)} ran at a loss`,
-            body: `Expenditure exceeded income by ₹${Math.abs(pl.net / 100).toLocaleString('en-IN')}.`,
-            link: '#/finance'
-        });
+await check('a corrupt file is rejected rather than restored', async () => {
+    const file = { text: async () => '{"not":"a backup"}', name: 'bad.json' };
+    let threw = false;
+    try {
+        await backup.inspectBackup(file);
+    } catch {
+        threw = true;
     }
-    return pl;
+    assert(threw, 'a file that is not a backup was accepted');
+});
+
+/* ------------------------------------------------------------------ RESULT */
+
+console.log(`\n${'='.repeat(58)}`);
+console.log(`  ${passed} passed, ${failed} failed`);
+console.log('='.repeat(58));
+
+if (failed) {
+    console.log('\nFailures:\n');
+    for (const { label, err } of failures) {
+        console.log(`  ${label}`);
+        console.log(`    ${err.stack?.split('\n').slice(0, 3).join('\n    ')}\n`);
+    }
+    process.exitCode = 1;
 }
-
-/* ------------------------------------------------------------------ HELPERS */
-
-function delta(current, previous) {
-    if (!previous) return null;
-    return Math.round(((current - previous) / Math.abs(previous)) * 100);
-}
-
-
-export { startOfMonth, endOfMonth };

@@ -1,205 +1,340 @@
 /**
- * NATYAM ERP 2.0 — Wizard
+ * NATYAM ERP 2.0 — Application shell
  *
- * A multi-step form in an overlay, with a step rail, per-step validation and
- * autosave. Built as a general component rather than inside the admissions
- * module because payroll runs and year-end promotion are the same shape, and
- * the second copy of a wizard is always the one that drifts.
+ * The chrome around every page: sidebar navigation, the header with its branch
+ * switcher, search, notification bell and profile, and the footer that tells
+ * the school how its data is doing.
  *
- * Two decisions worth stating:
+ * The markup here is written against the class contract already defined in
+ * shell.css (.app-shell / .app-sidebar / .app-header / .nav-item …) rather
+ * than inventing a parallel set of names. Two naming schemes for one piece of
+ * furniture is how stylesheets rot.
  *
- * 1. Validation is delegated. The wizard asks its caller "is this step ok?"
- *    and paints whatever errors come back. It knows nothing about admissions
- *    rules — those belong to the service, which is exactly where the caller
- *    forwards the question.
+ * Navigation is filtered by capability, so a teacher's sidebar has no Finance
+ * entry — absent, not disabled. A menu full of things you cannot do teaches
+ * people to stop reading the menu.
  *
- * 2. State is one flat object shared by every step. Steps read and write the
- *    same bag, so a later step can show what an earlier one collected without
- *    the caller threading values through by hand.
+ * The shell listens on the bus rather than being poked by pages. When a payment
+ * is recorded the bell updates because notifications changed, not because the
+ * fees page remembered to tell the shell. A shell that pages must notify is a
+ * shell that breaks each time a page is added.
  */
 
-import { html, render, on, el } from '../utils/dom.js';
-import { overlay } from './overlay.js';
-import { fields as renderFields, readForm, showErrors, clearErrors } from './form.js';
-import { debounce } from '../utils/dom.js';
+import { html, render, raw, on, el, initials } from '../utils/dom.js';
+import { icon } from './icons.js';
+import { session } from '../core/session.js';
+import { bus, EVENTS } from '../core/bus.js';
+import { router } from '../core/router.js';
+import { NAVIGATION } from '../config/app.config.js';
+import { openPalette } from './palette.js';
+import { unreadCount } from '../services/notifications.service.js';
+import { storageStatus } from '../services/settings.service.js';
+import { backupStatus } from '../services/backup.service.js';
+
+export class Shell {
+    constructor(root) {
+        this.root = root;
+        this.collapsed = session.prefs().sidebarCollapsed === true;
+    }
+
+    mount() {
+        render(this.root, html`
+            <a class="skip-link" href="#main">Skip to content</a>
+
+            <div class="app-shell" data-role="shell"
+                 data-sidebar="${this.collapsed ? 'collapsed' : 'expanded'}">
+
+                <aside class="app-sidebar" data-role="sidebar">
+                    <div class="sidebar-brand">
+                        <span class="brand-mark" aria-hidden="true">${raw(icon('feather', { size: 20 }))}</span>
+                        <span class="brand-text">
+                            <span class="brand-name">NATYAM</span>
+                            <span class="brand-sub">School of Kuchipudi</span>
+                        </span>
+                    </div>
+
+                    <div class="sidebar-search">
+                        <button class="sidebar-search-btn" data-action="search">
+                            ${raw(icon('search', { size: 15 }))}
+                            <span>Search</span>
+                            <kbd class="kbd">Ctrl K</kbd>
+                        </button>
+                    </div>
+
+                    <nav class="sidebar-nav" aria-label="Main">
+                        <div data-role="nav"></div>
+                    </nav>
+
+                    <div class="sidebar-footer">
+                        <button class="sidebar-collapse" data-action="collapse"
+                                aria-label="Collapse navigation">
+                            ${raw(icon('chevrons-left', { size: 16 }))}
+                            <span>Collapse</span>
+                        </button>
+                    </div>
+                </aside>
+
+                <div class="app-main">
+                    <header class="app-header">
+                        <button class="header-btn header-nav-toggle" data-action="menu"
+                                aria-label="Open navigation">
+                            ${raw(icon('menu', { size: 18 }))}
+                        </button>
+
+                        <div class="header-search">
+                            <button class="header-search-btn" data-action="search">
+                                ${raw(icon('search', { size: 15 }))}
+                                <span>Search students, receipts, batches…</span>
+                                <kbd class="kbd">Ctrl K</kbd>
+                            </button>
+                        </div>
+
+                        <div class="header-actions">
+                            <div data-role="branch"></div>
+
+                            <a class="header-btn" href="#/notifications"
+                               data-role="bell" aria-label="Notifications">
+                                ${raw(icon('bell', { size: 18 }))}
+                            </a>
+
+                            <button class="header-btn" data-action="theme"
+                                    aria-label="Switch between light and dark">
+                                ${raw(icon('moon', { size: 18 }))}
+                            </button>
+
+                            <button class="profile-btn" data-action="profile">
+                                <span class="avatar avatar-sm" aria-hidden="true" data-role="avatar"></span>
+                                <span class="brand-text">
+                                    <span class="type-strong" data-role="user-name"></span>
+                                    <span class="type-caption type-muted" data-role="user-role"></span>
+                                </span>
+                            </button>
+                        </div>
+                    </header>
+
+                    <main class="viewport" id="main" data-role="viewport" tabindex="-1"></main>
+
+                    <footer class="app-footer">
+                        <span class="storage-pill" data-role="storage"></span>
+                        <span data-role="backup"></span>
+                    </footer>
+                </div>
+
+                <div class="scrim" data-action="close-menu" hidden></div>
+            </div>
+        `);
+
+        this.paintNav();
+        this.paintBranch();
+        this.paintUser();
+        this.bind();
+        this.refreshBell();
+        this.refreshFooter();
+
+        return this.root.querySelector('[data-role="viewport"]');
+    }
+
+    /* ------------------------------------------------------------------ NAV */
+
+    paintNav() {
+        const groups = NAVIGATION
+            .map((group) => ({
+                ...group,
+                items: group.items.filter((item) => !item.cap || session.can(item.cap))
+            }))
+            .filter((group) => group.items.length);
+
+        render(this.root.querySelector('[data-role="nav"]'), html`
+            ${groups.map((group) => html`
+                <div class="nav-group">
+                    <div class="nav-group-label">${group.group}</div>
+                    <ul class="nav-list">
+                        ${group.items.map((item) => html`
+                            <li>
+                                <a class="nav-item" href="#${item.path}" data-path="${item.path}">
+                                    ${raw(icon(item.icon, { size: 17 }))}
+                                    <span class="nav-item-label">${item.label}</span>
+                                </a>
+                            </li>
+                        `)}
+                    </ul>
+                </div>
+            `)}
+        `);
+
+        this.markActive();
+    }
+
+    /**
+     * Highlights the current route, matching on prefix so /students/:id still
+     * lights up Students. `aria-current` is what the stylesheet keys on, which
+     * makes the visual state and the accessible state impossible to separate.
+     */
+    markActive() {
+        const current = router.path();
+
+        this.root.querySelectorAll('[data-path]').forEach((node) => {
+            const path = node.dataset.path;
+            const active = path === '/'
+                ? current === '/'
+                : current === path || current.startsWith(`${path}/`);
+
+            if (active) node.setAttribute('aria-current', 'page');
+            else node.removeAttribute('aria-current');
+        });
+    }
+
+    /* --------------------------------------------------------------- BRANCH */
+
+    paintBranch() {
+        const branches = session.branches || [];
+        const target = this.root.querySelector('[data-role="branch"]');
+
+        // A single-branch school is not shown a branch switcher: one more
+        // control that can never do anything is worse than no control.
+        if (branches.length < 2) {
+            render(target, '');
+            return;
+        }
+
+        render(target, html`
+            <label class="branch-select">
+                ${raw(icon('map-pin', { size: 15 }))}
+                <span class="sr-only">Active branch</span>
+                <select class="select select-sm" data-role="branch-select">
+                    ${session.canAny('settings.view', 'report.view') ? html`
+                        <option value="" ${session.branch() === null ? 'selected' : ''}>All branches</option>
+                    ` : ''}
+                    ${branches.map((branch) => html`
+                        <option value="${branch.id}" ${session.branch() === branch.id ? 'selected' : ''}>
+                            ${branch.name}
+                        </option>
+                    `)}
+                </select>
+            </label>
+        `);
+    }
+
+    paintUser() {
+        const name = session.actorName();
+        render(this.root.querySelector('[data-role="user-name"]'), name);
+        render(this.root.querySelector('[data-role="user-role"]'), session.roleLabel());
+        render(this.root.querySelector('[data-role="avatar"]'), initials(name));
+    }
+
+    /* ----------------------------------------------------------------- BELL */
+
+    async refreshBell() {
+        try {
+            const count = await unreadCount();
+            const bell = this.root.querySelector('[data-role="bell"]');
+            if (!bell) return;
+
+            bell.setAttribute('aria-label',
+                count ? `Notifications, ${count} unread` : 'Notifications');
+
+            const existing = bell.querySelector('.badge-count');
+            if (count) {
+                const text = count > 9 ? '9+' : String(count);
+                if (existing) existing.textContent = text;
+                else bell.append(el('span', { class: 'badge-count' }, text));
+            } else {
+                existing?.remove();
+            }
+        } catch {
+            /* The bell is decoration. A failure here must not break the shell. */
+        }
+    }
+
+    /**
+     * The footer states plainly where the data lives and when it was last
+     * backed up. This app holds a school's entire record set in one browser
+     * profile; a person who never sees that fact will not take a backup until
+     * the morning it matters.
+     */
+    async refreshFooter() {
+        try {
+            const [storage, backup] = await Promise.all([storageStatus(), backupStatus()]);
+
+            render(this.root.querySelector('[data-role="storage"]'), html`
+                <span class="storage-dot" data-state="${storage.persisted ? 'ok' : 'warn'}"></span>
+                <span>${storage.persisted
+                    ? 'Stored in this browser, protected'
+                    : 'Stored in this browser, unprotected'}</span>
+            `);
+
+            render(this.root.querySelector('[data-role="backup"]'), html`
+                <a href="#/settings?tab=data">${backup.message}</a>
+            `);
+        } catch {
+            /* Footer detail is optional; silence beats a broken shell. */
+        }
+    }
+
+    /* ---------------------------------------------------------------- EVENTS */
+
+    bind() {
+        on(this.root, 'click', '[data-action="search"]', () => openPalette());
+        on(this.root, 'click', '[data-action="profile"]', () => router.go('/settings?tab=users'));
+
+        on(this.root, 'click', '[data-action="collapse"]', () => {
+            this.collapsed = !this.collapsed;
+            this.root.querySelector('[data-role="shell"]')
+                .setAttribute('data-sidebar', this.collapsed ? 'collapsed' : 'expanded');
+            session.setPref('sidebarCollapsed', this.collapsed);
+        });
+
+        on(this.root, 'click', '[data-action="menu"]', () => this.toggleMobileNav(true));
+        on(this.root, 'click', '[data-action="close-menu"]', () => this.toggleMobileNav(false));
+        on(this.root, 'click', '.nav-item', () => this.toggleMobileNav(false));
+
+        on(this.root, 'click', '[data-action="theme"]', () => {
+            const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+            applyTheme(next);
+            session.setPref('theme', next);
+        });
+
+        on(this.root, 'change', '[data-role="branch-select"]', (_e, target) => {
+            session.setBranch(target.value || null);
+        });
+
+        bus.on(EVENTS.ROUTE_DONE, () => {
+            this.markActive();
+            this.root.querySelector('[data-role="viewport"]')?.focus?.();
+        });
+
+        bus.on(EVENTS.BRANCH_CHANGED, () => this.paintBranch());
+        bus.on(EVENTS.BACKUP_RESTORED, () => this.refreshFooter());
+
+        [EVENTS.NOTIFICATION_ADDED, EVENTS.NOTIFICATION_READ, EVENTS.PAYMENT_RECORDED]
+            .forEach((event) => bus.on(event, () => this.refreshBell()));
+    }
+
+    toggleMobileNav(open) {
+        const shell = this.root.querySelector('[data-role="shell"]');
+        const scrim = this.root.querySelector('.scrim');
+        shell.setAttribute('data-nav', open ? 'open' : 'closed');
+        scrim.hidden = !open;
+    }
+}
+
+/* ------------------------------------------------------------------ THEME */
 
 /**
- * @param {object} config
- * @param {string} config.title
- * @param {Array}  config.steps    [{ key, label, description, fields(state) => Field[]|html, validate(state) => {ok,errors}, render(state) }]
- * @param {object} [config.state]  Initial values.
- * @param {Function} config.onFinish   async (state) => result
- * @param {Function} [config.onStep]   async (state, stepIndex) => void — autosave hook.
- * @param {string} [config.finishLabel='Finish']
- * @returns {Promise<*>} Whatever onFinish returned, or null if abandoned.
+ * Applied to <html> so the first paint is already correct. "system" follows
+ * the device and keeps following it, which matters for a school that starts
+ * before dawn and finishes after dark.
  */
-export function wizard({
-    title,
-    description = '',
-    steps,
-    state = {},
-    onFinish,
-    onStep = null,
-    finishLabel = 'Finish',
-    size = 'wide'
-}) {
-    let index = 0;
-    let body = null;
-    const data = { ...state };
+export function applyTheme(preference) {
+    const resolved = preference === 'system'
+        ? (window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+        : preference;
 
-    const autosave = debounce(() => { onStep?.(data, index); }, 900);
-
-    const current = () => steps[index];
-
-    /** Pulls the visible step's inputs into the shared state bag. */
-    function absorb() {
-        const step = current();
-        if (typeof step.fields !== 'function') return;
-        const list = step.fields(data);
-        if (!Array.isArray(list)) return;
-        Object.assign(data, readForm(body.querySelector('[data-role="step-body"]'), list));
-    }
-
-    function paint() {
-        render(body, markup());
-        // The first control of a step gets focus, so a keyboard user is not
-        // dropped at the top of the dialog on every "Next".
-        body.querySelector('[data-role="step-body"] input, [data-role="step-body"] select, [data-role="step-body"] textarea')?.focus();
-        current().onMount?.(body.querySelector('[data-role="step-body"]'), { data, refresh: paint, go });
-    }
-
-    function markup() {
-        const step = current();
-        const list = typeof step.fields === 'function' ? step.fields(data) : null;
-
-        return html`
-            <div class="wizard">
-                <ol class="steps" aria-label="Application steps">
-                    ${steps.map((s, i) => html`
-                        <li class="step ${i === index ? 'is-current' : i < index ? 'is-done' : ''}">
-                            <button type="button" class="step-marker" data-goto="${i}"
-                                    ${i > index ? 'disabled' : ''}
-                                    aria-current="${i === index ? 'step' : 'false'}">
-                                ${i < index ? '✓' : i + 1}
-                            </button>
-                            <span class="step-label">${s.label}</span>
-                            ${i < steps.length - 1 ? html`<span class="step-line"></span>` : ''}
-                        </li>
-                    `)}
-                </ol>
-
-                <div class="wizard-panel">
-                    <header class="wizard-header">
-                        <h3 class="form-section-title">${step.label}</h3>
-                        ${step.description ? html`<p class="form-section-description">${step.description}</p>` : ''}
-                    </header>
-                    <div data-role="step-banner"></div>
-                    <form data-role="step-body" novalidate>
-                        ${Array.isArray(list) ? renderFields(list) : (step.render ? step.render(data) : '')}
-                    </form>
-                </div>
-            </div>
-        `;
-    }
-
-    async function go(target) {
-        if (target === index) return;
-
-        // Moving forward validates; moving back never does, because forcing a
-        // user to fix step 3 before they can look at step 2 is how forms get
-        // abandoned.
-        if (target > index) {
-            absorb();
-            const step = current();
-            const result = step.validate ? await step.validate(data) : { ok: true, errors: {} };
-            if (!result.ok) {
-                showErrors(body.querySelector('[data-role="step-body"]'), result.errors);
-                return;
-            }
-            clearErrors(body.querySelector('[data-role="step-body"]'));
-            await onStep?.(data, target);
-        } else {
-            absorb();
-        }
-
-        index = Math.max(0, Math.min(steps.length - 1, target));
-        paint();
-        syncFooter();
-    }
-
-    /* The footer buttons live in the overlay chrome, so they are re-labelled
-       rather than re-rendered as the step changes. */
-    function syncFooter() {
-        const root = body.closest('.modal, .drawer');
-        if (!root) return;
-        const back = root.querySelector('[data-wizard="back"]');
-        const next = root.querySelector('[data-wizard="next"]');
-        if (back) back.disabled = index === 0;
-        if (next) next.textContent = index === steps.length - 1 ? finishLabel : 'Continue';
-    }
-
-    return overlay({
-        variant: 'drawer',
-        size,
-        title,
-        description,
-        content: el('div', { class: 'wizard-host' }),
-        actions: [
-            {
-                label: 'Back',
-                variant: 'secondary',
-                attrs: { 'data-wizard': 'back' },
-                onClick: async () => { await go(index - 1); return false; }
-            },
-            {
-                label: 'Continue',
-                variant: 'primary',
-                primary: true,
-                attrs: { 'data-wizard': 'next' },
-                onClick: async ({ close, button }) => {
-                    if (index < steps.length - 1) {
-                        await go(index + 1);
-                        return false;
-                    }
-
-                    absorb();
-                    const step = current();
-                    const result = step.validate ? await step.validate(data) : { ok: true, errors: {} };
-                    if (!result.ok) {
-                        showErrors(body.querySelector('[data-role="step-body"]'), result.errors);
-                        return false;
-                    }
-
-                    void close;
-                    const original = button.textContent;
-                    button.textContent = 'Working…';
-                    try {
-                        const finished = await onFinish(data);
-                        return finished === undefined ? data : finished;
-                    } catch (err) {
-                        console.error('Wizard finish failed', err);
-                        render(body.querySelector('[data-role="step-banner"]'), html`
-                            <div class="alert alert-danger"><p class="alert-body">${err.message}</p></div>
-                        `);
-                        return false;
-                    } finally {
-                        button.textContent = original;
-                    }
-                }
-            }
-        ],
-        onMount: (mounted, api) => {
-            body = mounted;
-            void api;
-            paint();
-            syncFooter();
-
-            on(mounted, 'click', '[data-goto]', (_e, target) => go(Number(target.dataset.goto)));
-            on(mounted, 'input', 'input, select, textarea', () => { absorb(); autosave(); });
-            mounted.addEventListener('submit', (event) => {
-                event.preventDefault();
-                mounted.closest('.modal, .drawer')?.querySelector('[data-wizard="next"]')?.click();
-            });
-        }
-    });
+    document.documentElement.dataset.theme = resolved || 'light';
+    bus.emit(EVENTS.THEME_CHANGED, { theme: resolved });
 }
+
+export function applyDensity(density) {
+    document.documentElement.dataset.density = density || 'comfortable';
+}
+

@@ -1,185 +1,205 @@
 /**
- * Toasts.
+ * NATYAM ERP 2.0 — Wizard
  *
- * Rules this implementation enforces, because 1.0's did not:
- *   - Errors do not auto-dismiss. If a payment failed, the message must still
- *     be there when the user looks back at the screen.
- *   - Identical messages coalesce with a count instead of stacking eight deep.
- *   - Hovering pauses the timer. Reading a message should not make it vanish.
- *   - Everything is announced to assistive technology.
- *   - Content is set as text, never as markup.
+ * A multi-step form in an overlay, with a step rail, per-step validation and
+ * autosave. Built as a general component rather than inside the admissions
+ * module because payroll runs and year-end promotion are the same shape, and
+ * the second copy of a wizard is always the one that drifts.
+ *
+ * Two decisions worth stating:
+ *
+ * 1. Validation is delegated. The wizard asks its caller "is this step ok?"
+ *    and paints whatever errors come back. It knows nothing about admissions
+ *    rules — those belong to the service, which is exactly where the caller
+ *    forwards the question.
+ *
+ * 2. State is one flat object shared by every step. Steps read and write the
+ *    same bag, so a later step can show what an earlier one collected without
+ *    the caller threading values through by hand.
  */
 
-import { el, announce } from '../utils/dom.js';
-import { icon } from './icons.js';
+import { html, render, on, el } from '../utils/dom.js';
+import { overlay } from './overlay.js';
+import { fields as renderFields, readForm, showErrors, clearErrors } from './form.js';
+import { debounce } from '../utils/dom.js';
 
-const ICONS = {
-    success: 'check-circle',
-    error:   'x-circle',
-    warning: 'alert-triangle',
-    info:    'info'
-};
+/**
+ * @param {object} config
+ * @param {string} config.title
+ * @param {Array}  config.steps    [{ key, label, description, fields(state) => Field[]|html, validate(state) => {ok,errors}, render(state) }]
+ * @param {object} [config.state]  Initial values.
+ * @param {Function} config.onFinish   async (state) => result
+ * @param {Function} [config.onStep]   async (state, stepIndex) => void — autosave hook.
+ * @param {string} [config.finishLabel='Finish']
+ * @returns {Promise<*>} Whatever onFinish returned, or null if abandoned.
+ */
+export function wizard({
+    title,
+    description = '',
+    steps,
+    state = {},
+    onFinish,
+    onStep = null,
+    finishLabel = 'Finish',
+    size = 'wide'
+}) {
+    let index = 0;
+    let body = null;
+    const data = { ...state };
 
-const DEFAULT_DURATION = { success: 4000, info: 5000, warning: 7000, error: 0 };
+    const autosave = debounce(() => { onStep?.(data, index); }, 900);
 
-class ToastManager {
-    constructor() {
-        this.region = null;
-        this.active = new Map(); // dedupe key -> { node, count, timer }
-        this.max = 4;
+    const current = () => steps[index];
+
+    /** Pulls the visible step's inputs into the shared state bag. */
+    function absorb() {
+        const step = current();
+        if (typeof step.fields !== 'function') return;
+        const list = step.fields(data);
+        if (!Array.isArray(list)) return;
+        Object.assign(data, readForm(body.querySelector('[data-role="step-body"]'), list));
     }
 
-    _ensureRegion() {
-        if (this.region?.isConnected) return this.region;
-        this.region = el('div', {
-            class: 'toast-region',
-            role: 'region',
-            'aria-label': 'Notifications'
-        });
-        document.body.append(this.region);
-        return this.region;
+    function paint() {
+        render(body, markup());
+        // The first control of a step gets focus, so a keyboard user is not
+        // dropped at the top of the dialog on every "Next".
+        body.querySelector('[data-role="step-body"] input, [data-role="step-body"] select, [data-role="step-body"] textarea')?.focus();
+        current().onMount?.(body.querySelector('[data-role="step-body"]'), { data, refresh: paint, go });
     }
 
-    /**
-     * @param {object} options
-     * @param {'success'|'error'|'warning'|'info'} options.type
-     * @param {string} options.title     Short, in the interface's voice.
-     * @param {string} [options.message] One sentence of detail, optional.
-     * @param {number} [options.duration] ms; 0 keeps it until dismissed.
-     * @param {{label:string, onClick:Function}} [options.action]
-     */
-    show({ type = 'info', title, message = '', duration, action = null }) {
-        const region = this._ensureRegion();
-        const key = `${type}|${title}|${message}`;
+    function markup() {
+        const step = current();
+        const list = typeof step.fields === 'function' ? step.fields(data) : null;
 
-        // Same message again: bump a counter rather than adding another card.
-        const existing = this.active.get(key);
-        if (existing) {
-            existing.count += 1;
-            const counter = existing.node.querySelector('.toast-repeat');
-            if (counter) counter.textContent = `×${existing.count}`;
-            else existing.node.querySelector('.toast-title')
-                ?.append(el('span', { class: 'toast-repeat text-subtle' }, ` ×${existing.count}`));
-            this._resetTimer(key, duration ?? DEFAULT_DURATION[type]);
-            return () => this.dismiss(key);
+        return html`
+            <div class="wizard">
+                <ol class="steps" aria-label="Application steps">
+                    ${steps.map((s, i) => html`
+                        <li class="step ${i === index ? 'is-current' : i < index ? 'is-done' : ''}">
+                            <button type="button" class="step-marker" data-goto="${i}"
+                                    ${i > index ? 'disabled' : ''}
+                                    aria-current="${i === index ? 'step' : 'false'}">
+                                ${i < index ? '✓' : i + 1}
+                            </button>
+                            <span class="step-label">${s.label}</span>
+                            ${i < steps.length - 1 ? html`<span class="step-line"></span>` : ''}
+                        </li>
+                    `)}
+                </ol>
+
+                <div class="wizard-panel">
+                    <header class="wizard-header">
+                        <h3 class="form-section-title">${step.label}</h3>
+                        ${step.description ? html`<p class="form-section-description">${step.description}</p>` : ''}
+                    </header>
+                    <div data-role="step-banner"></div>
+                    <form data-role="step-body" novalidate>
+                        ${Array.isArray(list) ? renderFields(list) : (step.render ? step.render(data) : '')}
+                    </form>
+                </div>
+            </div>
+        `;
+    }
+
+    async function go(target) {
+        if (target === index) return;
+
+        // Moving forward validates; moving back never does, because forcing a
+        // user to fix step 3 before they can look at step 2 is how forms get
+        // abandoned.
+        if (target > index) {
+            absorb();
+            const step = current();
+            const result = step.validate ? await step.validate(data) : { ok: true, errors: {} };
+            if (!result.ok) {
+                showErrors(body.querySelector('[data-role="step-body"]'), result.errors);
+                return;
+            }
+            clearErrors(body.querySelector('[data-role="step-body"]'));
+            await onStep?.(data, target);
+        } else {
+            absorb();
         }
 
-        // Cap the stack. The oldest non-error goes first; errors are sticky by
-        // intent and should not be evicted by a run of routine successes.
-        if (this.active.size >= this.max) {
-            const evictable = [...this.active.entries()].find(([, v]) => v.type !== 'error');
-            if (evictable) this.dismiss(evictable[0]);
-        }
-
-        const node = el('div', {
-            class: `toast toast-${type}`,
-            role: type === 'error' ? 'alert' : 'status',
-            'aria-live': type === 'error' ? 'assertive' : 'polite'
-        });
-
-        const glyph = el('span', { class: 'toast-icon' });
-        glyph.innerHTML = icon(ICONS[type] || 'info', { size: 17, className: '' });
-
-        const content = el('div', { class: 'toast-content' },
-            el('div', { class: 'toast-title' }, title)
-        );
-        if (message) content.append(el('div', { class: 'toast-message' }, message));
-
-        if (action) {
-            const button = el('button', {
-                type: 'button',
-                class: 'btn btn-sm btn-secondary toast-action',
-                onClick: () => { action.onClick(); this.dismiss(key); }
-            }, action.label);
-            content.append(button);
-        }
-
-        const close = el('button', {
-            type: 'button',
-            class: 'btn btn-ghost btn-icon btn-sm',
-            'aria-label': 'Dismiss notification',
-            onClick: () => this.dismiss(key)
-        });
-        close.innerHTML = icon('x', { size: 14 });
-
-        node.append(glyph, content, close);
-
-        // Pausing on hover or focus means a long message can actually be read.
-        node.addEventListener('mouseenter', () => this._pause(key));
-        node.addEventListener('mouseleave', () => this._resume(key, duration ?? DEFAULT_DURATION[type]));
-        node.addEventListener('focusin', () => this._pause(key));
-
-        region.append(node);
-        this.active.set(key, { node, type, count: 1, timer: null });
-        this._resetTimer(key, duration ?? DEFAULT_DURATION[type]);
-
-        announce(message ? `${title}. ${message}` : title, type === 'error');
-        return () => this.dismiss(key);
+        index = Math.max(0, Math.min(steps.length - 1, target));
+        paint();
+        syncFooter();
     }
 
-    _resetTimer(key, duration) {
-        const entry = this.active.get(key);
-        if (!entry) return;
-        clearTimeout(entry.timer);
-        if (duration > 0) entry.timer = setTimeout(() => this.dismiss(key), duration);
+    /* The footer buttons live in the overlay chrome, so they are re-labelled
+       rather than re-rendered as the step changes. */
+    function syncFooter() {
+        const root = body.closest('.modal, .drawer');
+        if (!root) return;
+        const back = root.querySelector('[data-wizard="back"]');
+        const next = root.querySelector('[data-wizard="next"]');
+        if (back) back.disabled = index === 0;
+        if (next) next.textContent = index === steps.length - 1 ? finishLabel : 'Continue';
     }
 
-    _pause(key) {
-        const entry = this.active.get(key);
-        if (entry) clearTimeout(entry.timer);
-    }
+    return overlay({
+        variant: 'drawer',
+        size,
+        title,
+        description,
+        content: el('div', { class: 'wizard-host' }),
+        actions: [
+            {
+                label: 'Back',
+                variant: 'secondary',
+                attrs: { 'data-wizard': 'back' },
+                onClick: async () => { await go(index - 1); return false; }
+            },
+            {
+                label: 'Continue',
+                variant: 'primary',
+                primary: true,
+                attrs: { 'data-wizard': 'next' },
+                onClick: async ({ close, button }) => {
+                    if (index < steps.length - 1) {
+                        await go(index + 1);
+                        return false;
+                    }
 
-    _resume(key, duration) {
-        this._resetTimer(key, duration);
-    }
+                    absorb();
+                    const step = current();
+                    const result = step.validate ? await step.validate(data) : { ok: true, errors: {} };
+                    if (!result.ok) {
+                        showErrors(body.querySelector('[data-role="step-body"]'), result.errors);
+                        return false;
+                    }
 
-    dismiss(key) {
-        const entry = this.active.get(key);
-        if (!entry) return;
-        clearTimeout(entry.timer);
-        this.active.delete(key);
+                    void close;
+                    const original = button.textContent;
+                    button.textContent = 'Working…';
+                    try {
+                        const finished = await onFinish(data);
+                        return finished === undefined ? data : finished;
+                    } catch (err) {
+                        console.error('Wizard finish failed', err);
+                        render(body.querySelector('[data-role="step-banner"]'), html`
+                            <div class="alert alert-danger"><p class="alert-body">${err.message}</p></div>
+                        `);
+                        return false;
+                    } finally {
+                        button.textContent = original;
+                    }
+                }
+            }
+        ],
+        onMount: (mounted, api) => {
+            body = mounted;
+            void api;
+            paint();
+            syncFooter();
 
-        entry.node.dataset.leaving = 'true';
-        entry.node.addEventListener('animationend', () => entry.node.remove(), { once: true });
-        // Belt and braces: if the animation is suppressed by reduced-motion,
-        // animationend may not fire.
-        setTimeout(() => entry.node.remove(), 400);
-    }
-
-    clear() {
-        for (const key of [...this.active.keys()]) this.dismiss(key);
-    }
-}
-
-const manager = new ToastManager();
-
-export const toast = {
-    success: (title, message, options = {}) => manager.show({ type: 'success', title, message, ...options }),
-    error:   (title, message, options = {}) => manager.show({ type: 'error', title, message, ...options }),
-    warning: (title, message, options = {}) => manager.show({ type: 'warning', title, message, ...options }),
-    info:    (title, message, options = {}) => manager.show({ type: 'info', title, message, ...options }),
-
-    /**
-     * Wraps an async action with pending/success/error toasts. Keeps the
-     * three-branch pattern out of every call site.
-     */
-    async promise(work, { pending = 'Working…', success = 'Done', error = 'That did not work' }) {
-        const dismiss = manager.show({ type: 'info', title: pending, duration: 0 });
-        try {
-            const result = await work;
-            dismiss();
-            manager.show({ type: 'success', title: typeof success === 'function' ? success(result) : success });
-            return result;
-        } catch (err) {
-            dismiss();
-            manager.show({
-                type: 'error',
-                title: typeof error === 'function' ? error(err) : error,
-                message: err.message
+            on(mounted, 'click', '[data-goto]', (_e, target) => go(Number(target.dataset.goto)));
+            on(mounted, 'input', 'input, select, textarea', () => { absorb(); autosave(); });
+            mounted.addEventListener('submit', (event) => {
+                event.preventDefault();
+                mounted.closest('.modal, .drawer')?.querySelector('[data-wizard="next"]')?.click();
             });
-            throw err;
         }
-    },
-
-    clear: () => manager.clear()
-};
+    });
+}

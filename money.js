@@ -1,317 +1,487 @@
 /**
- * NATYAM ERP 2.0 — Batch service
+ * NATYAM ERP 2.0 — Attendance service
  *
- * A batch is where a level, a teacher, a room and a timetable meet, and almost
- * every conflict the school actually experiences is a collision between two of
- * those. This module enforces the ones that matter: a teacher cannot be in two
- * halls at once, a hall cannot hold two batches at once, and a batch cannot be
- * closed while students are still sitting in it.
+ * Roll call is the operation this product performs most often and the one 1.0
+ * got most wrong. Three faults, all fixed here:
  *
- * 1.0 had none of these checks. It was possible — and did happen — to schedule
- * two batches into Hall A on Saturday morning, which nobody discovered until
- * both sets of parents arrived.
+ *  1. Saving the same roll call twice created a second set of rows, because
+ *     the id was minted fresh each time. Every record now carries a composite
+ *     `batchId|date|studentId` key on a unique index, so a re-save is an
+ *     update by construction rather than by remembering to check.
+ *  2. Rows were written one at a time in a loop of separate transactions. A
+ *     failure halfway left a class half-marked. The whole roll call is now one
+ *     transaction.
+ *  3. Marking a date the school was closed produced a day of "absent" for
+ *     everyone, which then dragged every attendance percentage down. Holidays
+ *     and approved leave are checked before the register is even shown.
  */
 
 import { bus, EVENTS } from '../core/bus.js';
 import { session } from '../core/session.js';
-import { localDate, dayName, addDays } from '../utils/date.js';
-import { LEVELS, levelLabel } from '../config/app.config.js';
-import { batches$, students$, staff$, attendance$, AttendanceMath } from '../data/repositories.js';
+import { db, request } from '../core/db.js';
+import { uid } from '../utils/id.js';
+import { localDate, nowISO, addDays, daysBetween, monthKey, dayName, startOfMonth, endOfMonth, lastMonths } from '../utils/date.js';
+import { ATTENDANCE_STATUS } from '../config/app.config.js';
+import {
+    attendance$, students$, batches$, holidays$, leaves$, staff$, AttendanceMath
+} from '../data/repositories.js';
+import { notify } from './notifications.service.js';
 
 const DAY_CODES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-export const WEEK = Object.freeze(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']);
 
 /* ==========================================================================
-   SCHEDULING RULES
+   PREPARING A REGISTER
    ========================================================================== */
 
-/** Do two time ranges on the same day overlap? Touching ends do not count. */
-function overlaps(a, b) {
-    return a.startTime < b.endTime && b.startTime < a.endTime;
-}
-
-function sharesDay(a, b) {
-    return (a.days || []).some((d) => (b.days || []).includes(d));
-}
-
 /**
- * Finds every scheduling conflict a proposed batch would create.
+ * Builds the register a teacher sees: the roster, whatever was marked before,
+ * and every reason a student might legitimately be away.
  *
- * Returns a list rather than throwing on the first, because a badly-timed new
- * batch typically clashes with the teacher *and* the room, and being told
- * about them one at a time is three round trips of frustration.
+ * Returns rather than throws when the batch does not meet on the given date.
+ * Teachers do reach the wrong day, and a thrown error would put an exception
+ * screen where a sentence is wanted.
  */
-export async function findConflicts(candidate) {
-    const others = (await batches$.active()).filter((b) => b.id !== candidate.id && b.status === 'active');
-    const conflicts = [];
+export async function openRegister(batchId, date = localDate()) {
+    const batch = await batches$.findOrFail(batchId);
+    const dayCode = DAY_CODES[new Date(`${date}T00:00:00`).getDay()];
 
-    for (const other of others) {
-        if (!sharesDay(candidate, other) || !overlaps(candidate, other)) continue;
-
-        const days = (candidate.days || []).filter((d) => (other.days || []).includes(d));
-        const when = `${days.join(', ')} ${other.startTime}–${other.endTime}`;
-
-        if (candidate.teacherId && candidate.teacherId === other.teacherId) {
-            conflicts.push({ type: 'teacher', batch: other, message: `The same teacher already takes ${other.name} on ${when}.` });
-        }
-        if (candidate.room && candidate.branchId === other.branchId && candidate.room === other.room) {
-            conflicts.push({ type: 'room', batch: other, message: `${candidate.room} is occupied by ${other.name} on ${when}.` });
-        }
-    }
-
-    return conflicts;
-}
-
-/* ==========================================================================
-   LIFECYCLE
-   ========================================================================== */
-
-export async function createBatch(data, { allowConflicts = false } = {}) {
-    session.require('student.edit', 'create a batch');
-
-    const candidate = normalise(data);
-    assertShape(candidate);
-
-    const conflicts = await findConflicts(candidate);
-    if (conflicts.length && !allowConflicts) {
-        const err = new Error(`This clashes with an existing batch. ${conflicts[0].message}`);
-        err.conflicts = conflicts;
-        throw err;
-    }
-
-    const batch = await batches$.create(candidate);
-    bus.emit(EVENTS.BATCH_CREATED, { batch });
-    return { batch, conflicts };
-}
-
-export async function updateBatch(id, changes, { allowConflicts = false } = {}) {
-    session.require('student.edit', 'edit a batch');
-
-    const existing = await batches$.findOrFail(id);
-    const candidate = normalise({ ...existing, ...changes, id });
-    assertShape(candidate);
-
-    /* Changing the level of a batch that has students in it would silently
-       leave them at the wrong level for promotion and certification. */
-    if (candidate.level !== existing.level) {
-        const roster = await students$.byBatch(id);
-        if (roster.length) {
-            throw new Error(
-                `${roster.length} student${roster.length === 1 ? ' is' : 's are'} enrolled at ${levelLabel(existing.level)} in this batch. ` +
-                'Move them out before changing the level.'
-            );
-        }
-    }
-
-    const conflicts = await findConflicts(candidate);
-    if (conflicts.length && !allowConflicts) {
-        const err = new Error(`This clashes with an existing batch. ${conflicts[0].message}`);
-        err.conflicts = conflicts;
-        throw err;
-    }
-
-    const batch = await batches$.update(id, candidate);
-    bus.emit(EVENTS.BATCH_UPDATED, { batch, before: existing });
-    return { batch, conflicts };
-}
-
-/**
- * Closes a batch. Refuses while students remain, and offers the caller the
- * roster so the UI can propose moving them somewhere rather than just saying
- * no. A closed batch keeps its attendance history for reporting.
- */
-export async function closeBatch(id, { reason = null, moveTo = null } = {}) {
-    session.require('student.edit', 'close a batch');
-
-    const batch = await batches$.findOrFail(id);
-    const roster = await students$.byBatch(id);
-
-    if (roster.length && !moveTo) {
-        const err = new Error(`${batch.name} still has ${roster.length} student${roster.length === 1 ? '' : 's'}. Choose where they should go.`);
-        err.roster = roster;
-        throw err;
-    }
-
-    if (roster.length && moveTo) {
-        const target = await batches$.findOrFail(moveTo);
-        if (target.status !== 'active') throw new Error(`${target.name} is not active.`);
-        if (target.level !== batch.level) throw new Error(`${target.name} teaches ${levelLabel(target.level)}, not ${levelLabel(batch.level)}.`);
-
-        const existing = await students$.byBatch(moveTo);
-        if (target.capacity && existing.length + roster.length > target.capacity) {
-            throw new Error(`${target.name} seats ${target.capacity} and already has ${existing.length}. It cannot take ${roster.length} more.`);
-        }
-        for (const student of roster) {
-            await students$.update(student.id, { batchId: moveTo, branchId: target.branchId });
-        }
-    }
-
-    const closed = await batches$.update(id, {
-        status: 'closed',
-        closedOn: localDate(),
-        closeReason: reason?.trim() || null
-    });
-
-    bus.emit(EVENTS.BATCH_CLOSED, { batch: closed, moved: roster.length });
-    return { batch: closed, moved: roster.length };
-}
-
-export async function reopenBatch(id) {
-    session.require('student.edit', 'reopen a batch');
-    const batch = await batches$.update(id, { status: 'active', closedOn: null, closeReason: null });
-    bus.emit(EVENTS.BATCH_UPDATED, { batch });
-    return batch;
-}
-
-/* ==========================================================================
-   VIEWS
-   ========================================================================== */
-
-/** The batch list, with occupancy, teacher name and recent attendance rate. */
-export async function listBatches(branchId = null, { includeClosed = false } = {}) {
-    const [withOccupancy, teachers, recent] = await Promise.all([
-        batches$.withOccupancy(branchId),
-        staff$.teachers(),
-        attendance$.between(addDays(localDate(), -30), localDate(), branchId)
+    const [roster, existing, holiday] = await Promise.all([
+        students$.byBatch(batchId),
+        attendance$.forBatchOn(batchId, date),
+        holidays$.on(date, batch.branchId)
     ]);
 
-    const teacherName = new Map(teachers.map((t) => [t.id, t.name]));
+    const marked = new Map(existing.map((row) => [row.studentId, row]));
+    const leaveByStudent = new Map();
+    for (const student of roster) {
+        const leave = await leaves$.coveringDate(student.id, date);
+        if (leave) leaveByStudent.set(student.id, leave);
+    }
+
+    const entries = roster.map((student) => {
+        const prior = marked.get(student.id);
+        const leave = leaveByStudent.get(student.id);
+        return {
+            studentId: student.id,
+            name: student.name,
+            admissionNo: student.admissionNo,
+            photo: student.photo || null,
+            medicalNotes: student.medicalNotes || null,
+            // Default: an approved leave pre-fills as excused so a teacher does
+            // not have to remember which of thirty children has a note.
+            status: prior?.status || (leave ? ATTENDANCE_STATUS.EXCUSED : ATTENDANCE_STATUS.PRESENT),
+            note: prior?.note || (leave ? leave.reason : null),
+            onLeave: Boolean(leave),
+            previouslyMarked: Boolean(prior)
+        };
+    });
+
+    return {
+        batch,
+        date,
+        dayName: dayName(date),
+        meetsToday: batch.days.includes(dayCode),
+        holiday,
+        alreadyMarked: existing.length > 0,
+        markedAt: existing[0]?.updatedAt || null,
+        entries,
+        empty: roster.length === 0
+    };
+}
+
+/** Every batch meeting on a date, with whether its register is done. */
+export async function dayBoard(date = localDate(), branchId = null) {
+    const [meeting, marked, holiday, teachers] = await Promise.all([
+        batches$.meetingOn(date, branchId),
+        attendance$.onDate(date, branchId),
+        holidays$.on(date, branchId),
+        staff$.teachers()
+    ]);
+
     const byBatch = new Map();
-    for (const row of recent) {
+    for (const row of marked) {
         if (!byBatch.has(row.batchId)) byBatch.set(row.batchId, []);
         byBatch.get(row.batchId).push(row);
     }
 
-    let rows = withOccupancy;
-    if (includeClosed) {
-        const all = (await batches$.all()).filter((b) => !branchId || b.branchId === branchId);
-        const seen = new Set(rows.map((r) => r.id));
-        rows = rows.concat(all.filter((b) => !seen.has(b.id)).map((b) => ({ ...b, enrolled: 0, seatsLeft: 0, occupancy: 0 })));
-    }
-
-    return rows
-        .map((batch) => ({
-            ...batch,
-            teacherName: teacherName.get(batch.teacherId) || 'Unassigned',
-            levelLabel: levelLabel(batch.level),
-            schedule: describeSchedule(batch),
-            attendanceRate: AttendanceMath.rateOf(byBatch.get(batch.id) || [])
-        }))
-        .sort((a, b) => a.levelOrder - b.levelOrder || a.name.localeCompare(b.name));
-}
-
-/** Everything the batch detail view shows. */
-export async function batchDetail(id) {
-    const batch = await batches$.findOrFail(id);
-    const [roster, teacher, recent, conflicts] = await Promise.all([
-        students$.byBatch(id),
-        batch.teacherId ? staff$.find(batch.teacherId) : null,
-        attendance$.between(addDays(localDate(), -60), localDate()),
-        findConflicts(batch)
-    ]);
-
-    const mine = recent.filter((r) => r.batchId === id);
-    const perStudent = new Map();
-    for (const row of mine) {
-        if (!perStudent.has(row.studentId)) perStudent.set(row.studentId, []);
-        perStudent.get(row.studentId).push(row);
-    }
+    const teacherName = new Map(teachers.map((t) => [t.id, t.name]));
+    const rosterCounts = await Promise.all(meeting.map((b) => students$.byBatch(b.id)));
 
     return {
-        batch: {
-            ...batch,
-            levelLabel: levelLabel(batch.level),
-            schedule: describeSchedule(batch),
-            enrolled: roster.length,
-            seatsLeft: batch.capacity ? Math.max(0, batch.capacity - roster.length) : null,
-            occupancy: batch.capacity ? Math.round((roster.length / batch.capacity) * 100) : null
-        },
-        teacher,
-        conflicts,
-        attendanceRate: AttendanceMath.rateOf(mine),
-        roster: roster.map((student) => ({
-            ...student,
-            attendanceRate: AttendanceMath.rateOf(perStudent.get(student.id) || [])
-        })).sort((a, b) => (a.attendanceRate ?? 101) - (b.attendanceRate ?? 101))
+        date,
+        holiday,
+        batches: meeting.map((batch, index) => {
+            const rows = byBatch.get(batch.id) || [];
+            return {
+                ...batch,
+                teacherName: teacherName.get(batch.teacherId) || 'Unassigned',
+                expected: rosterCounts[index].length,
+                marked: rows.length,
+                done: rows.length > 0,
+                rate: AttendanceMath.rateOf(rows),
+                breakdown: AttendanceMath.breakdownOf(rows)
+            };
+        })
     };
 }
 
-/**
- * The week's timetable, grouped by day and sorted by start time. This is the
- * view that makes a double-booking obvious at a glance, which is why it exists
- * as well as the conflict check.
- */
-export async function timetable(branchId = null) {
-    const [batches, teachers] = await Promise.all([batches$.active(branchId), staff$.teachers()]);
-    const teacherName = new Map(teachers.map((t) => [t.id, t.name]));
+/* ==========================================================================
+   POSTING
+   ========================================================================== */
 
-    return WEEK.map((day) => ({
-        day,
-        label: dayName(nextDateFor(day)),
-        sessions: batches
-            .filter((b) => (b.days || []).includes(day))
-            .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''))
-            .map((b) => ({
-                ...b,
-                teacherName: teacherName.get(b.teacherId) || 'Unassigned',
-                levelLabel: levelLabel(b.level)
-            }))
-    }));
+/**
+ * Writes a roll call.
+ *
+ * One transaction, composite keys, and a read-before-write so that re-marking
+ * preserves the original `createdAt` — the difference between "marked at 6:35
+ * this morning" and "corrected at 4pm" is the sort of thing a parent dispute
+ * turns on.
+ *
+ * @param {object} params
+ * @param {string} params.batchId
+ * @param {string} params.date
+ * @param {Array<{studentId: string, status: string, note?: string}>} params.entries
+ */
+export async function postRegister({ batchId, date, entries }) {
+    session.require('attendance.mark', 'mark attendance');
+
+    const batch = await batches$.findOrFail(batchId);
+    if (!date) throw new Error('Choose the date being marked.');
+    if (date > localDate()) throw new Error('Attendance cannot be marked for a future date.');
+    if (!Array.isArray(entries) || !entries.length) throw new Error('There is nobody in this batch to mark.');
+
+    const valid = new Set(Object.values(ATTENDANCE_STATUS));
+    for (const entry of entries) {
+        if (!entry.studentId) throw new Error('An attendance row is missing its student.');
+        if (!valid.has(entry.status)) throw new Error(`"${entry.status}" is not a valid attendance status.`);
+    }
+
+    // Backdating beyond a fortnight is almost always a mistyped date rather
+    // than a genuine correction, so it is refused rather than absorbed.
+    const age = daysBetween(date, localDate());
+    if (age > 30) {
+        throw new Error(`That date is ${age} days ago. Attendance can only be marked or corrected within 30 days.`);
+    }
+
+    const existing = await attendance$.forBatchOn(batchId, date);
+    const priorByStudent = new Map(existing.map((row) => [row.studentId, row]));
+    const at = nowISO();
+    const actor = session.actorId();
+
+    const records = entries.map((entry) => {
+        const prior = priorByStudent.get(entry.studentId);
+        return {
+            id: prior?.id || uid('ATT'),
+            batchDate: `${batchId}|${date}|${entry.studentId}`,
+            studentId: entry.studentId,
+            batchId,
+            branchId: batch.branchId,
+            date,
+            status: entry.status,
+            note: entry.note?.trim() || null,
+            markedBy: actor,
+            markedByName: session.actorName(),
+            createdAt: prior?.createdAt || at,
+            createdBy: prior?.createdBy || actor,
+            updatedAt: at,
+            updatedBy: actor,
+            correctedFrom: prior && prior.status !== entry.status ? prior.status : null
+        };
+    });
+
+    const corrections = records.filter((r) => r.correctedFrom).length;
+
+    await db.unit(['attendance', 'auditLog'], async (s) => {
+        for (const record of records) await request(s.attendance.put(record));
+        await request(s.auditLog.put({
+            id: uid('AUD'),
+            entity: 'Attendance',
+            entityId: batchId,
+            action: existing.length ? 'correct' : 'mark',
+            detail: { date, count: records.length, corrections },
+            actorId: actor, actorName: session.actorName(), at
+        }));
+    }, 'attendance:post');
+
+    const summary = {
+        batchId, date,
+        total: records.length,
+        breakdown: AttendanceMath.breakdownOf(records),
+        rate: AttendanceMath.rateOf(records),
+        corrected: corrections,
+        wasUpdate: existing.length > 0
+    };
+
+    bus.emit(EVENTS.ATTENDANCE_SAVED, summary);
+    return summary;
 }
 
-/** A teacher's own week — the teacher dashboard's schedule panel. */
-export async function teacherSchedule(teacherId) {
-    const batches = await batches$.byTeacher(teacherId);
-    const rosters = await Promise.all(batches.map((b) => students$.byBatch(b.id)));
+/**
+ * Marks a whole day as a holiday across every batch that would have met.
+ *
+ * Holiday rows are written rather than simply skipping the day: an absent
+ * *record* means "nobody came and that is fine", while an absent *row* is
+ * indistinguishable from a register nobody got round to.
+ */
+export async function declareHoliday({ date, name, branchId = null, mark = true }) {
+    session.require('attendance.mark', 'declare a holiday');
 
-    return WEEK.map((day) => ({
-        day,
-        sessions: batches
-            .map((b, i) => ({ ...b, enrolled: rosters[i].length, levelLabel: levelLabel(b.level) }))
-            .filter((b) => (b.days || []).includes(day))
-            .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''))
-    })).filter((d) => d.sessions.length);
+    if (!date) throw new Error('Choose a date.');
+    if (!name?.trim()) throw new Error('Give the holiday a name — it appears on the calendar.');
+
+    const holiday = await holidays$.create({ date, name: name.trim(), branchId });
+
+    let marked = 0;
+    if (mark) {
+        const batches = await batches$.meetingOn(date, branchId);
+        for (const batch of batches) {
+            const roster = await students$.byBatch(batch.id);
+            if (!roster.length) continue;
+            const result = await postRegister({
+                batchId: batch.id,
+                date,
+                entries: roster.map((s) => ({ studentId: s.id, status: ATTENDANCE_STATUS.HOLIDAY, note: name.trim() }))
+            });
+            marked += result.total;
+        }
+    }
+
+    bus.emit(EVENTS.HOLIDAY_CHANGED, { holiday, marked });
+    return { holiday, marked };
+}
+
+export async function removeHoliday(id) {
+    session.require('attendance.mark', 'remove a holiday');
+    const holiday = await holidays$.findOrFail(id);
+    await holidays$.remove(id);
+    bus.emit(EVENTS.HOLIDAY_CHANGED, { holiday: null, removed: holiday });
+    return true;
+}
+
+/* ==========================================================================
+   LEAVE
+   ========================================================================== */
+
+export async function requestLeave({ studentId, fromDate, toDate, reason }) {
+    const student = await students$.findOrFail(studentId);
+
+    const request$ = await leaves$.create({
+        studentId,
+        studentName: student.name,
+        branchId: student.branchId,
+        batchId: student.batchId,
+        fromDate,
+        toDate,
+        reason: reason?.trim(),
+        status: 'pending',
+        requestedOn: localDate()
+    });
+
+    await notify({
+        kind: 'attendance',
+        key: `leave:${request$.id}`,
+        title: `Leave requested — ${student.name}`,
+        body: `${fromDate} to ${toDate}: ${request$.reason}`,
+        link: '#/attendance?tab=leave'
+    });
+
+    bus.emit(EVENTS.LEAVE_REQUESTED, { request: request$ });
+    return request$;
+}
+
+/**
+ * Approving leave rewrites any attendance already marked in the covered range
+ * from absent to excused. Without that, a family who gave three weeks' notice
+ * still shows a wall of red on the child's record.
+ */
+export async function decideLeave(id, approved, { note = null } = {}) {
+    session.require('attendance.mark', 'decide a leave request');
+
+    const leave = await leaves$.findOrFail(id);
+    if (leave.status !== 'pending') throw new Error('This request has already been decided.');
+
+    const updated = await leaves$.update(id, {
+        status: approved ? 'approved' : 'declined',
+        decidedOn: localDate(),
+        decidedBy: session.actorId(),
+        decisionNote: note?.trim() || null
+    });
+
+    let amended = 0;
+    if (approved) {
+        const rows = (await attendance$.forStudent(leave.studentId, { from: leave.fromDate, to: leave.toDate }))
+            .filter((r) => r.status === ATTENDANCE_STATUS.ABSENT);
+
+        if (rows.length) {
+            const at = nowISO();
+            const amendedRows = rows.map((r) => ({
+                ...r,
+                status: ATTENDANCE_STATUS.EXCUSED,
+                note: leave.reason,
+                correctedFrom: ATTENDANCE_STATUS.ABSENT,
+                updatedAt: at,
+                updatedBy: session.actorId()
+            }));
+            await db.putMany('attendance', amendedRows);
+            amended = amendedRows.length;
+            bus.emit(EVENTS.ATTENDANCE_SAVED, { batchId: leave.batchId, date: leave.fromDate, amended });
+        }
+    }
+
+    bus.emit(EVENTS.LEAVE_DECIDED, { request: updated, amended });
+    return { request: updated, amended };
+}
+
+/* ==========================================================================
+   ANALYTICS
+   ========================================================================== */
+
+/** Attendance for one month, shaped as a calendar grid for the monthly view. */
+export async function monthlyGrid({ batchId, month = monthKey() }) {
+    const [year, mon] = month.split('-').map(Number);
+    const from = `${month}-01`;
+    const to = endOfMonth(new Date(year, mon - 1, 1));
+
+    const [roster, rows, holidayRows, batch] = await Promise.all([
+        students$.byBatch(batchId),
+        attendance$.between(from, to),
+        holidays$.inRange(from, to),
+        batches$.findOrFail(batchId)
+    ]);
+
+    const mine = rows.filter((r) => r.batchId === batchId);
+    const byKey = new Map(mine.map((r) => [`${r.studentId}|${r.date}`, r]));
+    const holidays = new Set(holidayRows.map((h) => h.date));
+
+    // Only days the batch actually meets become columns. Showing all 31 days
+    // makes a grid that is 80% empty and unreadable on a laptop.
+    const days = [];
+    for (let d = new Date(year, mon - 1, 1); d.getMonth() === mon - 1; d.setDate(d.getDate() + 1)) {
+        const date = localDate(d);
+        if (date > localDate()) break;
+        if (!batch.days.includes(DAY_CODES[d.getDay()])) continue;
+        days.push({ date, day: d.getDate(), holiday: holidays.has(date) });
+    }
+
+    return {
+        batch,
+        month,
+        days,
+        rows: roster.map((student) => {
+            const cells = days.map((d) => byKey.get(`${student.id}|${d.date}`)?.status || null);
+            const present = cells.filter((c) => c && c !== ATTENDANCE_STATUS.ABSENT && c !== ATTENDANCE_STATUS.HOLIDAY).length;
+            const counted = cells.filter((c) => c && c !== ATTENDANCE_STATUS.HOLIDAY).length;
+            return {
+                student,
+                cells,
+                present,
+                counted,
+                rate: counted ? Math.round((present / counted) * 100) : null
+            };
+        })
+    };
+}
+
+/** Headline attendance figures for a range — used by dashboard and reports. */
+export async function summary({ from, to, branchId = null, batchId = null }) {
+    let rows = await attendance$.between(from, to, branchId);
+    if (batchId) rows = rows.filter((r) => r.batchId === batchId);
+
+    const breakdown = AttendanceMath.breakdownOf(rows);
+    const sessions = new Set(rows.map((r) => `${r.batchId}|${r.date}`)).size;
+
+    return {
+        from, to,
+        marks: rows.length,
+        sessions,
+        rate: AttendanceMath.rateOf(rows),
+        breakdown,
+        byDate: groupRate(rows, (r) => r.date),
+        byBatch: groupRate(rows, (r) => r.batchId)
+    };
+}
+
+/** Monthly attendance rate over the last n months, for the trend chart. */
+export async function trend(months = 6, branchId = null) {
+    const keys = lastMonths(months);
+    const from = `${keys[0]}-01`;
+    const rows = await attendance$.between(from, localDate(), branchId);
+
+    return keys.map((key) => {
+        const slice = rows.filter((r) => r.date.startsWith(key));
+        return { period: key, rate: AttendanceMath.rateOf(slice), marks: slice.length };
+    });
+}
+
+/** Per-teacher marking discipline — how many of their registers are done. */
+export async function teacherCompliance({ from, to, branchId = null }) {
+    const [teachers, batches, rows] = await Promise.all([
+        staff$.teachers(branchId),
+        batches$.active(branchId),
+        attendance$.between(from, to, branchId)
+    ]);
+
+    const done = new Set(rows.map((r) => `${r.batchId}|${r.date}`));
+
+    return teachers.map((teacher) => {
+        const own = batches.filter((b) => b.teacherId === teacher.id);
+        let expected = 0;
+        let marked = 0;
+
+        for (const batch of own) {
+            for (let d = new Date(`${from}T00:00:00`); localDate(d) <= to; d.setDate(d.getDate() + 1)) {
+                if (!batch.days.includes(DAY_CODES[d.getDay()])) continue;
+                expected += 1;
+                if (done.has(`${batch.id}|${localDate(d)}`)) marked += 1;
+            }
+        }
+
+        return {
+            teacher,
+            batches: own.length,
+            expected,
+            marked,
+            compliance: expected ? Math.round((marked / expected) * 100) : null
+        };
+    }).sort((a, b) => (a.compliance ?? 101) - (b.compliance ?? 101));
+}
+
+/** Registers that were never filled in — the follow-up list. */
+export async function missingRegisters({ days = 14, branchId = null } = {}) {
+    const from = addDays(localDate(), -days);
+    const [batches, rows] = await Promise.all([
+        batches$.active(branchId),
+        attendance$.between(from, localDate(), branchId)
+    ]);
+
+    const done = new Set(rows.map((r) => `${r.batchId}|${r.date}`));
+    const missing = [];
+
+    for (const batch of batches) {
+        for (let d = new Date(`${from}T00:00:00`); localDate(d) <= localDate(); d.setDate(d.getDate() + 1)) {
+            const date = localDate(d);
+            if (!batch.days.includes(DAY_CODES[d.getDay()])) continue;
+            if (done.has(`${batch.id}|${date}`)) continue;
+            if (await holidays$.on(date, batch.branchId)) continue;
+            missing.push({ batch, date, age: daysBetween(date, localDate()) });
+        }
+    }
+
+    return missing.sort((a, b) => b.age - a.age);
 }
 
 /* ------------------------------------------------------------------ HELPERS */
 
-function normalise(data) {
-    const level = LEVELS.find((l) => l.value === data.level);
-    return {
-        ...data,
-        name: String(data.name || '').trim(),
-        code: String(data.code || '').trim().toUpperCase(),
-        room: data.room?.trim() || null,
-        days: Array.isArray(data.days) ? WEEK.filter((d) => data.days.includes(d)) : [],
-        capacity: Number(data.capacity) || 0,
-        levelOrder: level?.order || 99,
-        status: data.status || 'active'
-    };
+function groupRate(rows, keyOf) {
+    const groups = new Map();
+    for (const row of rows) {
+        const key = keyOf(row);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(row);
+    }
+    return [...groups.entries()]
+        .map(([key, group]) => ({ key, rate: AttendanceMath.rateOf(group), marks: group.length }))
+        .sort((a, b) => String(a.key).localeCompare(String(b.key)));
 }
 
-function assertShape(batch) {
-    if (!batch.name) throw new Error('A batch needs a name.');
-    if (!batch.code) throw new Error('A batch needs a short code, e.g. HYD-PRA-A.');
-    if (!batch.branchId) throw new Error('Choose which branch this batch runs at.');
-    if (!batch.level) throw new Error('Choose the level this batch teaches.');
-    if (!batch.days.length) throw new Error('Choose at least one day the batch meets.');
-    if (!batch.startTime || !batch.endTime) throw new Error('Give the start and end time.');
-    if (batch.endTime <= batch.startTime) throw new Error('The batch cannot end before it starts.');
-    if (batch.capacity < 0) throw new Error('Capacity cannot be negative.');
-}
-
-function describeSchedule(batch) {
-    if (!batch.days?.length) return 'Not scheduled';
-    const days = WEEK.filter((d) => batch.days.includes(d)).join(', ');
-    return `${days} · ${batch.startTime}–${batch.endTime}`;
-}
-
-
-
-/** The next calendar date falling on a given day code, for label formatting. */
-function nextDateFor(dayCode) {
-    const target = DAY_CODES.indexOf(dayCode);
-    const d = new Date();
-    while (d.getDay() !== target) d.setDate(d.getDate() + 1);
-    return localDate(d);
-}
+export { startOfMonth, endOfMonth };

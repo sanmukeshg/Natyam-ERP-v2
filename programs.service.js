@@ -1,547 +1,130 @@
 /**
- * NATYAM ERP 2.0 — Form builder
+ * Icons.
  *
- * Thirteen module pages need forms. Without this file each of them writes its
- * own `<div class="field"><label…` by hand, and within a month the label sits
- * above the input on nine screens and beside it on four, half of them forget
- * `aria-describedby` on the error text, and the required marker is a red
- * asterisk in some places and the word "required" in others.
+ * Inline SVG paths rather than an icon font or a sprite file. Fonts render
+ * boxes if the file is missing offline and are invisible to a screen reader in
+ * ways that are hard to fix; a sprite is an extra request that can fail on a
+ * cold cache. Inline paths always paint, inherit `currentColor`, and cost about
+ * 4KB for the whole set.
  *
- * So forms are declared as data here and rendered once. A page says what it
- * wants collected; this module decides what that looks like and how it behaves
- * when it is wrong.
- *
- * What this deliberately does NOT do is validate business rules. It checks
- * that a required box has something in it and that a number is a number —
- * shape, not meaning. Whether a fee may be waived, or a student may join a
- * full batch, is the service layer's answer and this file must never guess it.
+ * 1.0 used emoji in the sidebar. Emoji render differently on every OS, cannot
+ * be recoloured, and are announced literally by screen readers ("house with
+ * garden" for the dashboard link).
  */
 
-import { html, render, el, escapeHtml } from '../utils/dom.js';
-import { overlay } from './overlay.js';
-import { toPaise, toRupees } from '../utils/money.js';
+const PATHS = {
+    /* Navigation */
+    home:          '<path d="M3 9.5 12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1V9.5Z"/>',
+    inbox:         '<path d="M4 13h4l1.5 3h5L16 13h4"/><path d="M4 13 6 5h12l2 8v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-6Z"/>',
+    users:         '<circle cx="9" cy="8" r="3.2"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16.5 5.6a3.2 3.2 0 0 1 0 6.2"/><path d="M18 14.4a6.2 6.2 0 0 1 3.5 5.6"/>',
+    briefcase:     '<rect x="2.5" y="7" width="19" height="13" rx="2"/><path d="M8.5 7V5a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 15.5 5v2"/><path d="M2.5 12.5h19"/>',
+    grid:          '<rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/>',
+    'check-square':'<rect x="3" y="3" width="18" height="18" rx="2.5"/><path d="m8 12 2.8 2.8L16.5 9"/>',
+    star:          '<path d="m12 3.2 2.7 5.6 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9L12 3.2Z"/>',
+    award:         '<circle cx="12" cy="9" r="5.5"/><path d="m8.5 13.8-1.4 6.7 4.9-2.6 4.9 2.6-1.4-6.7"/>',
+    receipt:       '<path d="M5 3.5h14v17l-2.3-1.6-2.4 1.6-2.3-1.6L9.7 20.5 7.3 18.9 5 20.5v-17Z"/><path d="M8.5 8h7M8.5 12h7"/>',
+    layers:        '<path d="m12 3 9 4.8-9 4.8-9-4.8L12 3Z"/><path d="m3 12.5 9 4.8 9-4.8"/><path d="m3 17 9 4.8L21 17"/>',
+    'trending-up': '<path d="m3 16.5 5.5-5.5 3.5 3.5L21 5.5"/><path d="M15.5 5.5H21v5.5"/>',
+    'bar-chart':   '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+    settings:      '<circle cx="12" cy="12" r="3"/><path d="M19.4 14.5a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5v.2a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H2a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H8a1.6 1.6 0 0 0 1-1.5V2a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V8a1.6 1.6 0 0 0 1.5 1h.2a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1Z"/>',
 
-/* ==========================================================================
-   FIELD MARKUP
-   ========================================================================== */
+    /* Actions */
+    search:        '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.9-3.9"/>',
+    plus:          '<path d="M12 5v14M5 12h14"/>',
+    minus:         '<path d="M5 12h14"/>',
+    x:             '<path d="M18 6 6 18M6 6l12 12"/>',
+    check:         '<path d="m20 6-11 11-5-5"/>',
+    edit:          '<path d="M17 3.5a2.1 2.1 0 0 1 3 3L7.5 19 3 20.5 4.5 16 17 3.5Z"/>',
+    trash:         '<path d="M3 6h18M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6M19 6v13.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 19.5V6"/><path d="M10 11v6M14 11v6"/>',
+    download:      '<path d="M12 3v12"/><path d="m7 11 5 5 5-5"/><path d="M4 20h16"/>',
+    upload:        '<path d="M12 20V8"/><path d="m7 12 5-5 5 5"/><path d="M4 4h16"/>',
+    printer:       '<path d="M7 8V3h10v5"/><rect x="3" y="8" width="18" height="8" rx="2"/><path d="M7 14h10v7H7v-7Z"/>',
+    filter:        '<path d="M3 5h18l-7 8v6l-4 2v-8L3 5Z"/>',
+    'more-vertical':'<circle cx="12" cy="5" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="12" cy="19" r="1.4"/>',
+    refresh:       '<path d="M20.5 11a8.5 8.5 0 1 0-1.6 6"/><path d="M20.5 17v-5h-5"/>',
+    copy:          '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>',
+    'external-link':'<path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M18 14v5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 19V8a1.5 1.5 0 0 1 1.5-1.5H10"/>',
+
+    /* Chevrons and arrows */
+    'chevron-down':  '<path d="m5 9 7 7 7-7"/>',
+    'chevron-up':    '<path d="m5 15 7-7 7 7"/>',
+    'chevron-left':  '<path d="m15 5-7 7 7 7"/>',
+    'chevron-right': '<path d="m9 5 7 7-7 7"/>',
+    'chevrons-left': '<path d="m11 5-7 7 7 7M19 5l-7 7 7 7"/>',
+    'arrow-up':      '<path d="M12 20V4"/><path d="m5 11 7-7 7 7"/>',
+    'arrow-down':    '<path d="M12 4v16"/><path d="m5 13 7 7 7-7"/>',
+    'arrow-right':   '<path d="M4 12h16"/><path d="m13 5 7 7-7 7"/>',
+    'arrow-left':    '<path d="M20 12H4"/><path d="m11 5-7 7 7 7"/>',
+    'corner-down-right':'<path d="M4 4v8a3 3 0 0 0 3 3h12"/><path d="m15 11 4 4-4 4"/>',
+
+    /* Status */
+    'check-circle':  '<circle cx="12" cy="12" r="9"/><path d="m8 12 2.6 2.6L16 9"/>',
+    'alert-circle':  '<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5"/><circle cx="12" cy="16.2" r=".9" fill="currentColor" stroke="none"/>',
+    'alert-triangle':'<path d="M10.3 3.9 1.9 18.4A2 2 0 0 0 3.6 21.4h16.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4.5"/><circle cx="12" cy="17.2" r=".9" fill="currentColor" stroke="none"/>',
+    'x-circle':      '<circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/>',
+    info:            '<circle cx="12" cy="12" r="9"/><path d="M12 16.5v-5"/><circle cx="12" cy="8" r=".9" fill="currentColor" stroke="none"/>',
+    clock:           '<circle cx="12" cy="12" r="9"/><path d="M12 6.8V12l3.4 2"/>',
+    lock:            '<rect x="4.5" y="10.5" width="15" height="10.5" rx="2"/><path d="M8 10.5V7.2a4 4 0 0 1 8 0v3.3"/>',
+    bell:            '<path d="M18 8.5a6 6 0 1 0-12 0c0 5-2 6.5-2 6.5h16s-2-1.5-2-6.5Z"/><path d="M13.7 19a2 2 0 0 1-3.4 0"/>',
+    'cloud-off':     '<path d="m3 3 18 18"/><path d="M18.4 15.7A4 4 0 0 0 17 8h-1.3A7 7 0 0 0 7.5 6"/><path d="M5.8 8.3A4.5 4.5 0 0 0 7 17h9"/>',
+    compass:         '<circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5 5-2Z"/>',
+
+    /* Domain */
+    calendar:      '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+    'calendar-check':'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/><path d="m8.5 15 2.2 2.2 4.3-4.3"/>',
+    'map-pin':     '<path d="M12 21s7-5.5 7-11a7 7 0 1 0-14 0c0 5.5 7 11 7 11Z"/><circle cx="12" cy="10" r="2.6"/>',
+    phone:         '<path d="M6.5 3h3l1.5 4.5-2 1.5a12 12 0 0 0 6 6l1.5-2L21 14.5v3a2 2 0 0 1-2.2 2A17 17 0 0 1 4 5.2 2 2 0 0 1 6.5 3Z"/>',
+    mail:          '<rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>',
+    user:          '<circle cx="12" cy="8" r="4"/><path d="M4.5 21a7.5 7.5 0 0 1 15 0"/>',
+    'user-plus':   '<circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0"/><path d="M19 8v6M22 11h-6"/>',
+    file:          '<path d="M13.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5L13.5 3Z"/><path d="M13.5 3v5.5H19"/>',
+    'file-text':   '<path d="M13.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5L13.5 3Z"/><path d="M13.5 3v5.5H19M8.5 13h7M8.5 17h5"/>',
+    activity:      '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+    'pie-chart':   '<path d="M21 12A9 9 0 1 1 12 3v9h9Z"/>',
+    wallet:        '<path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H18v3"/><rect x="3" y="7.5" width="18" height="12.5" rx="2"/><circle cx="17" cy="14" r="1.3" fill="currentColor" stroke="none"/>',
+    moon:          '<path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5Z"/>',
+    sun:           '<circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M4.2 4.2 6 6M18 18l1.8 1.8M2 12h2.5M19.5 12H22M4.2 19.8 6 18M18 6l1.8-1.8"/>',
+    menu:          '<path d="M4 7h16M4 12h16M4 17h16"/>',
+    'log-out':     '<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"/><path d="M10 8l-4 4 4 4M6 12h9"/>',
+    database:      '<ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
+    'help-circle': '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.2a2.6 2.6 0 0 1 5 .8c0 1.7-2.5 2.5-2.5 2.5"/><circle cx="12" cy="16.5" r=".9" fill="currentColor" stroke="none"/>',
+    'shopping-bag':'<path d="M5 7h14l1 13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1L5 7Z"/><path d="M9 10V6a3 3 0 0 1 6 0v4"/>',
+    music:         '<path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>',
+
+    /* Added after a coverage audit found nine call sites drawing nothing:
+       a missing icon rendered as an empty span, so the sidebar brand mark and
+       several refresh buttons were silently blank. */
+    feather:        '<path d="M20.2 3.8a5.5 5.5 0 0 0-7.8 0L4 12.2V20h7.8l8.4-8.4a5.5 5.5 0 0 0 0-7.8Z"/><path d="M16 8 2 22"/><path d="M17.5 11.5h-7"/>',
+    'refresh-cw':   '<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v5h-5"/>',
+    'rotate-ccw':   '<path d="M3 12a9 9 0 1 0 2.6-6.4"/><path d="M3 3v5h5"/>',
+    'trending-down':'<path d="m3 7.5 5.5 5.5 3.5-3.5L21 18.5"/><path d="M15.5 18.5H21V13"/>',
+    shield:         '<path d="M12 2.5 4.5 5.5v6c0 4.6 3.1 8.8 7.5 10 4.4-1.2 7.5-5.4 7.5-10v-6L12 2.5Z"/>',
+    archive:        '<rect x="2.5" y="4" width="19" height="4.5" rx="1"/><path d="M4.5 8.5V19a1 1 0 0 0 1 1h13a1 1 0 0 0 1-1V8.5"/><path d="M9.5 12.5h5"/>',
+    'user-check':   '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="m16.5 12 2 2 4-4"/>',
+    'toggle-left':  '<rect x="2" y="6.5" width="20" height="11" rx="5.5"/><circle cx="7.5" cy="12" r="2.5"/>',
+};
 
 /**
- * @typedef {object} Field
- * @property {string} name
- * @property {string} label
- * @property {'text'|'textarea'|'select'|'number'|'money'|'date'|'time'|'tel'|'email'|'checkbox'|'switch'|'radio'|'hidden'|'static'|'divider'} [type='text']
- * @property {*} [value]
- * @property {boolean} [required]
- * @property {string} [hint]
- * @property {string} [placeholder]
- * @property {Array}  [options]   For select/radio: [{ value, label, disabled, note }]
- * @property {number} [min] @property {number} [max] @property {number} [step]
- * @property {number} [rows]      For textarea.
- * @property {string} [width]     Grid span hint: 'full' | 'half' | 'third'.
- * @property {boolean}[autofocus]
- * @property {boolean}[disabled]
- */
-
-/** Renders one field. */
-export function field(config) {
-    const {
-        name, label, type = 'text', value = '', required = false, hint = '',
-        placeholder = '', options = [], rows = 3, min, max, step,
-        disabled = false, autofocus = false, autocomplete
-    } = config;
-
-    const id = `f-${name}`;
-    const describedBy = hint ? `${id}-hint` : '';
-
-    if (type === 'hidden') {
-        return html`<input type="hidden" name="${name}" value="${value ?? ''}">`;
-    }
-
-    if (type === 'divider') {
-        return html`<div class="divider divider-labelled" data-label="${label || ''}"></div>`;
-    }
-
-    if (type === 'static') {
-        return html`
-            <div class="field" data-width="${config.width || 'full'}">
-                <span class="field-label">${label}</span>
-                <p class="type-body">${value || '—'}</p>
-                ${hint ? html`<p class="field-hint">${hint}</p>` : ''}
-            </div>
-        `;
-    }
-
-    if (type === 'checkbox' || type === 'switch') {
-        const controlBox = type === 'switch'
-            ? html`<span class="switch-track" aria-hidden="true"></span>`
-            : html`<span class="check-box" aria-hidden="true"></span>`;
-        return html`
-            <div class="field" data-width="${config.width || 'full'}">
-                <label class="${type === 'switch' ? 'switch' : 'check'}">
-                    <input type="checkbox" name="${name}" id="${id}"
-                           ${value ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
-                    ${controlBox}
-                    <span>${label}</span>
-                </label>
-                ${hint ? html`<p class="field-hint" id="${id}-hint">${hint}</p>` : ''}
-                <p class="field-error" data-error-for="${name}" hidden></p>
-            </div>
-        `;
-    }
-
-    // A set of independent checkboxes returning an array — the "which days
-    // does this batch meet" shape. Added here rather than hand-rolled in the
-    // batch form because programmes and reports need exactly the same control.
-    if (type === 'checkbox-group') {
-        const selected = new Set((Array.isArray(value) ? value : []).map(String));
-        return html`
-            <fieldset class="field" data-width="${config.width || 'full'}">
-                <legend class="field-label">${label}${required ? requiredMark() : ''}</legend>
-                <div class="row row-wrap">
-                    ${options.map((option, index) => html`
-                        <label class="check">
-                            <input type="checkbox" name="${name}" value="${option.value}"
-                                   ${selected.has(String(option.value)) ? 'checked' : ''}
-                                   ${option.disabled ? 'disabled' : ''}
-                                   ${autofocus && index === 0 ? 'autofocus' : ''}>
-                            <span class="check-box" aria-hidden="true"></span>
-                            <span>${option.label}</span>
-                        </label>
-                    `)}
-                </div>
-                ${hint ? html`<p class="field-hint" id="${id}-hint">${hint}</p>` : ''}
-                <p class="field-error" data-error-for="${name}" hidden></p>
-            </fieldset>
-        `;
-    }
-
-    if (type === 'radio') {
-        return html`
-            <fieldset class="field" data-width="${config.width || 'full'}">
-                <legend class="field-label">${label}${required ? requiredMark() : ''}</legend>
-                <div class="row row-wrap">
-                    ${options.map((option, index) => html`
-                        <label class="check">
-                            <input type="radio" name="${name}" value="${option.value}"
-                                   ${String(value) === String(option.value) ? 'checked' : ''}
-                                   ${option.disabled ? 'disabled' : ''}
-                                   ${autofocus && index === 0 ? 'autofocus' : ''}>
-                            <span class="check-radio" aria-hidden="true"></span>
-                            <span>${option.label}</span>
-                        </label>
-                    `)}
-                </div>
-                ${hint ? html`<p class="field-hint" id="${id}-hint">${hint}</p>` : ''}
-                <p class="field-error" data-error-for="${name}" hidden></p>
-            </fieldset>
-        `;
-    }
-
-    let control;
-
-    if (type === 'textarea') {
-        control = html`<textarea class="textarea" name="${name}" id="${id}" rows="${rows}"
-                                 placeholder="${placeholder}"
-                                 ${required ? 'required' : ''} ${disabled ? 'disabled' : ''}
-                                 ${autofocus ? 'autofocus' : ''}
-                                 ${describedBy ? `aria-describedby="${describedBy}"` : ''}
-                       >${value ?? ''}</textarea>`;
-    } else if (type === 'select') {
-        control = html`
-            <select class="select" name="${name}" id="${id}"
-                    ${required ? 'required' : ''} ${disabled ? 'disabled' : ''}
-                    ${autofocus ? 'autofocus' : ''}
-                    ${describedBy ? `aria-describedby="${describedBy}"` : ''}>
-                ${config.placeholder !== false
-                    ? html`<option value="">${placeholder || 'Choose…'}</option>`
-                    : ''}
-                ${options.map((option) => html`
-                    <option value="${option.value}"
-                            ${String(value) === String(option.value) ? 'selected' : ''}
-                            ${option.disabled ? 'disabled' : ''}>
-                        ${option.label}${option.note ? ` — ${option.note}` : ''}
-                    </option>
-                `)}
-            </select>
-        `;
-    } else {
-        // `money` is a decimal rupee input; the caller receives paise.
-        const inputType = type === 'money' ? 'number' : type;
-        const inputStep = type === 'money' ? '0.01' : step;
-
-        control = html`
-            <input class="input" type="${inputType}" name="${name}" id="${id}"
-                   value="${value ?? ''}" placeholder="${placeholder}"
-                   ${min !== undefined ? `min="${min}"` : ''}
-                   ${max !== undefined ? `max="${max}"` : ''}
-                   ${inputStep !== undefined ? `step="${inputStep}"` : ''}
-                   ${autocomplete ? `autocomplete="${autocomplete}"` : ''}
-                   ${required ? 'required' : ''} ${disabled ? 'disabled' : ''}
-                   ${autofocus ? 'autofocus' : ''}
-                   ${type === 'money' ? 'data-money="1" inputmode="decimal"' : ''}
-                   ${describedBy ? `aria-describedby="${describedBy}"` : ''}>
-        `;
-    }
-
-    return html`
-        <div class="field" data-width="${config.width || 'full'}">
-            <label class="field-label" for="${id}">${label}${required ? requiredMark() : ''}</label>
-            ${type === 'money'
-                ? html`<div class="input-group"><span class="input-prefix">₹</span>${control}</div>`
-                : control}
-            ${hint ? html`<p class="field-hint" id="${id}-hint">${hint}</p>` : ''}
-            <p class="field-error" data-error-for="${name}" hidden></p>
-        </div>
-    `;
-}
-
-function requiredMark() {
-    return html`<span class="field-required" aria-hidden="true">*</span><span class="sr-only"> (required)</span>`;
-}
-
-/** Renders a list of fields into a responsive grid. */
-export function fields(list) {
-    return html`<div class="form-grid">${list.filter(Boolean).map((f) => field(f))}</div>`;
-}
-
-/** A titled group of fields. */
-export function section(title, list, description = '') {
-    return html`
-        <section class="form-section">
-            <h3 class="form-section-title">${title}</h3>
-            ${description ? html`<p class="form-section-description">${description}</p>` : ''}
-            ${fields(list)}
-        </section>
-    `;
-}
-
-/* ==========================================================================
-   READING VALUES BACK
-   ========================================================================== */
-
-/**
- * Reads a form's values, typed according to the field list that produced it.
+ * Renders an icon as an inline SVG string.
  *
- * Typing here rather than at the call site is what stops a rupee amount
- * reaching a service as the string "1200.50". Money always leaves this
- * function as integer paise, numbers as numbers, empty text as null.
+ * Icons are decorative by default (`aria-hidden`), because they nearly always
+ * sit beside a text label. Pass a `label` only where the icon is the sole
+ * content of a control, and in that case prefer an aria-label on the button.
  */
-export function readForm(root, list) {
-    const values = {};
-
-    for (const config of list.filter(Boolean)) {
-        if (!config.name || config.type === 'divider' || config.type === 'static') continue;
-
-        const control = root.querySelector(`[name="${CSS.escape(config.name)}"]`);
-        if (!control && config.type !== 'radio' && config.type !== 'checkbox-group') continue;
-
-        switch (config.type) {
-            case 'checkbox-group': {
-                const boxes = root.querySelectorAll(`[name="${CSS.escape(config.name)}"]:checked`);
-                values[config.name] = [...boxes].map((box) => box.value);
-                break;
-            }
-            case 'checkbox':
-            case 'switch':
-                values[config.name] = Boolean(control.checked);
-                break;
-            case 'radio': {
-                const checked = root.querySelector(`[name="${CSS.escape(config.name)}"]:checked`);
-                values[config.name] = checked ? checked.value : null;
-                break;
-            }
-            case 'money': {
-                const raw = control.value.trim();
-                values[config.name] = raw === '' ? null : toPaise(Number(raw));
-                break;
-            }
-            case 'number': {
-                const raw = control.value.trim();
-                values[config.name] = raw === '' ? null : Number(raw);
-                break;
-            }
-            default: {
-                const raw = String(control.value ?? '').trim();
-                values[config.name] = raw === '' ? null : raw;
-            }
-        }
+export function icon(name, { size = 20, className = 'icon', label = null, strokeWidth = 1.7 } = {}) {
+    const path = PATHS[name];
+    if (!path) {
+        console.warn(`Unknown icon: ${name}`);
+        return '';
     }
+    const a11y = label
+        ? `role="img" aria-label="${label.replace(/"/g, '&quot;')}"`
+        : 'aria-hidden="true" focusable="false"';
 
-    return values;
+    return `<svg class="${className}" width="${size}" height="${size}" viewBox="0 0 24 24" ` +
+           `fill="none" stroke="currentColor" stroke-width="${strokeWidth}" ` +
+           `stroke-linecap="round" stroke-linejoin="round" ${a11y}>${path}</svg>`;
 }
 
-/** Shape-level validation only. Returns { ok, errors: { field: message } }. */
-export function validateShape(values, list) {
-    const errors = {};
-
-    for (const config of list.filter(Boolean)) {
-        if (!config.name) continue;
-        const value = values[config.name];
-
-        // An empty array is empty even though it is truthy.
-        if (config.required && Array.isArray(value) && value.length === 0) {
-            errors[config.name] = `${config.label} is needed.`;
-            continue;
-        }
-        if (config.required && (value === null || value === undefined || value === '' || value === false)) {
-            errors[config.name] = `${config.label} is needed.`;
-            continue;
-        }
-        if (value === null || value === undefined) continue;
-
-        if ((config.type === 'number' || config.type === 'money') && Number.isNaN(value)) {
-            errors[config.name] = 'This must be a number.';
-        }
-        if (config.type === 'money' && value !== null && value < 0) {
-            errors[config.name] = 'This cannot be negative.';
-        }
-        if (config.type === 'number' && config.min !== undefined && value < config.min) {
-            errors[config.name] = `This cannot be below ${config.min}.`;
-        }
-        if (config.type === 'number' && config.max !== undefined && value > config.max) {
-            errors[config.name] = `This cannot be above ${config.max}.`;
-        }
-        if (config.type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
-            errors[config.name] = 'This does not look like an email address.';
-        }
-        if (config.type === 'tel' && String(value).replace(/\D/g, '').length < 10) {
-            errors[config.name] = 'A phone number needs at least ten digits.';
-        }
-    }
-
-    return { ok: Object.keys(errors).length === 0, errors };
-}
-
-/**
- * Paints errors onto a rendered form and moves focus to the first one, so a
- * failure on a long form does not leave the user hunting for the red text.
- */
-export function showErrors(root, errors) {
-    root.querySelectorAll('[data-error-for]').forEach((node) => {
-        node.hidden = true;
-        node.textContent = '';
-    });
-    root.querySelectorAll('[aria-invalid]').forEach((node) => node.removeAttribute('aria-invalid'));
-
-    let first = null;
-
-    for (const [name, message] of Object.entries(errors || {})) {
-        const slot = root.querySelector(`[data-error-for="${CSS.escape(name)}"]`);
-        const control = root.querySelector(`[name="${CSS.escape(name)}"]`);
-
-        if (slot) {
-            slot.textContent = message;
-            slot.hidden = false;
-        }
-        if (control) {
-            control.setAttribute('aria-invalid', 'true');
-            control.setAttribute('aria-errormessage', `err-${name}`);
-            if (slot) slot.id = `err-${name}`;
-            if (!first) first = control;
-        }
-    }
-
-    first?.focus();
-    return first !== null;
-}
-
-/** Clears every error slot. */
-export function clearErrors(root) {
-    showErrors(root, {});
-}
-
-/* ==========================================================================
-   FORM OVERLAYS
-   ========================================================================== */
-
-/**
- * A drawer or modal containing a form. Resolves with the submitted values, or
- * null if the user backed out.
- *
- * The submit handler is given the typed values and may throw: a thrown error
- * is shown inside the form rather than as a toast, because the user is looking
- * at the form and an error about the form belongs there. If the handler
- * returns a `{ errors }` object, those are painted onto the fields.
- *
- * @param {object} options
- * @param {string} options.title
- * @param {Field[]} options.fields
- * @param {Function} options.onSubmit  async (values, helpers) => result
- * @param {'modal'|'drawer'} [options.variant='drawer']
- * @param {string} [options.submitLabel='Save']
- * @param {Function} [options.onMount]  (body, helpers) => void — for live wiring.
- */
-export function formOverlay({
-    title,
-    description = '',
-    fields: list,
-    onSubmit,
-    variant = 'drawer',
-    size = 'md',
-    submitLabel = 'Save',
-    cancelLabel = 'Cancel',
-    intro = '',
-    danger = false,
-    onMount = null
-}) {
-    let body = null;
-    let currentFields = list;
-
-    const helpers = {
-        /** Swaps the field list — for forms whose shape depends on a choice. */
-        setFields(next) {
-            currentFields = next;
-            const values = readForm(body, currentFields);
-            render(body.querySelector('[data-role="fields"]'), fields(next));
-            // Restore what the user had already typed into surviving fields.
-            for (const [name, value] of Object.entries(values)) {
-                const control = body.querySelector(`[name="${CSS.escape(name)}"]`);
-                if (control && value !== null && control.type !== 'checkbox') control.value = value;
-            }
-        },
-        values: () => readForm(body, currentFields),
-        setError(name, message) { showErrors(body, { [name]: message }); },
-        banner(message, tone = 'danger') {
-            const slot = body.querySelector('[data-role="form-banner"]');
-            if (!slot) return;
-            render(slot, message
-                ? html`<div class="alert alert-${tone}"><p class="alert-body">${message}</p></div>`
-                : '');
-        }
-    };
-
-    return overlay({
-        variant,
-        size,
-        title,
-        description,
-        content: html`
-            <form data-role="form" novalidate>
-                <div data-role="form-banner"></div>
-                ${intro ? html`<p class="type-body mb-4">${intro}</p>` : ''}
-                <div data-role="fields">${fields(list)}</div>
-            </form>
-        `,
-        actions: [
-            { label: cancelLabel, variant: 'secondary', value: null },
-            {
-                label: submitLabel,
-                variant: danger ? 'danger' : 'primary',
-                primary: true,
-                onClick: async ({ body: mounted, close, button }) => {
-                    void mounted; void close;
-                    const values = readForm(body, currentFields);
-                    const shape = validateShape(values, currentFields);
-
-                    // `false` is the overlay's "stay open" signal; every
-                    // validation failure below uses it.
-                    if (!shape.ok) {
-                        showErrors(body, shape.errors);
-                        return false;
-                    }
-                    clearErrors(body);
-
-                    const original = button.innerHTML;
-                    button.innerHTML = 'Working…';
-
-                    try {
-                        const result = await onSubmit(values, helpers);
-                        if (result && result.errors) {
-                            showErrors(body, result.errors);
-                            return false;
-                        }
-                        return result === undefined ? values : result;
-                    } catch (err) {
-                        console.error('Form submission failed', err);
-                        helpers.banner(err.message);
-                        body.scrollTo?.({ top: 0, behavior: 'smooth' });
-                        return false;
-                    } finally {
-                        button.innerHTML = original;
-                    }
-                }
-            }
-        ],
-        onMount: (mounted, api) => {
-            body = mounted;
-            // Enter submits, as it does in every other form the user has used.
-            mounted.querySelector('[data-role="form"]')?.addEventListener('submit', (event) => {
-                event.preventDefault();
-                mounted.closest('.modal, .drawer')?.querySelector('.btn-primary, .btn-danger')?.click();
-            });
-            onMount?.(mounted, { ...helpers, close: api.close });
-            mounted.querySelector('input, select, textarea')?.focus();
-        }
-    });
-}
-
-/* ==========================================================================
-   SMALL HELPERS PAGES REACH FOR
-   ========================================================================== */
-
-/** Turns a record list into select options. */
-export function optionsFrom(rows, { value = 'id', label = 'name', note = null, disabled = null } = {}) {
-    return rows.map((row) => ({
-        value: typeof value === 'function' ? value(row) : row[value],
-        label: typeof label === 'function' ? label(row) : row[label],
-        note: note ? (typeof note === 'function' ? note(row) : row[note]) : null,
-        disabled: disabled ? disabled(row) : false
-    }));
-}
-
-/** Rupee value for pre-filling a money field from stored paise. */
-export function moneyValue(paise) {
-    return paise === null || paise === undefined ? '' : String(toRupees(paise));
-}
-
-/** A read-only summary block, used in confirmation steps. */
-export function summaryList(pairs) {
-    return html`
-        <dl class="dl">
-            ${pairs.filter(([, value]) => value !== null && value !== undefined && value !== '')
-                .map(([term, value]) => html`<dt>${term}</dt><dd>${value}</dd>`)}
-        </dl>
-    `;
-}
-
-/** Escapes a value for use inside an attribute built by hand. */
-export const attr = escapeHtml;
-
-/**
- * Filter-bar controls.
- *
- * These are deliberately separate from the form builder: a filter is not a
- * form field. It has no validation, no submit, no dirty state, and it applies
- * the instant it changes. Nine pages had hand-rolled the same label/select
- * pairing with slightly different aria wiring — three of them had no
- * accessible name at all — so it lives here now.
- *
- * Both emit `data-filter="<name>"`, which is the delegation hook every page
- * listens on.
- */
-export function filterSelect({ name, label, options, value = '', width = null }) {
-    return html`
-        <label class="filter-control" ${width ? `style="width:${width}"` : ''}>
-            <span class="sr-only">${label}</span>
-            <select class="select select-sm" data-filter="${name}" aria-label="${label}">
-                ${options.map((option) => html`
-                    <option value="${option.value}" ${String(value) === String(option.value) ? 'selected' : ''}>
-                        ${option.label}
-                    </option>
-                `)}
-            </select>
-        </label>
-    `;
-}
-
-/** The date half of the same pattern — used by every date-range filter bar. */
-export function filterDate({ name, label, value = '', min = null, max = null }) {
-    return html`
-        <label class="filter-control">
-            <span class="type-caption type-muted">${label}</span>
-            <input class="input input-sm" type="date" data-filter="${name}"
-                   value="${value || ''}" aria-label="${label}"
-                   ${min ? `min="${min}"` : ''} ${max ? `max="${max}"` : ''}>
-        </label>
-    `;
-}
+export function hasIcon(name) { return Boolean(PATHS[name]); }
+export const iconNames = Object.keys(PATHS);

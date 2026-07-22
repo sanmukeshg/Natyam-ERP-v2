@@ -1,349 +1,114 @@
 /**
- * NATYAM ERP 2.0 — Programme service
+ * Field consistency check.
  *
- * Performances, workshops, competitions, examinations and rehearsals. In this
- * school these are not a side feature: the Annual Day rangapravesham is the
- * event the entire year is organised around, and a student's programme history
- * is what a certificate is issued against.
+ * The academic-year screen was dead because three files disagreed about what a
+ * year record is called: the seed wrote `startsOn`, the service sorted on
+ * `startDate`, and the page displayed `name`. Nothing failed at import time and
+ * nothing failed at parse time — it only threw when a person opened the tab.
  *
- * "Events" and "programmes" are the same thing here and are modelled once.
- * Splitting them into two entities — as the original brief's separate
- * EventService and ProgramService would imply — would mean two participant
- * lists, two calendars and two places for a date to be wrong, to distinguish
- * things the school itself does not distinguish. What actually differs between
- * a workshop and a competition is a `type` field and which fields matter.
- */
-
-import { bus, EVENTS } from '../core/bus.js';
-import { session } from '../core/session.js';
-import { localDate, daysBetween, formatDate, monthKey } from '../utils/date.js';
-import { PROGRAM_TYPES, LEVELS, levelLabel } from '../config/app.config.js';
-import { programs$, students$, staff$, branches$, certificates$ } from '../data/repositories.js';
-import { notify } from './notifications.service.js';
-import { postEntry } from './finance.service.js';
-
-export const PROGRAM_STATUS = Object.freeze({
-    SCHEDULED: 'scheduled',
-    RUNNING:   'running',
-    COMPLETED: 'completed',
-    CANCELLED: 'cancelled'
-});
-
-/* ==========================================================================
-   LIFECYCLE
-   ========================================================================== */
-
-export async function schedule(data) {
-    session.require('program.edit', 'schedule a programme');
-
-    const record = normalise(data);
-    assertShape(record);
-
-    const program = await programs$.create({ ...record, status: PROGRAM_STATUS.SCHEDULED });
-
-    if (daysBetween(localDate(), program.date) <= 60) {
-        await notify({
-            kind: 'program',
-            key: `derived:program:${program.id}`,
-            title: `${program.name} scheduled`,
-            body: [formatDate(program.date), program.venue].filter(Boolean).join(' · '),
-            link: `#/programs/${program.id}`
-        });
-    }
-
-    bus.emit(EVENTS.PROGRAM_SCHEDULED, { program });
-    return program;
-}
-
-export async function updateProgram(id, changes) {
-    session.require('program.edit', 'edit a programme');
-
-    const existing = await programs$.findOrFail(id);
-    if (existing.status === PROGRAM_STATUS.COMPLETED && changes.date && changes.date !== existing.date) {
-        throw new Error('This programme has already taken place. Its date cannot be changed.');
-    }
-
-    const record = normalise({ ...existing, ...changes, id });
-    assertShape(record);
-
-    const program = await programs$.update(id, record);
-    bus.emit(EVENTS.PROGRAM_UPDATED, { program, before: existing });
-    return program;
-}
-
-/**
- * Closes a programme out. Attendance, receipts and expenditure are all
- * recorded at this point rather than trickling in afterwards, because a
- * programme nobody closed is a programme whose costs never reach the ledger —
- * which is precisely how a school convinces itself its Annual Day broke even.
- */
-export async function complete(id, { attendees = null, income = 0, expenditure = 0, notes = null } = {}) {
-    session.require('program.edit', 'close a programme');
-
-    const program = await programs$.findOrFail(id);
-    if (program.status === PROGRAM_STATUS.COMPLETED) throw new Error('This programme is already closed.');
-    if (program.status === PROGRAM_STATUS.CANCELLED) throw new Error('This programme was cancelled.');
-    if (program.date > localDate()) throw new Error(`${program.name} has not happened yet — it is scheduled for ${formatDate(program.date)}.`);
-
-    const earned = Math.round(Number(income) || 0);
-    const spent = Math.round(Number(expenditure) || 0);
-
-    const completed = await programs$.update(id, {
-        status: PROGRAM_STATUS.COMPLETED,
-        completedOn: localDate(),
-        attendees: attendees !== null ? Number(attendees) : (program.participants?.length || null),
-        income: earned,
-        expenditure: spent,
-        notes: notes?.trim() || null
-    });
-
-    /* Money flows to the ledger, not into the programme record alone. */
-    if (earned > 0 && session.can('finance.edit')) {
-        await postEntry({
-            date: program.date,
-            account: program.type === 'workshop' ? 'Workshop fees' : 'Programme tickets',
-            type: 'income',
-            amount: earned,
-            narration: `${program.name} — receipts`,
-            branchId: program.branchId,
-            sourceType: 'program',
-            sourceId: program.id
-        });
-    }
-    if (spent > 0 && session.can('finance.edit')) {
-        await postEntry({
-            date: program.date,
-            account: 'Venue hire',
-            type: 'expense',
-            amount: spent,
-            narration: `${program.name} — costs`,
-            branchId: program.branchId,
-            sourceType: 'program',
-            sourceId: program.id
-        });
-    }
-
-    bus.emit(EVENTS.PROGRAM_COMPLETED, { program: completed });
-    return completed;
-}
-
-export async function cancel(id, { reason }) {
-    session.require('program.edit', 'cancel a programme');
-
-    if (!reason?.trim()) throw new Error('Record why the programme was cancelled — families will ask.');
-    const program = await programs$.findOrFail(id);
-    if (program.status === PROGRAM_STATUS.COMPLETED) throw new Error('A completed programme cannot be cancelled.');
-
-    const cancelled = await programs$.update(id, {
-        status: PROGRAM_STATUS.CANCELLED,
-        cancelledOn: localDate(),
-        cancelReason: reason.trim()
-    });
-
-    await notify({
-        kind: 'program',
-        key: `program:cancelled:${id}`,
-        title: `${program.name} cancelled`,
-        body: reason.trim(),
-        link: `#/programs/${id}`
-    });
-
-    bus.emit(EVENTS.PROGRAM_UPDATED, { program: cancelled });
-    return cancelled;
-}
-
-/* ==========================================================================
-   PARTICIPANTS
-   ========================================================================== */
-
-/**
- * Sets the participant list.
+ * This looks for more of the same. For each store it collects the field names
+ * that are *written* (in seed data and in repository create calls) and the
+ * field names that are *read* off records of that type, then reports reads with
+ * no corresponding write.
  *
- * Replaces rather than appends, and validates the whole list first: a
- * performance cast is edited as a set ("these fourteen girls"), not one name
- * at a time, and half-applying an edit is worse than rejecting it.
+ * It is a heuristic and will produce false positives — computed fields, fields
+ * added by services after load, fields from joined records. It is meant to give
+ * a short list worth eyeballing, not a verdict.
  */
-export async function setParticipants(id, studentIds) {
-    session.require('program.edit', 'change the participant list');
+const fs = require('fs');
+const path = require('path');
 
-    const program = await programs$.findOrFail(id);
-    if (program.status === PROGRAM_STATUS.CANCELLED) throw new Error('This programme was cancelled.');
+const ROOT = process.cwd();
+const files = [];
 
-    const ids = [...new Set(studentIds)];
-    const students = await Promise.all(ids.map((sid) => students$.find(sid)));
-
-    const missing = ids.filter((_, i) => !students[i]);
-    if (missing.length) throw new Error(`${missing.length} of the selected students no longer exist. Refresh and try again.`);
-
-    const inactive = students.filter((s) => s.status === 'inactive');
-    if (inactive.length) {
-        throw new Error(`${inactive.map((s) => s.name).join(', ')} ${inactive.length === 1 ? 'is' : 'are'} no longer active.`);
+(function walk(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith('.js')) files.push(full);
     }
+})(path.join(ROOT, 'js'));
 
-    const updated = await programs$.update(id, {
-        participants: ids,
-        participantCount: ids.length
-    });
+const sources = new Map(files.map((f) => [path.relative(ROOT, f), fs.readFileSync(f, 'utf8')]));
 
-    bus.emit(EVENTS.PROGRAM_UPDATED, { program: updated, before: program });
-    return updated;
+/* Singular accessor names that indicate "this variable holds a record of type X". */
+const ENTITIES = {
+    student: 'students', batch: 'batches', invoice: 'invoices', payment: 'payments',
+    expense: 'expenses', program: 'programs', certificate: 'certificates',
+    branch: 'branches', year: 'academicYears', plan: 'feePlans', member: 'staff',
+    application: 'admissions', admission: 'admissions', entry: 'ledgerEntries',
+    salary: 'salaries', row: null, record: null
+};
+
+/* Fields written anywhere, per store, gathered from object literals near a
+   store name and from the seed file. */
+const written = new Map();
+
+function addWritten(store, field) {
+    if (!store) return;
+    if (!written.has(store)) written.set(store, new Set());
+    written.get(store).add(field);
 }
 
-export async function addParticipants(id, studentIds) {
-    const program = await programs$.findOrFail(id);
-    return setParticipants(id, [...(program.participants || []), ...studentIds]);
-}
-
-export async function removeParticipant(id, studentId) {
-    const program = await programs$.findOrFail(id);
-    return setParticipants(id, (program.participants || []).filter((s) => s !== studentId));
-}
-
-/**
- * Students eligible for a programme, annotated with why.
- *
- * An examination is level-gated; a performance is not. Encoding that here
- * rather than in the picker means the rule is the same whether a cast is set
- * from the programme page, from a bulk action, or from a report.
- */
-export async function eligibleStudents(programOrId, { level = null } = {}) {
-    const program = typeof programOrId === 'string' ? await programs$.findOrFail(programOrId) : programOrId;
-    const roster = await students$.active(program.branchId);
-    const chosen = new Set(program.participants || []);
-
-    const gate = program.type === 'examination' ? (level || program.level) : null;
-
-    return roster
-        .map((student) => ({
-            ...student,
-            selected: chosen.has(student.id),
-            eligible: !gate || student.level === gate,
-            reason: gate && student.level !== gate
-                ? `At ${levelLabel(student.level)}, not ${levelLabel(gate)}`
-                : null
-        }))
-        .sort((a, b) => Number(b.eligible) - Number(a.eligible) || a.name.localeCompare(b.name, 'en-IN'));
-}
-
-/* ==========================================================================
-   VIEWS
-   ========================================================================== */
-
-/** The programme list, enriched for display. */
-export async function listPrograms(branchId = null, { from = null, to = null, type = null, status = null } = {}) {
-    let rows = (await programs$.all()).filter((p) => !branchId || p.branchId === branchId);
-
-    if (from) rows = rows.filter((p) => p.date >= from);
-    if (to) rows = rows.filter((p) => p.date <= to);
-    if (type) rows = rows.filter((p) => p.type === type);
-    if (status) rows = rows.filter((p) => p.status === status);
-
-    const [allBranches, allStaff] = await Promise.all([branches$.all(), staff$.all()]);
-    const branchName = new Map(allBranches.map((b) => [b.id, b.name]));
-    const staffName = new Map(allStaff.map((s) => [s.id, s.name]));
-
-    return rows
-        .map((program) => ({
-            ...program,
-            typeLabel: PROGRAM_TYPES.find((t) => t.value === program.type)?.label || program.type,
-            branchName: branchName.get(program.branchId) || '—',
-            leadName: staffName.get(program.leadStaffId) || null,
-            participantCount: program.participants?.length ?? program.participantCount ?? 0,
-            daysAway: program.date >= localDate() ? daysBetween(localDate(), program.date) : null,
-            isPast: program.date < localDate()
-        }))
-        .sort((a, b) => b.date.localeCompare(a.date));
-}
-
-/** Everything the programme detail view needs. */
-export async function programDetail(id) {
-    const program = await programs$.findOrFail(id);
-    const [participants, branch, lead, certs] = await Promise.all([
-        Promise.all((program.participants || []).map((sid) => students$.find(sid))),
-        program.branchId ? branches$.find(program.branchId) : null,
-        program.leadStaffId ? staff$.find(program.leadStaffId) : null,
-        certificates$.all()
-    ]);
-
-    const cast = participants.filter(Boolean).sort((a, b) => a.name.localeCompare(b.name, 'en-IN'));
-
-    return {
-        program: {
-            ...program,
-            typeLabel: PROGRAM_TYPES.find((t) => t.value === program.type)?.label || program.type,
-            daysAway: program.date >= localDate() ? daysBetween(localDate(), program.date) : null
-        },
-        branch,
-        lead,
-        participants: cast,
-        byLevel: LEVELS
-            .map((l) => ({ level: l.value, label: l.label, count: cast.filter((s) => s.level === l.value).length }))
-            .filter((row) => row.count > 0),
-        certificatesIssued: certs.filter((c) => c.programId === id).length,
-        canIssueCertificates: program.status === PROGRAM_STATUS.COMPLETED && cast.length > 0,
-        net: (program.income || 0) - (program.expenditure || 0)
-    };
-}
-
-/** Calendar payload: programmes grouped by month, for the calendar widget. */
-export async function calendar({ months = 3, branchId = null } = {}) {
-    const rows = await listPrograms(branchId);
-    const from = monthKey();
-    const grouped = new Map();
-
-    for (const program of rows) {
-        const key = program.date.slice(0, 7);
-        if (key < from) continue;
-        if (!grouped.has(key)) grouped.set(key, []);
-        grouped.get(key).push(program);
+// Seed file: `await db.putMany('storeName', rows)` preceded by object literals.
+const seed = sources.get('js/data/seed.js') || '';
+for (const match of seed.matchAll(/putMany\('([a-zA-Z]+)'/g)) {
+    const store = match[1];
+    // Take the 4000 characters before the call — the literals that built it.
+    const chunk = seed.slice(Math.max(0, match.index - 4000), match.index);
+    for (const field of chunk.matchAll(/\b([a-zA-Z][a-zA-Z0-9]*)\s*:/g)) {
+        addWritten(store, field[1]);
     }
-
-    return [...grouped.entries()]
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .slice(0, months)
-        .map(([period, items]) => ({ period, items: items.sort((a, b) => a.date.localeCompare(b.date)) }));
 }
 
-/** Headline programme figures. */
-export async function programSummary(branchId = null) {
-    const rows = await listPrograms(branchId);
-    const year = localDate().slice(0, 4);
-    const thisYear = rows.filter((p) => p.date.startsWith(year));
-
-    return {
-        upcoming: rows.filter((p) => !p.isPast && p.status === PROGRAM_STATUS.SCHEDULED).length,
-        thisYear: thisYear.length,
-        completed: thisYear.filter((p) => p.status === PROGRAM_STATUS.COMPLETED).length,
-        cancelled: thisYear.filter((p) => p.status === PROGRAM_STATUS.CANCELLED).length,
-        participantsEngaged: new Set(thisYear.flatMap((p) => p.participants || [])).size,
-        byType: PROGRAM_TYPES
-            .map((t) => ({ type: t.value, label: t.label, count: thisYear.filter((p) => p.type === t.value).length }))
-            .filter((row) => row.count > 0),
-        nextUp: rows.filter((p) => !p.isPast).sort((a, b) => a.date.localeCompare(b.date))[0] || null
-    };
+// Service creates: `xxx$.create({ ... })` — attribute the literal to that repo.
+for (const [, source] of sources) {
+    for (const match of source.matchAll(/([a-zA-Z]+)\$\.(?:create|update|put)\(/g)) {
+        const repo = match[1];
+        const store = repo === 'staff' ? 'staff' : repo;
+        const chunk = source.slice(match.index, match.index + 1200);
+        for (const field of chunk.matchAll(/\b([a-zA-Z][a-zA-Z0-9]*)\s*:/g)) addWritten(store, field[1]);
+    }
+    // Object literals assigned to a variable then written.
+    for (const match of source.matchAll(/s\.([a-zA-Z]+)\.put\(/g)) {
+        const store = match[1];
+        const chunk = source.slice(Math.max(0, match.index - 2500), match.index);
+        for (const field of chunk.matchAll(/\b([a-zA-Z][a-zA-Z0-9]*)\s*:/g)) addWritten(store, field[1]);
+    }
 }
 
-/* ------------------------------------------------------------------ HELPERS */
+/* Fields read, per entity variable name. */
+const suspicious = [];
 
-function normalise(data) {
-    return {
-        ...data,
-        name: String(data.name || '').trim(),
-        venue: data.venue?.trim() || null,
-        description: data.description?.trim() || null,
-        participants: Array.isArray(data.participants) ? [...new Set(data.participants)] : [],
-        income: Math.round(Number(data.income) || 0),
-        expenditure: Math.round(Number(data.expenditure) || 0)
-    };
+for (const [file, source] of sources) {
+    if (file === 'js/data/seed.js') continue;
+
+    for (const [variable, store] of Object.entries(ENTITIES)) {
+        if (!store) continue;
+        const pattern = new RegExp(`\\b${variable}\\.([a-zA-Z][a-zA-Z0-9]*)\\b`, 'g');
+        for (const match of source.matchAll(pattern)) {
+            const field = match[1];
+            if (['id', 'map', 'filter', 'find', 'length', 'sort', 'reduce', 'some', 'every',
+                 'slice', 'push', 'includes', 'forEach', 'join', 'toFixed', 'toString',
+                 'flatMap', 'indexOf', 'concat', 'at', 'keys', 'values', 'entries'].includes(field)) continue;
+
+            const known = written.get(store);
+            if (known && known.size > 4 && !known.has(field)) {
+                suspicious.push({ file, store, expression: `${variable}.${field}` });
+            }
+        }
+    }
 }
 
-function assertShape(program) {
-    if (!program.name) throw new Error('A programme needs a name.');
-    if (!program.date) throw new Error('A programme needs a date.');
-    if (!program.type) throw new Error('Choose a programme type.');
-    if (!PROGRAM_TYPES.some((t) => t.value === program.type)) throw new Error(`"${program.type}" is not a recognised programme type.`);
-    if (!program.branchId) throw new Error('Choose which branch is running this.');
-    if (program.type === 'examination' && !program.level) throw new Error('An examination is held for a specific level.');
-    if (program.income < 0 || program.expenditure < 0) throw new Error('Amounts cannot be negative.');
+const grouped = new Map();
+for (const item of suspicious) {
+    const key = `${item.store}.${item.expression}`;
+    if (!grouped.has(key)) grouped.set(key, new Set());
+    grouped.get(key).add(item.file);
 }
 
+console.log(`— Reads with no matching write (${grouped.size}) —`);
+console.log('  Heuristic: computed and joined fields will appear here legitimately.\n');
+for (const [key, where] of [...grouped.entries()].sort()) {
+    console.log(`  ${key.padEnd(38)} ${[...where].join(', ')}`);
+}

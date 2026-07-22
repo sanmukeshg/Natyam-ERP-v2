@@ -1,487 +1,360 @@
 /**
- * NATYAM ERP 2.0 — Attendance service
+ * NATYAM ERP 2.0 — Analytics service
  *
- * Roll call is the operation this product performs most often and the one 1.0
- * got most wrong. Three faults, all fixed here:
+ * Trends and comparisons, for the analytics dashboard.
  *
- *  1. Saving the same roll call twice created a second set of rows, because
- *     the id was minted fresh each time. Every record now carries a composite
- *     `batchId|date|studentId` key on a unique index, so a re-save is an
- *     update by construction rather than by remembering to check.
- *  2. Rows were written one at a time in a loop of separate transactions. A
- *     failure halfway left a class half-marked. The whole roll call is now one
- *     transaction.
- *  3. Marking a date the school was closed produced a day of "absent" for
- *     everyone, which then dragged every attendance percentage down. Holidays
- *     and approved leave are checked before the register is even shown.
+ * This service is almost entirely composition: it asks finance for its monthly
+ * series, attendance for its trend, fees for its collection summary, and joins
+ * the answers. It deliberately does not recompute any of those from the raw
+ * stores. If analytics derived revenue its own way, the school would have two
+ * revenue numbers that differed by rounding and a fortnight of arguments about
+ * which screen was lying.
+ *
+ * The one thing genuinely computed here is student growth, because no other
+ * module needs "how did the roll move month by month" and there was nowhere
+ * honest to put it.
  */
 
-import { bus, EVENTS } from '../core/bus.js';
 import { session } from '../core/session.js';
-import { db, request } from '../core/db.js';
-import { uid } from '../utils/id.js';
-import { localDate, nowISO, addDays, daysBetween, monthKey, dayName, startOfMonth, endOfMonth, lastMonths } from '../utils/date.js';
-import { ATTENDANCE_STATUS } from '../config/app.config.js';
-import {
-    attendance$, students$, batches$, holidays$, leaves$, staff$, AttendanceMath
-} from '../data/repositories.js';
-import { notify } from './notifications.service.js';
+import { localDate, lastMonths, monthKey, formatMonth, addMonths, startOfMonth, endOfMonth } from '../utils/date.js';
+import { students$, admissions$, batches$, invoices$ } from '../data/repositories.js';
+import { STUDENT_STATUS, ADMISSION_STATUS } from '../config/app.config.js';
 
-const DAY_CODES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+import { monthlySeries, profitAndLoss, branchPerformance as financeByBranch } from './finance.service.js';
+import { trend as attendanceTrend, teacherCompliance } from './attendance.service.js';
+import { collectionSummary } from './fees.service.js';
+import { programSummary, listPrograms } from './programs.service.js';
+import { listStaff } from './staff.service.js';
+import { listBranches } from './settings.service.js';
 
 /* ==========================================================================
-   PREPARING A REGISTER
+   EXECUTIVE SUMMARY
    ========================================================================== */
 
 /**
- * Builds the register a teacher sees: the roster, whatever was marked before,
- * and every reason a student might legitimately be away.
- *
- * Returns rather than throws when the batch does not meet on the given date.
- * Teachers do reach the wrong day, and a thrown error would put an exception
- * screen where a sentence is wanted.
+ * The half-dozen numbers an owner actually wants, each with the direction of
+ * travel. A KPI without a comparison is a number without meaning — "82%
+ * attendance" only matters next to last month's 76%.
  */
-export async function openRegister(batchId, date = localDate()) {
-    const batch = await batches$.findOrFail(batchId);
-    const dayCode = DAY_CODES[new Date(`${date}T00:00:00`).getDay()];
+export async function executiveKPIs(branchId = null) {
+    session.require('report.view', 'view analytics');
 
-    const [roster, existing, holiday] = await Promise.all([
-        students$.byBatch(batchId),
-        attendance$.forBatchOn(batchId, date),
-        holidays$.on(date, batch.branchId)
-    ]);
+    const thisMonth = monthKey();
+    const lastMonth = monthKey(addMonths(localDate(), -1));
 
-    const marked = new Map(existing.map((row) => [row.studentId, row]));
-    const leaveByStudent = new Map();
-    for (const student of roster) {
-        const leave = await leaves$.coveringDate(student.id, date);
-        if (leave) leaveByStudent.set(student.id, leave);
-    }
-
-    const entries = roster.map((student) => {
-        const prior = marked.get(student.id);
-        const leave = leaveByStudent.get(student.id);
-        return {
-            studentId: student.id,
-            name: student.name,
-            admissionNo: student.admissionNo,
-            photo: student.photo || null,
-            medicalNotes: student.medicalNotes || null,
-            // Default: an approved leave pre-fills as excused so a teacher does
-            // not have to remember which of thirty children has a note.
-            status: prior?.status || (leave ? ATTENDANCE_STATUS.EXCUSED : ATTENDANCE_STATUS.PRESENT),
-            note: prior?.note || (leave ? leave.reason : null),
-            onLeave: Boolean(leave),
-            previouslyMarked: Boolean(prior)
-        };
-    });
-
-    return {
-        batch,
-        date,
-        dayName: dayName(date),
-        meetsToday: batch.days.includes(dayCode),
-        holiday,
-        alreadyMarked: existing.length > 0,
-        markedAt: existing[0]?.updatedAt || null,
-        entries,
-        empty: roster.length === 0
-    };
-}
-
-/** Every batch meeting on a date, with whether its register is done. */
-export async function dayBoard(date = localDate(), branchId = null) {
-    const [meeting, marked, holiday, teachers] = await Promise.all([
-        batches$.meetingOn(date, branchId),
-        attendance$.onDate(date, branchId),
-        holidays$.on(date, branchId),
-        staff$.teachers()
-    ]);
-
-    const byBatch = new Map();
-    for (const row of marked) {
-        if (!byBatch.has(row.batchId)) byBatch.set(row.batchId, []);
-        byBatch.get(row.batchId).push(row);
-    }
-
-    const teacherName = new Map(teachers.map((t) => [t.id, t.name]));
-    const rosterCounts = await Promise.all(meeting.map((b) => students$.byBatch(b.id)));
-
-    return {
-        date,
-        holiday,
-        batches: meeting.map((batch, index) => {
-            const rows = byBatch.get(batch.id) || [];
-            return {
-                ...batch,
-                teacherName: teacherName.get(batch.teacherId) || 'Unassigned',
-                expected: rosterCounts[index].length,
-                marked: rows.length,
-                done: rows.length > 0,
-                rate: AttendanceMath.rateOf(rows),
-                breakdown: AttendanceMath.breakdownOf(rows)
-            };
+    const [roll, growth, revenue, attendance, collection, previousCollection] = await Promise.all([
+        students$.active(branchId),
+        studentGrowth(2, branchId),
+        monthlySeries(2, branchId),
+        attendanceTrend(2, branchId),
+        collectionSummary({
+            from: startOfMonth(localDate()), to: localDate(), branchId
+        }),
+        collectionSummary({
+            from: startOfMonth(addMonths(localDate(), -1)),
+            to: endOfMonth(addMonths(localDate(), -1)),
+            branchId
         })
-    };
-}
-
-/* ==========================================================================
-   POSTING
-   ========================================================================== */
-
-/**
- * Writes a roll call.
- *
- * One transaction, composite keys, and a read-before-write so that re-marking
- * preserves the original `createdAt` — the difference between "marked at 6:35
- * this morning" and "corrected at 4pm" is the sort of thing a parent dispute
- * turns on.
- *
- * @param {object} params
- * @param {string} params.batchId
- * @param {string} params.date
- * @param {Array<{studentId: string, status: string, note?: string}>} params.entries
- */
-export async function postRegister({ batchId, date, entries }) {
-    session.require('attendance.mark', 'mark attendance');
-
-    const batch = await batches$.findOrFail(batchId);
-    if (!date) throw new Error('Choose the date being marked.');
-    if (date > localDate()) throw new Error('Attendance cannot be marked for a future date.');
-    if (!Array.isArray(entries) || !entries.length) throw new Error('There is nobody in this batch to mark.');
-
-    const valid = new Set(Object.values(ATTENDANCE_STATUS));
-    for (const entry of entries) {
-        if (!entry.studentId) throw new Error('An attendance row is missing its student.');
-        if (!valid.has(entry.status)) throw new Error(`"${entry.status}" is not a valid attendance status.`);
-    }
-
-    // Backdating beyond a fortnight is almost always a mistyped date rather
-    // than a genuine correction, so it is refused rather than absorbed.
-    const age = daysBetween(date, localDate());
-    if (age > 30) {
-        throw new Error(`That date is ${age} days ago. Attendance can only be marked or corrected within 30 days.`);
-    }
-
-    const existing = await attendance$.forBatchOn(batchId, date);
-    const priorByStudent = new Map(existing.map((row) => [row.studentId, row]));
-    const at = nowISO();
-    const actor = session.actorId();
-
-    const records = entries.map((entry) => {
-        const prior = priorByStudent.get(entry.studentId);
-        return {
-            id: prior?.id || uid('ATT'),
-            batchDate: `${batchId}|${date}|${entry.studentId}`,
-            studentId: entry.studentId,
-            batchId,
-            branchId: batch.branchId,
-            date,
-            status: entry.status,
-            note: entry.note?.trim() || null,
-            markedBy: actor,
-            markedByName: session.actorName(),
-            createdAt: prior?.createdAt || at,
-            createdBy: prior?.createdBy || actor,
-            updatedAt: at,
-            updatedBy: actor,
-            correctedFrom: prior && prior.status !== entry.status ? prior.status : null
-        };
-    });
-
-    const corrections = records.filter((r) => r.correctedFrom).length;
-
-    await db.unit(['attendance', 'auditLog'], async (s) => {
-        for (const record of records) await request(s.attendance.put(record));
-        await request(s.auditLog.put({
-            id: uid('AUD'),
-            entity: 'Attendance',
-            entityId: batchId,
-            action: existing.length ? 'correct' : 'mark',
-            detail: { date, count: records.length, corrections },
-            actorId: actor, actorName: session.actorName(), at
-        }));
-    }, 'attendance:post');
-
-    const summary = {
-        batchId, date,
-        total: records.length,
-        breakdown: AttendanceMath.breakdownOf(records),
-        rate: AttendanceMath.rateOf(records),
-        corrected: corrections,
-        wasUpdate: existing.length > 0
-    };
-
-    bus.emit(EVENTS.ATTENDANCE_SAVED, summary);
-    return summary;
-}
-
-/**
- * Marks a whole day as a holiday across every batch that would have met.
- *
- * Holiday rows are written rather than simply skipping the day: an absent
- * *record* means "nobody came and that is fine", while an absent *row* is
- * indistinguishable from a register nobody got round to.
- */
-export async function declareHoliday({ date, name, branchId = null, mark = true }) {
-    session.require('attendance.mark', 'declare a holiday');
-
-    if (!date) throw new Error('Choose a date.');
-    if (!name?.trim()) throw new Error('Give the holiday a name — it appears on the calendar.');
-
-    const holiday = await holidays$.create({ date, name: name.trim(), branchId });
-
-    let marked = 0;
-    if (mark) {
-        const batches = await batches$.meetingOn(date, branchId);
-        for (const batch of batches) {
-            const roster = await students$.byBatch(batch.id);
-            if (!roster.length) continue;
-            const result = await postRegister({
-                batchId: batch.id,
-                date,
-                entries: roster.map((s) => ({ studentId: s.id, status: ATTENDANCE_STATUS.HOLIDAY, note: name.trim() }))
-            });
-            marked += result.total;
-        }
-    }
-
-    bus.emit(EVENTS.HOLIDAY_CHANGED, { holiday, marked });
-    return { holiday, marked };
-}
-
-export async function removeHoliday(id) {
-    session.require('attendance.mark', 'remove a holiday');
-    const holiday = await holidays$.findOrFail(id);
-    await holidays$.remove(id);
-    bus.emit(EVENTS.HOLIDAY_CHANGED, { holiday: null, removed: holiday });
-    return true;
-}
-
-/* ==========================================================================
-   LEAVE
-   ========================================================================== */
-
-export async function requestLeave({ studentId, fromDate, toDate, reason }) {
-    const student = await students$.findOrFail(studentId);
-
-    const request$ = await leaves$.create({
-        studentId,
-        studentName: student.name,
-        branchId: student.branchId,
-        batchId: student.batchId,
-        fromDate,
-        toDate,
-        reason: reason?.trim(),
-        status: 'pending',
-        requestedOn: localDate()
-    });
-
-    await notify({
-        kind: 'attendance',
-        key: `leave:${request$.id}`,
-        title: `Leave requested — ${student.name}`,
-        body: `${fromDate} to ${toDate}: ${request$.reason}`,
-        link: '#/attendance?tab=leave'
-    });
-
-    bus.emit(EVENTS.LEAVE_REQUESTED, { request: request$ });
-    return request$;
-}
-
-/**
- * Approving leave rewrites any attendance already marked in the covered range
- * from absent to excused. Without that, a family who gave three weeks' notice
- * still shows a wall of red on the child's record.
- */
-export async function decideLeave(id, approved, { note = null } = {}) {
-    session.require('attendance.mark', 'decide a leave request');
-
-    const leave = await leaves$.findOrFail(id);
-    if (leave.status !== 'pending') throw new Error('This request has already been decided.');
-
-    const updated = await leaves$.update(id, {
-        status: approved ? 'approved' : 'declined',
-        decidedOn: localDate(),
-        decidedBy: session.actorId(),
-        decisionNote: note?.trim() || null
-    });
-
-    let amended = 0;
-    if (approved) {
-        const rows = (await attendance$.forStudent(leave.studentId, { from: leave.fromDate, to: leave.toDate }))
-            .filter((r) => r.status === ATTENDANCE_STATUS.ABSENT);
-
-        if (rows.length) {
-            const at = nowISO();
-            const amendedRows = rows.map((r) => ({
-                ...r,
-                status: ATTENDANCE_STATUS.EXCUSED,
-                note: leave.reason,
-                correctedFrom: ATTENDANCE_STATUS.ABSENT,
-                updatedAt: at,
-                updatedBy: session.actorId()
-            }));
-            await db.putMany('attendance', amendedRows);
-            amended = amendedRows.length;
-            bus.emit(EVENTS.ATTENDANCE_SAVED, { batchId: leave.batchId, date: leave.fromDate, amended });
-        }
-    }
-
-    bus.emit(EVENTS.LEAVE_DECIDED, { request: updated, amended });
-    return { request: updated, amended };
-}
-
-/* ==========================================================================
-   ANALYTICS
-   ========================================================================== */
-
-/** Attendance for one month, shaped as a calendar grid for the monthly view. */
-export async function monthlyGrid({ batchId, month = monthKey() }) {
-    const [year, mon] = month.split('-').map(Number);
-    const from = `${month}-01`;
-    const to = endOfMonth(new Date(year, mon - 1, 1));
-
-    const [roster, rows, holidayRows, batch] = await Promise.all([
-        students$.byBatch(batchId),
-        attendance$.between(from, to),
-        holidays$.inRange(from, to),
-        batches$.findOrFail(batchId)
     ]);
 
-    const mine = rows.filter((r) => r.batchId === batchId);
-    const byKey = new Map(mine.map((r) => [`${r.studentId}|${r.date}`, r]));
-    const holidays = new Set(holidayRows.map((h) => h.date));
-
-    // Only days the batch actually meets become columns. Showing all 31 days
-    // makes a grid that is 80% empty and unreadable on a laptop.
-    const days = [];
-    for (let d = new Date(year, mon - 1, 1); d.getMonth() === mon - 1; d.setDate(d.getDate() + 1)) {
-        const date = localDate(d);
-        if (date > localDate()) break;
-        if (!batch.days.includes(DAY_CODES[d.getDay()])) continue;
-        days.push({ date, day: d.getDate(), holiday: holidays.has(date) });
-    }
+    const current = revenue.find((r) => r.period === thisMonth) || { income: 0, net: 0 };
+    const previous = revenue.find((r) => r.period === lastMonth) || { income: 0, net: 0 };
+    const attendanceNow = attendance.find((a) => a.period === thisMonth)?.rate ?? null;
+    const attendanceThen = attendance.find((a) => a.period === lastMonth)?.rate ?? null;
+    const joinedNow = growth.at(-1)?.joined ?? 0;
+    const joinedThen = growth.at(-2)?.joined ?? 0;
 
     return {
-        batch,
-        month,
-        days,
-        rows: roster.map((student) => {
-            const cells = days.map((d) => byKey.get(`${student.id}|${d.date}`)?.status || null);
-            const present = cells.filter((c) => c && c !== ATTENDANCE_STATUS.ABSENT && c !== ATTENDANCE_STATUS.HOLIDAY).length;
-            const counted = cells.filter((c) => c && c !== ATTENDANCE_STATUS.HOLIDAY).length;
-            return {
-                student,
-                cells,
-                present,
-                counted,
-                rate: counted ? Math.round((present / counted) * 100) : null
-            };
-        })
+        students: kpi('Students on the roll', roll.length, roll.length - (growth.at(-1)?.opening ?? roll.length)),
+        joined: kpi('Joined this month', joinedNow, joinedNow - joinedThen),
+        revenue: kpi('Income this month', current.income, current.income - previous.income, 'money'),
+        net: kpi('Net this month', current.net, current.net - previous.net, 'money'),
+        collected: kpi('Collected this month', collection.collected,
+            collection.collected - previousCollection.collected, 'money'),
+        outstanding: kpi('Outstanding', collection.outstanding,
+            collection.outstanding - previousCollection.outstanding, 'money', true),
+        attendance: kpi('Attendance this month', attendanceNow,
+            attendanceNow === null || attendanceThen === null ? null : attendanceNow - attendanceThen, 'percent')
     };
 }
 
-/** Headline attendance figures for a range — used by dashboard and reports. */
-export async function summary({ from, to, branchId = null, batchId = null }) {
-    let rows = await attendance$.between(from, to, branchId);
-    if (batchId) rows = rows.filter((r) => r.batchId === batchId);
+function kpi(label, value, delta, format = 'number', lowerIsBetter = false) {
+    const direction = delta === null || delta === 0 ? 'flat' : delta > 0 ? 'up' : 'down';
+    const good = direction === 'flat'
+        ? null
+        : lowerIsBetter ? direction === 'down' : direction === 'up';
 
-    const breakdown = AttendanceMath.breakdownOf(rows);
-    const sessions = new Set(rows.map((r) => `${r.batchId}|${r.date}`)).size;
-
-    return {
-        from, to,
-        marks: rows.length,
-        sessions,
-        rate: AttendanceMath.rateOf(rows),
-        breakdown,
-        byDate: groupRate(rows, (r) => r.date),
-        byBatch: groupRate(rows, (r) => r.batchId)
-    };
+    return { label, value, delta, direction, good, format };
 }
 
-/** Monthly attendance rate over the last n months, for the trend chart. */
-export async function trend(months = 6, branchId = null) {
+/* ==========================================================================
+   TRENDS
+   ========================================================================== */
+
+/**
+ * The roll month by month: who joined, who left, and where the total stood at
+ * the end. Leavers are inferred from a status that is no longer active rather
+ * than from a deletion, because archiving is a soft delete and a hard-deleted
+ * student would silently vanish from history.
+ */
+export async function studentGrowth(months = 12, branchId = null) {
     const keys = lastMonths(months);
-    const from = `${keys[0]}-01`;
-    const rows = await attendance$.between(from, localDate(), branchId);
+    const all = (await students$.all()).filter((s) => !branchId || s.branchId === branchId);
 
-    return keys.map((key) => {
-        const slice = rows.filter((r) => r.date.startsWith(key));
-        return { period: key, rate: AttendanceMath.rateOf(slice), marks: slice.length };
+    let running = all.filter((student) => {
+        const joined = student.joinedOn || student.createdAt?.slice(0, 10);
+        return joined && joined < `${keys[0]}-01`
+            && !(student.leftOn && student.leftOn < `${keys[0]}-01`);
+    }).length;
+
+    return keys.map((period) => {
+        const opening = running;
+
+        const joined = all.filter((s) => (s.joinedOn || s.createdAt?.slice(0, 10) || '').startsWith(period)).length;
+        const left = all.filter((s) => (s.leftOn || '').startsWith(period)).length;
+
+        running = opening + joined - left;
+
+        return {
+            period,
+            label: formatMonth(period),
+            opening,
+            joined,
+            left,
+            total: running,
+            netChange: joined - left
+        };
     });
 }
 
-/** Per-teacher marking discipline — how many of their registers are done. */
-export async function teacherCompliance({ from, to, branchId = null }) {
-    const [teachers, batches, rows] = await Promise.all([
-        staff$.teachers(branchId),
-        batches$.active(branchId),
-        attendance$.between(from, to, branchId)
-    ]);
+/** Income, expenditure and net by month — read straight from the ledger. */
+export async function revenueTrend(months = 12, branchId = null) {
+    return monthlySeries(months, branchId);
+}
 
-    const done = new Set(rows.map((r) => `${r.batchId}|${r.date}`));
+/** Attendance rate by month. */
+export async function attendanceTrendSeries(months = 12, branchId = null) {
+    const rows = await attendanceTrend(months, branchId);
+    return rows.map((row) => ({ ...row, label: formatMonth(row.period) }));
+}
 
-    return teachers.map((teacher) => {
-        const own = batches.filter((b) => b.teacherId === teacher.id);
-        let expected = 0;
-        let marked = 0;
+/**
+ * Billed against collected, month by month. The gap between the two lines is
+ * the arrears the school is carrying, which is a more useful thing to look at
+ * than either line alone.
+ */
+export async function collectionTrend(months = 12, branchId = null) {
+    const keys = lastMonths(months);
+    const invoices = (await invoices$.all()).filter((i) => !branchId || i.branchId === branchId);
 
-        for (const batch of own) {
-            for (let d = new Date(`${from}T00:00:00`); localDate(d) <= to; d.setDate(d.getDate() + 1)) {
-                if (!batch.days.includes(DAY_CODES[d.getDay()])) continue;
-                expected += 1;
-                if (done.has(`${batch.id}|${localDate(d)}`)) marked += 1;
-            }
-        }
+    return Promise.all(keys.map(async (period) => {
+        const billed = invoices
+            .filter((invoice) => (invoice.issuedOn || invoice.dueDate || '').startsWith(period))
+            .filter((invoice) => invoice.status !== 'cancelled')
+            .reduce((sum, invoice) => sum + (invoice.amount || 0), 0);
+
+        const summary = await collectionSummary({
+            from: `${period}-01`,
+            to: endOfMonth(`${period}-01`),
+            branchId
+        });
 
         return {
-            teacher,
-            batches: own.length,
-            expected,
-            marked,
-            compliance: expected ? Math.round((marked / expected) * 100) : null
+            period,
+            label: formatMonth(period),
+            billed,
+            collected: summary.collected,
+            gap: billed - summary.collected,
+            rate: billed ? Math.round((summary.collected / billed) * 100) : null
         };
-    }).sort((a, b) => (a.compliance ?? 101) - (b.compliance ?? 101));
+    }));
 }
 
-/** Registers that were never filled in — the follow-up list. */
-export async function missingRegisters({ days = 14, branchId = null } = {}) {
-    const from = addDays(localDate(), -days);
-    const [batches, rows] = await Promise.all([
-        batches$.active(branchId),
-        attendance$.between(from, localDate(), branchId)
+/* ==========================================================================
+   COMPARISONS
+   ========================================================================== */
+
+/** Every branch side by side. */
+export async function branchComparison({ from, to }) {
+    const [branches, financials] = await Promise.all([
+        listBranches(),
+        financeByBranch({ from, to })
     ]);
 
-    const done = new Set(rows.map((r) => `${r.batchId}|${r.date}`));
-    const missing = [];
+    const byId = new Map(financials.map((row) => [row.branch.id, row]));
 
-    for (const batch of batches) {
-        for (let d = new Date(`${from}T00:00:00`); localDate(d) <= localDate(); d.setDate(d.getDate() + 1)) {
-            const date = localDate(d);
-            if (!batch.days.includes(DAY_CODES[d.getDay()])) continue;
-            if (done.has(`${batch.id}|${date}`)) continue;
-            if (await holidays$.on(date, batch.branchId)) continue;
-            missing.push({ batch, date, age: daysBetween(date, localDate()) });
-        }
-    }
+    return Promise.all(branches.map(async (branch) => {
+        const [roll, batchRows, collection] = await Promise.all([
+            students$.active(branch.id),
+            batches$.active(branch.id),
+            collectionSummary({ from, to, branchId: branch.id })
+        ]);
 
-    return missing.sort((a, b) => b.age - a.age);
+        const financial = byId.get(branch.id) || { income: 0, expense: 0, net: 0, margin: null };
+
+        return {
+            branch,
+            students: roll.length,
+            batches: batchRows.length,
+            capacity: batchRows.reduce((sum, b) => sum + (b.capacity || 0), 0),
+            occupancy: batchRows.reduce((sum, b) => sum + (b.capacity || 0), 0)
+                ? Math.round((roll.length / batchRows.reduce((sum, b) => sum + (b.capacity || 0), 0)) * 100)
+                : null,
+            collected: collection.collected,
+            outstanding: collection.outstanding,
+            income: financial.income,
+            expense: financial.expense,
+            net: financial.net,
+            margin: financial.margin
+        };
+    }));
 }
 
-/* ------------------------------------------------------------------ HELPERS */
+/**
+ * Teacher performance, which needs stating carefully: this measures register
+ * compliance and the attendance of the classes they teach. It does not measure
+ * teaching. A guru with the school's hardest batch will look worse than one
+ * with the keenest, and the numbers are presented as prompts for a
+ * conversation rather than a ranking.
+ */
+export async function teacherPerformance({ from, to, branchId = null }) {
+    const [staff, compliance] = await Promise.all([
+        listStaff(branchId),
+        teacherCompliance({ from, to, branchId })
+    ]);
 
-function groupRate(rows, keyOf) {
-    const groups = new Map();
-    for (const row of rows) {
-        const key = keyOf(row);
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key).push(row);
-    }
-    return [...groups.entries()]
-        .map(([key, group]) => ({ key, rate: AttendanceMath.rateOf(group), marks: group.length }))
-        .sort((a, b) => String(a.key).localeCompare(String(b.key)));
+    const byTeacher = new Map(compliance.map((row) => [row.teacher.id, row]));
+
+    return staff
+        .filter((member) => member.role === 'teacher')
+        .map((member) => {
+            const record = byTeacher.get(member.id) || {};
+            return {
+                staff: member,
+                name: member.name,
+                batches: member.batchCount,
+                students: member.studentCount,
+                weeklySessions: member.weeklySessions,
+                expected: record.expected ?? 0,
+                marked: record.marked ?? 0,
+                compliance: record.compliance ?? null
+            };
+        })
+        .sort((a, b) => (b.compliance ?? -1) - (a.compliance ?? -1));
 }
 
-export { startOfMonth, endOfMonth };
+/** Programmes by type, participation and financial result. */
+export async function programAnalytics(branchId = null, { from = null, to = null } = {}) {
+    const [summary, rows] = await Promise.all([
+        programSummary(branchId),
+        listPrograms(branchId, { from, to })
+    ]);
+
+    const completed = rows.filter((program) => program.status === 'completed');
+
+    return {
+        ...summary,
+        held: completed.length,
+        totalIncome: completed.reduce((sum, p) => sum + (p.income || 0), 0),
+        totalCost: completed.reduce((sum, p) => sum + (p.expenditure || 0), 0),
+        net: completed.reduce((sum, p) => sum + ((p.income || 0) - (p.expenditure || 0)), 0),
+        averageCast: completed.length
+            ? Math.round(completed.reduce((sum, p) => sum + (p.participantCount || 0), 0) / completed.length)
+            : 0,
+        byType: summary.byType.map((entry) => {
+            const ofType = completed.filter((p) => p.type === entry.type);
+            return {
+                ...entry,
+                net: ofType.reduce((sum, p) => sum + ((p.income || 0) - (p.expenditure || 0)), 0),
+                participants: ofType.reduce((sum, p) => sum + (p.participantCount || 0), 0)
+            };
+        }),
+        mostAttended: [...completed]
+            .sort((a, b) => (b.participantCount || 0) - (a.participantCount || 0))
+            .slice(0, 5)
+    };
+}
+
+/* ==========================================================================
+   FUNNEL
+   ========================================================================== */
+
+/**
+ * Application to enrolment, as a funnel. The number worth watching is not the
+ * conversion rate but the count sitting at "approved" — those are families who
+ * have been told yes and are not yet on any register.
+ */
+export async function admissionFunnel(branchId = null, { months = 6 } = {}) {
+    const since = `${lastMonths(months)[0]}-01`;
+    const all = (await admissions$.all())
+        .filter((a) => !branchId || a.branchId === branchId)
+        .filter((a) => (a.appliedOn || '') >= since);
+
+    const count = (status) => all.filter((a) => a.status === status).length;
+
+    const applied = all.length;
+    const enrolled = count(ADMISSION_STATUS.ENROLLED);
+    const decided = enrolled + count(ADMISSION_STATUS.REJECTED);
+
+    return {
+        stages: [
+            { key: 'applied', label: 'Applied', value: applied },
+            { key: 'reviewing', label: 'In review', value: count(ADMISSION_STATUS.SUBMITTED) + count(ADMISSION_STATUS.REVIEWING) },
+            { key: 'approved', label: 'Approved', value: count(ADMISSION_STATUS.APPROVED) },
+            { key: 'enrolled', label: 'Enrolled', value: enrolled }
+        ],
+        conversionRate: decided ? Math.round((enrolled / decided) * 100) : null,
+        awaitingEnrolment: count(ADMISSION_STATUS.APPROVED)
+    };
+}
+
+/* ==========================================================================
+   COMPOSITE
+   ========================================================================== */
+
+/**
+ * Everything the analytics page needs, resolved in parallel with each panel
+ * isolated: one slow or broken panel must not blank the whole dashboard.
+ */
+export async function analyticsOverview({ branchId = null, months = 12, from = null, to = null } = {}) {
+    session.require('report.view', 'view analytics');
+
+    const range = {
+        from: from || `${lastMonths(months)[0]}-01`,
+        to: to || localDate()
+    };
+
+    const panels = await Promise.allSettled([
+        executiveKPIs(branchId),
+        studentGrowth(months, branchId),
+        revenueTrend(months, branchId),
+        attendanceTrendSeries(months, branchId),
+        collectionTrend(months, branchId),
+        branchComparison(range),
+        teacherPerformance({ ...range, branchId }),
+        programAnalytics(branchId, range),
+        admissionFunnel(branchId, { months: 6 }),
+        profitAndLoss({ ...range, branchId })
+    ]);
+
+    const [kpis, growth, revenue, attendance, collection, branches, teachers, programs, funnel, pl] =
+        panels.map((panel) => (panel.status === 'fulfilled' ? panel.value : null));
+
+    const failed = panels
+        .map((panel, index) => (panel.status === 'rejected' ? PANEL_NAMES[index] : null))
+        .filter(Boolean);
+
+    return {
+        range, months,
+        kpis, growth, revenue, attendance, collection,
+        branches, teachers, programs, funnel, profitAndLoss: pl,
+        failed
+    };
+}
+
+const PANEL_NAMES = [
+    'headline figures', 'student growth', 'revenue', 'attendance', 'collection',
+    'branches', 'teachers', 'programmes', 'admissions', 'profit and loss'
+];
+
+export { STUDENT_STATUS };

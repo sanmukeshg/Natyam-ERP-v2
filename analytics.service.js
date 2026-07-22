@@ -1,202 +1,474 @@
 /**
- * NATYAM ERP 2.0 — Timetable
+ * NATYAM ERP 2.0 — Batches
  *
- * The week, laid out so a double-booking is visible without anyone running a
- * check. The service already refuses to create clashing batches; this exists
- * because the batches created *before* that rule, or deliberately overridden
- * past it, still need to be seen by a human.
+ * A batch is where a level, a teacher, a room and a slot in the week meet. It
+ * is also the thing that makes a student real: without one they are on no
+ * register, which is why capacity and clashes are checked before anything is
+ * written rather than discovered later by a teacher standing in a full hall.
  *
- * Two layouts, same data: a day-column grid on a wide screen, and a stacked
- * day-by-day list on a narrow one. The stacked version is not a degraded
- * fallback — on a phone in a corridor it is the better of the two.
+ * Conflict handling is worth noting. createBatch throws with a `conflicts`
+ * array attached when a new batch would double-book a teacher or a room. This
+ * page catches that, shows what it clashes with, and offers to save anyway —
+ * because a school sometimes genuinely does run two things in one hall, and a
+ * system that simply says "no" gets worked around outside the system.
  */
 
 import { Page } from '../../core/router.js';
 import { html, render, raw, on } from '../../utils/dom.js';
 import { icon } from '../../ui/icons.js';
+import { kpiCard } from '../../ui/chart.js';
 import { toast } from '../../ui/toast.js';
+import { drawer, confirm } from '../../ui/overlay.js';
+import { DataTable } from '../../ui/table.js';
+import { formOverlay, optionsFrom, summaryList } from '../../ui/form.js';
 import { session } from '../../core/session.js';
 import { EVENTS } from '../../core/bus.js';
 import { router } from '../../core/router.js';
 import { formatNumber } from '../../utils/money.js';
-import { timetable } from '../../services/batches.service.js';
-import { listStaff } from '../../services/staff.service.js';
+import { localDate } from '../../utils/date.js';
+import { LEVELS } from '../../config/app.config.js';
 
-export default class TimetablePage extends Page {
+import {
+    WEEK, listBatches, batchDetail, createBatch, updateBatch, closeBatch, reopenBatch
+} from '../../services/batches.service.js';
+import { availableTeachers } from '../../services/staff.service.js';
+import { listBranches } from '../../services/settings.service.js';
+
+// Keys must match the WEEK values exported by batches.service (capitalised),
+// otherwise every lookup misses and the label silently falls back to the raw
+// value. Full names are friendlier in the day picker than the short form.
+const DAY_LABELS = {
+    Mon: 'Monday', Tue: 'Tuesday', Wed: 'Wednesday', Thu: 'Thursday',
+    Fri: 'Friday', Sat: 'Saturday', Sun: 'Sunday'
+};
+
+export default class BatchesPage extends Page {
     constructor(context) {
         super(context);
-        this.title = 'Timetable';
-        this.teacherId = this.query.teacher || '';
+        this.title = 'Batches';
+        this.includeClosed = false;
     }
 
     async render(container) {
         this.container = container;
         render(container, this.shell());
         this.bind();
+        this.buildTable();
         await this.load();
+
+        if (this.query.new) this.createBatch();
+        if (this.query.batch) this.openBatch(this.query.batch);
     }
 
     shell() {
         return html`
             <header class="page-header">
                 <div class="page-header-text">
-                    <h1 class="page-title">Timetable</h1>
-                    <p class="page-subtitle" data-role="subtitle">The teaching week.</p>
+                    <h1 class="page-title">Batches</h1>
+                    <p class="page-subtitle" data-role="count">Loading…</p>
                 </div>
                 <div class="page-actions">
-                    <label class="filter-control">
-                        <span class="sr-only">Teacher</span>
-                        <select class="select select-sm" data-role="teacher">
-                            <option value="">All teachers</option>
-                        </select>
-                    </label>
-                    <button class="btn btn-secondary btn-sm" data-action="print">
-                        ${raw(icon('printer', { size: 15 }))} Print
-                    </button>
+                    <a class="btn btn-secondary btn-sm" href="#/timetable">
+                        ${raw(icon('calendar', { size: 15 }))} Timetable
+                    </a>
+                    ${session.can('student.edit') ? html`
+                        <button class="btn btn-primary btn-sm" data-action="new">
+                            ${raw(icon('plus', { size: 15 }))} New batch
+                        </button>
+                    ` : ''}
                 </div>
             </header>
-            <div class="page-body" data-role="body"></div>
+            <div class="page-body">
+                <div class="filter-bar">
+                    <label class="row row-tight">
+                        <input type="checkbox" class="checkbox" data-role="closed">
+                        <span class="type-caption">Include closed batches</span>
+                    </label>
+                </div>
+                <div data-role="table"></div>
+            </div>
         `;
     }
 
     bind() {
-        this.onDispose(on(this.container, 'change', '[data-role="teacher"]', (_e, target) => {
-            this.teacherId = target.value;
-            this.paint();
+        this.onDispose(on(this.container, 'click', '[data-action="new"]', () => this.createBatch()));
+        this.onDispose(on(this.container, 'change', '[data-role="closed"]', (_e, target) => {
+            this.includeClosed = target.checked;
+            this.load();
         }));
-        this.onDispose(on(this.container, 'click', '[data-action="print"]', () => window.print()));
-        this.onDispose(on(this.container, 'click', '[data-batch]', (_e, target) =>
-            router.go(`/batches?batch=${target.dataset.batch}`)));
 
-        this.events.on(EVENTS.BRANCH_CHANGED, () => this.load());
+        [EVENTS.BATCH_CREATED, EVENTS.BATCH_UPDATED, EVENTS.STUDENT_CREATED, EVENTS.BRANCH_CHANGED]
+            .filter(Boolean)
+            .forEach((event) => this.events.on(event, () => this.load()));
+    }
+
+    buildTable() {
+        this.table = new DataTable({
+            rows: [],
+            searchPlaceholder: 'Search batch, teacher or room…',
+            defaultSort: 'name',
+            emptyTitle: 'No batches yet',
+            emptyMessage: 'A batch is what puts a student on a register. Create the first one.',
+            emptyIcon: 'grid',
+            emptyAction: session.can('student.edit')
+                ? { label: 'New batch', onClick: () => this.createBatch() }
+                : null,
+            onRowClick: (row) => this.openBatch(row.id),
+            columns: [
+                {
+                    key: 'name', label: 'Batch', sortable: true,
+                    searchValue: (row) => `${row.name} ${row.code || ''} ${row.teacherName} ${row.room || ''}`,
+                    render: (row) => html`
+                        <div>
+                            <span class="type-strong">${row.name}</span>
+                            <div class="type-caption type-muted">${row.code || ''} · ${row.levelLabel}</div>
+                        </div>
+                    `
+                },
+                {
+                    key: 'schedule', label: 'When', sortable: true,
+                    render: (row) => html`
+                        <div>
+                            <span>${row.schedule}</span>
+                            ${row.room ? html`<div class="type-caption type-muted">${row.room}</div>` : ''}
+                        </div>
+                    `
+                },
+                { key: 'teacherName', label: 'Teacher', sortable: true },
+                {
+                    key: 'enrolled', label: 'Seats', align: 'right', sortable: true,
+                    render: (row) => html`
+                        <div>
+                            <span class="type-strong">${row.enrolled}${row.capacity ? ` / ${row.capacity}` : ''}</span>
+                            ${row.capacity ? html`
+                                <div class="meter meter-sm" role="img"
+                                     aria-label="${row.occupancy}% full">
+                                    <span class="meter-fill" style="width:${Math.min(100, row.occupancy)}%"
+                                          data-tone="${row.occupancy >= 100 ? 'negative' : row.occupancy >= 80 ? 'caution' : 'positive'}"></span>
+                                </div>
+                            ` : ''}
+                        </div>
+                    `
+                },
+                {
+                    key: 'attendanceRate', label: 'Attendance', align: 'right', sortable: true,
+                    render: (row) => row.attendanceRate === null
+                        ? html`<span class="type-muted">—</span>`
+                        : html`<span class="badge ${row.attendanceRate >= 80 ? 'badge-success'
+                            : row.attendanceRate >= 65 ? 'badge-warning' : 'badge-danger'}">${row.attendanceRate}%</span>`
+                },
+                {
+                    key: 'status', label: 'Status', sortable: true,
+                    render: (row) => html`<span class="badge ${row.status === 'active' ? 'badge-success' : 'badge-neutral'}">
+                        ${row.status}</span>`
+                }
+            ]
+        });
+
+        this.table.mount(this.container.querySelector('[data-role="table"]'));
+        this.onDispose(() => this.table.destroy());
     }
 
     async load() {
-        const body = this.container.querySelector('[data-role="body"]');
-        render(body, html`<div class="skeleton skeleton-row"></div>`);
-
         try {
-            const [week, staff] = await Promise.all([
-                timetable(session.branch()),
-                listStaff(session.branch())
-            ]);
+            const rows = await listBatches(session.branch(), { includeClosed: this.includeClosed });
+            this.rows = rows;
+            this.table.setRows(rows);
 
-            this.week = week;
+            const full = rows.filter((r) => r.capacity && r.enrolled >= r.capacity).length;
+            const empty = rows.filter((r) => !r.enrolled).length;
 
-            const select = this.container.querySelector('[data-role="teacher"]');
-            render(select, html`
-                <option value="">All teachers</option>
-                ${staff.filter((person) => person.role === 'teacher').map((person) => html`
-                    <option value="${person.id}" ${person.id === this.teacherId ? 'selected' : ''}>
-                        ${person.name}
-                    </option>
-                `)}
+            render(this.container.querySelector('[data-role="count"]'), html`
+                ${formatNumber(rows.length)} batch${rows.length === 1 ? '' : 'es'}
+                ${full ? `· ${full} full` : ''}
+                ${empty ? `· ${empty} with nobody in them` : ''}
             `);
-
-            this.paint();
         } catch (err) {
             console.error(err);
             toast.error(err.message);
         }
     }
 
-    paint() {
-        const week = this.teacherId
-            ? this.week.map((day) => ({
-                ...day,
-                sessions: day.sessions.filter((s) => s.teacherId === this.teacherId)
-            }))
-            : this.week;
+    /* ------------------------------------------------------------ CREATE/EDIT */
 
-        const total = week.reduce((sum, day) => sum + day.sessions.length, 0);
-        const clashes = findClashes(week);
+    async batchFields(existing = null) {
+        const [teachers, branches] = await Promise.all([
+            availableTeachers({
+                branchId: session.branch(),
+                excludeBatchId: existing?.id || null
+            }),
+            listBranches()
+        ]);
 
-        render(this.container.querySelector('[data-role="subtitle"]'), html`
-            ${formatNumber(total)} class${total === 1 ? '' : 'es'} a week
-            ${clashes.length ? `· ${clashes.length} clash${clashes.length === 1 ? '' : 'es'}` : '· no clashes'}
-        `);
+        // A batch must belong to a branch. The form supplies one rather than
+        // leaving the service to reject a create with no branch attached:
+        //  - single-branch installs and a selected active branch default
+        //    automatically, so nothing extra is asked of the user;
+        //  - with several branches and "All branches" in view, the field is a
+        //    real, required choice — which is what future multi-branch needs.
+        const defaultBranchId = existing?.branchId
+            || session.branch()
+            || (branches.length === 1 ? branches[0].id : '');
 
-        render(this.container.querySelector('[data-role="body"]'), html`
-            ${clashes.length ? html`
-                <div class="alert alert-warning">
-                    <div class="alert-title">Two classes share a teacher or a room</div>
-                    <ul class="stack stack-xs">
-                        ${clashes.map((clash) => html`<li>${clash}</li>`)}
-                    </ul>
-                </div>
-            ` : ''}
-
-            ${total ? html`
-                <div class="timetable">
-                    ${week.map((day) => html`
-                        <section class="timetable-day">
-                            <h2 class="timetable-day-label">${day.label}</h2>
-                            ${day.sessions.length ? html`
-                                <ul class="stack stack-sm">
-                                    ${day.sessions.map((entry) => html`
-                                        <li>
-                                            <button class="timetable-slot" data-batch="${entry.id}">
-                                                <span class="timetable-time">
-                                                    ${entry.startTime}–${entry.endTime}
-                                                </span>
-                                                <span class="type-strong">${entry.name}</span>
-                                                <span class="type-caption type-muted">
-                                                    ${entry.levelLabel} · ${entry.teacherName}
-                                                    ${entry.room ? `· ${entry.room}` : ''}
-                                                </span>
-                                            </button>
-                                        </li>
-                                    `)}
-                                </ul>
-                            ` : html`<p class="type-caption type-muted">No classes.</p>`}
-                        </section>
-                    `)}
-                </div>
-            ` : html`
-                <div class="card"><div class="card-body">
-                    <div class="empty">
-                        <div class="empty-glyph">${raw(icon('calendar'))}</div>
-                        <h2 class="empty-title">Nothing scheduled</h2>
-                        <p class="empty-text">
-                            ${this.teacherId ? 'This teacher has no batches.' : 'Create a batch to fill the week.'}
-                        </p>
-                        <div class="empty-actions">
-                            <a class="btn btn-primary" href="#/batches?new=1">New batch</a>
-                        </div>
-                    </div>
-                </div></div>
-            `}
-        `);
+        return [
+            { name: 'name', label: 'Batch name', required: true, width: 'half', value: existing?.name,
+              placeholder: 'Prarambhika Morning' },
+            { name: 'code', label: 'Code', required: true, width: 'half', value: existing?.code, placeholder: 'PRA-M1',
+              hint: 'Short label used on registers and reports.' },
+            {
+                name: 'branchId', label: 'Branch', type: 'select', required: true, width: 'half',
+                value: defaultBranchId,
+                options: optionsFrom(branches, { label: (b) => b.name }),
+                hint: branches.length > 1 ? 'Which branch this batch runs at.' : null
+            },
+            {
+                name: 'level', label: 'Level', type: 'select', required: true, width: 'half', value: existing?.level,
+                options: LEVELS.map((l) => ({ value: l.value, label: l.label })),
+                hint: 'Only students at this level can be placed here.'
+            },
+            {
+                name: 'teacherId', label: 'Teacher', type: 'select', width: 'half', value: existing?.teacherId,
+                options: optionsFrom(teachers, {
+                    label: (t) => t.name,
+                    note: (t) => `${t.load} batch${t.load === 1 ? '' : 'es'} · ${t.weeklySessions} sessions a week`
+                })
+            },
+            {
+                name: 'days', label: 'Days', type: 'checkbox-group', required: true, value: existing?.days || [],
+                options: WEEK.map((day) => ({ value: day, label: DAY_LABELS[day] || day })),
+                hint: 'The register only exists on these days.'
+            },
+            { name: 'startTime', label: 'Starts', type: 'time', required: true, width: 'half', value: existing?.startTime },
+            { name: 'endTime', label: 'Ends', type: 'time', required: true, width: 'half', value: existing?.endTime },
+            { name: 'room', label: 'Room or hall', width: 'half', value: existing?.room },
+            { name: 'capacity', label: 'Capacity', type: 'number', min: 1, max: 200, width: 'half',
+              value: existing?.capacity, hint: 'Leave blank for no limit.' },
+            { name: 'startsOn', label: 'Running since', type: 'date', width: 'half',
+              value: existing?.startsOn || localDate() },
+            { name: 'notes', label: 'Notes', type: 'textarea', rows: 2, value: existing?.notes }
+        ];
     }
-}
 
-/**
- * Overlap detection for display only. The authoritative check is
- * batches.service.findConflicts, which runs before a batch is written; this
- * catches what is already in the database.
- */
-function findClashes(week) {
-    const messages = [];
+    async createBatch() {
+        session.require('student.edit', 'create a batch');
+        const fields = await this.batchFields();
 
-    for (const day of week) {
-        for (let i = 0; i < day.sessions.length; i += 1) {
-            for (let j = i + 1; j < day.sessions.length; j += 1) {
-                const a = day.sessions[i];
-                const b = day.sessions[j];
-                if (!overlaps(a, b)) continue;
+        const created = await formOverlay({
+            title: 'New batch',
+            description: 'A batch fixes a level, a teacher and a slot in the week.',
+            fields,
+            size: 'wide',
+            submitLabel: 'Create batch',
+            onSubmit: async (values, helpers) => this.saveWithConflictCheck(
+                (allowConflicts) => createBatch(values, { allowConflicts }),
+                helpers
+            )
+        });
 
-                if (a.teacherId && a.teacherId === b.teacherId) {
-                    messages.push(`${a.teacherName} teaches ${a.name} and ${b.name} at the same time on ${day.label}.`);
-                } else if (a.room && a.room === b.room) {
-                    messages.push(`${a.room} holds ${a.name} and ${b.name} at the same time on ${day.label}.`);
-                }
-            }
+        if (created) {
+            toast.success(`${created.name} created.`);
+            await this.load();
+            this.openBatch(created.id);
         }
     }
 
-    return messages;
+    async editBatch(batch) {
+        const fields = await this.batchFields(batch);
+
+        const saved = await formOverlay({
+            title: `Edit ${batch.name}`,
+            fields,
+            size: 'wide',
+            onSubmit: async (values, helpers) => this.saveWithConflictCheck(
+                (allowConflicts) => updateBatch(batch.id, values, { allowConflicts }),
+                helpers
+            )
+        });
+
+        if (saved) {
+            toast.success('Batch updated.');
+            await this.load();
+        }
+    }
+
+    /**
+     * The service refuses a clashing batch by throwing with the clashes
+     * attached. Rather than swallowing that or forcing the user to guess, we
+     * show what it collides with and let them decide — a school does sometimes
+     * mean it.
+     */
+    async saveWithConflictCheck(attempt, helpers) {
+        try {
+            return await attempt(false);
+        } catch (err) {
+            if (!err.conflicts?.length) throw err;
+
+            const proceed = await confirm({
+                title: 'This clashes with another batch',
+                message: err.conflicts.map((conflict) => conflict.message).join('\n'),
+                confirmLabel: 'Save anyway',
+                cancelLabel: 'Change the timing',
+                danger: true
+            });
+
+            if (!proceed) {
+                helpers.banner('Adjust the day, time, teacher or room and try again.');
+                return { errors: {} };
+            }
+            return attempt(true);
+        }
+    }
+
+    /* ---------------------------------------------------------------- DETAIL */
+
+    async openBatch(id) {
+        let detail;
+        try {
+            detail = await batchDetail(id);
+        } catch (err) {
+            toast.error(err.message);
+            return;
+        }
+
+        const batch = detail.batch;
+
+        await drawer({
+            title: batch.name,
+            description: `${batch.levelLabel} · ${batch.schedule} · ${detail.teacher?.name || 'no teacher assigned'}`,
+            size: 'wide',
+            content: html`
+                ${detail.conflicts.length ? html`
+                    <div class="alert alert-warning">
+                        <div class="alert-title">Timetable clash</div>
+                        <ul class="stack stack-xs">
+                            ${detail.conflicts.map((conflict) => html`<li>${conflict.message}</li>`)}
+                        </ul>
+                    </div>
+                ` : ''}
+
+                ${!detail.teacher ? html`
+                    <div class="alert alert-warning">
+                        <p class="alert-body">No teacher is assigned. Nobody is responsible for marking this register.</p>
+                    </div>
+                ` : ''}
+
+                <div class="grid grid-3">
+                    ${kpiCard('On the roll', `${batch.enrolled}${batch.capacity ? ` / ${batch.capacity}` : ''}`,
+                        batch.seatsLeft === null ? 'no limit set' : `${batch.seatsLeft} seats free`)}
+                    ${kpiCard('Attendance, 60 days', detail.attendanceRate === null ? '—' : `${detail.attendanceRate}%`)}
+                    ${kpiCard('Room', batch.room || 'Not set')}
+                </div>
+
+                <div class="card"><div class="card-body">
+                    ${summaryList([
+                        ['Code', batch.code],
+                        ['Level', batch.levelLabel],
+                        ['Schedule', batch.schedule],
+                        ['Teacher', detail.teacher?.name],
+                        ['Running since', batch.startsOn],
+                        ['Status', batch.status],
+                        ['Notes', batch.notes]
+                    ])}
+                </div></div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">Roll</h3>
+                        <p class="card-subtitle">Lowest attendance first — the ones worth a phone call.</p>
+                    </div>
+                    <div class="card-body card-body-tight">
+                        ${detail.roster.length ? html`
+                            <ul class="stack stack-sm">
+                                ${detail.roster.map((student) => html`
+                                    <li class="spread">
+                                        <div>
+                                            <span class="type-strong">${student.name}</span>
+                                            <div class="type-caption type-muted">${student.admissionNo || ''}</div>
+                                        </div>
+                                        <div class="row row-tight">
+                                            ${student.attendanceRate === null
+                                                ? html`<span class="type-muted type-caption">not marked yet</span>`
+                                                : html`<span class="badge ${student.attendanceRate >= 80 ? 'badge-success'
+                                                    : student.attendanceRate >= 65 ? 'badge-warning' : 'badge-danger'}">
+                                                    ${student.attendanceRate}%</span>`}
+                                            <button class="btn btn-sm btn-ghost" data-student="${student.id}">Open</button>
+                                        </div>
+                                    </li>
+                                `)}
+                            </ul>
+                        ` : html`
+                            <div class="empty empty-compact">
+                                <p class="empty-text">Nobody is in this batch yet.</p>
+                                <a class="btn btn-sm btn-primary" href="#/students?filter=unplaced">Place students</a>
+                            </div>
+                        `}
+                    </div>
+                </div>
+            `,
+            actions: this.detailActions(batch),
+            onMount: (body, api) => {
+                on(body, 'click', '[data-student]', (_e, target) => {
+                    api.close(null);
+                    router.go(`/students?student=${target.dataset.student}`);
+                });
+            }
+        });
+    }
+
+    detailActions(batch) {
+        const actions = [
+            { label: 'Close', variant: 'secondary', value: null },
+            {
+                label: 'Take register',
+                variant: 'secondary',
+                onClick: () => { router.go(`/attendance?batch=${batch.id}`); return null; }
+            }
+        ];
+
+        if (!session.can('student.edit')) return actions;
+
+        actions.push({
+            label: batch.status === 'active' ? 'Close batch' : 'Reopen batch',
+            variant: batch.status === 'active' ? 'danger-quiet' : 'secondary',
+            onClick: async () => {
+                await this.toggleStatus(batch);
+                return null;
+            }
+        });
+
+        actions.push({
+            label: 'Edit',
+            variant: 'primary',
+            primary: true,
+            onClick: async () => { await this.editBatch(batch); return null; }
+        });
+
+        return actions;
+    }
+
+    async toggleStatus(batch) {
+        try {
+            if (batch.status === 'active') {
+                const ok = await confirm({
+                    title: `Close ${batch.name}?`,
+                    message: batch.enrolled
+                        ? `${batch.enrolled} students are still in this batch. They must be moved elsewhere first, `
+                          + 'or they will be left on no register.'
+                        : 'The batch stops appearing on the timetable. Its attendance history is kept.',
+                    confirmLabel: 'Close batch',
+                    danger: true
+                });
+                if (!ok) return;
+                await closeBatch(batch.id);
+                toast.success(`${batch.name} closed.`);
+            } else {
+                await reopenBatch(batch.id);
+                toast.success(`${batch.name} reopened.`);
+            }
+            await this.load();
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
 }
 
-function overlaps(a, b) {
-    return (a.startTime || '') < (b.endTime || '') && (b.startTime || '') < (a.endTime || '');
-}

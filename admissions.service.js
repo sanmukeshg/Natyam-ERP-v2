@@ -1,316 +1,481 @@
 /**
- * Charts.
+ * DataTable.
  *
- * Hand-rolled SVG rather than a charting library, for three reasons: the app
- * must work offline from a cold cache, GitHub Pages has no build step to tree-
- * shake a 200KB dependency, and this ERP needs five chart types, not fifty.
+ * Every list in the ERP is this component with a different column definition.
+ * In 1.0, each module hand-wrote its own <table> markup; that produced six
+ * subtly different empty states, no sorting anywhere, and no pagination, so
+ * the students page rendered all 80 rows and would have rendered all 8,000.
  *
- * Everything returns an SVG string. Colours come from the token palette via CSS
- * variables, so charts follow the theme without being re-rendered.
- *
- * Accessibility: each chart carries role="img" and a generated summary in
- * aria-label, plus an optional data table for screen readers. A chart nobody
- * can read is decoration.
+ * Design decisions worth stating:
+ *   - Rendering is a full innerHTML replacement of the <tbody> only. For page
+ *     sizes of 25–100 rows this measures faster than diffing and is far less
+ *     code to be wrong.
+ *   - Row actions use a single delegated listener on the table, so re-rendering
+ *     does not churn listeners.
+ *   - Sorting and filtering happen over the supplied row array. Where a store
+ *     is large, the caller passes an already-paginated slice and sets
+ *     `serverSide: true`.
  */
 
-import { escapeHtml, html } from '../utils/dom.js';
+import { html, render, raw, escapeHtml, el, on, debounce, announce } from '../utils/dom.js';
+import { icon } from './icons.js';
 
-const PALETTE = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)', 'var(--chart-5)', 'var(--chart-6)'];
+let instanceCount = 0;
 
-/**
- * Sparkline. Trend shape only — no axes, no labels. Sits inside a KPI card
- * where the number is the message and the line is the context.
- */
-export function sparkline(values, { width = 240, height = 34, tone = 'accent', showLast = true } = {}) {
-    const data = values.filter((v) => Number.isFinite(v));
-    if (data.length < 2) return '';
+export class DataTable {
+    /**
+     * @param {object} config
+     * @param {Array}  config.columns  [{ key, label, align, sortable, width, render(row), exportValue(row) }]
+     * @param {Array}  [config.rows]
+     * @param {string} [config.rowId='id']
+     * @param {string} [config.emptyTitle]
+     * @param {string} [config.emptyMessage]
+     * @param {object} [config.emptyAction]  { label, onClick }
+     * @param {boolean}[config.selectable=false]
+     * @param {boolean}[config.searchable=true]
+     * @param {string} [config.searchPlaceholder]
+     * @param {number} [config.pageSize=25]
+     * @param {Function}[config.onRowClick]
+     * @param {Array}  [config.bulkActions]  [{ label, variant, onClick(ids) }]
+     * @param {Array}  [config.toolbar]      Raw html`` fragments placed in the toolbar.
+     */
+    constructor(config) {
+        this.id = `dt-${++instanceCount}`;
+        this.columns = config.columns;
+        this.rows = config.rows || [];
+        this.rowId = config.rowId || 'id';
+        this.emptyTitle = config.emptyTitle || 'Nothing here yet';
+        this.emptyMessage = config.emptyMessage || '';
+        this.emptyAction = config.emptyAction || null;
+        this.emptyIcon = config.emptyIcon || 'inbox';
+        this.selectable = config.selectable || false;
+        this.searchable = config.searchable !== false;
+        this.searchPlaceholder = config.searchPlaceholder || 'Search…';
+        this.pageSize = config.pageSize || 25;
+        this.onRowClick = config.onRowClick || null;
+        this.bulkActions = config.bulkActions || [];
+        this.toolbar = config.toolbar || [];
+        this.pinFirst = config.pinFirst !== false;
+        this.caption = config.caption || null;
 
-    const min = Math.min(...data);
-    const max = Math.max(...data);
-    const span = max - min || 1;
-    const pad = 3;
+        this.state = {
+            search: '',
+            sortKey: config.defaultSort || null,
+            sortDir: config.defaultSortDir || 'asc',
+            page: 1,
+            selected: new Set()
+        };
 
-    const points = data.map((value, index) => {
-        const x = (index / (data.length - 1)) * (width - pad * 2) + pad;
-        const y = height - pad - ((value - min) / span) * (height - pad * 2);
-        return [x, y];
-    });
+        this.container = null;
+        this.disposers = [];
+    }
 
-    const line = points.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join(' ');
-    const area = `${line} L${points[points.length - 1][0].toFixed(1)} ${height} L${points[0][0].toFixed(1)} ${height} Z`;
+    /* ------------------------------------------------------------------ DATA */
 
-    const stroke = tone === 'accent' ? 'var(--accent)'
-        : tone === 'success' ? 'var(--success-500)'
-        : tone === 'danger' ? 'var(--danger-500)'
-        : 'var(--chart-1)';
+    setRows(rows) {
+        this.rows = rows;
+        this.state.page = 1;
+        // Drop selections for rows that no longer exist.
+        this.state.selected = new Set([...this.state.selected].filter((id) => rows.some((r) => r[this.rowId] === id)));
+        this.refresh();
+    }
 
-    const gradientId = `spark-${Math.random().toString(36).slice(2, 8)}`;
-    const [lastX, lastY] = points[points.length - 1];
-    const direction = data[data.length - 1] >= data[0] ? 'rising' : 'falling';
+    /**
+     * Swap the column set. The reports module drives this: one table instance
+     * renders thirteen different reports, so the columns are data too. Sort and
+     * page state reset because a sort key from the previous report is
+     * meaningless against the new one.
+     */
+    setColumns(columns) {
+        this.columns = columns;
+        this.state.sortKey = null;
+        this.state.page = 1;
+        this.state.selected = new Set();
+        this.refresh();
+    }
 
-    return `<svg class="chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none"
-                 role="img" aria-label="Trend over ${data.length} periods, ${direction}">
-        <defs>
-            <linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="${stroke}" stop-opacity="0.18"/>
-                <stop offset="100%" stop-color="${stroke}" stop-opacity="0"/>
-            </linearGradient>
-        </defs>
-        <path d="${area}" fill="url(#${gradientId})"/>
-        <path d="${line}" fill="none" stroke="${stroke}" stroke-width="1.8"
-              stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
-        ${showLast ? `<circle cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(1)}" r="2.4" fill="${stroke}"/>` : ''}
-    </svg>`;
+    /** Rows after search and sort, before pagination. */
+    get processed() {
+        let rows = this.rows;
+
+        const term = this.state.search.trim().toLowerCase();
+        if (term) {
+            rows = rows.filter((row) => this.columns.some((col) => {
+                const value = col.searchValue ? col.searchValue(row) : row[col.key];
+                return String(value ?? '').toLowerCase().includes(term);
+            }));
+        }
+
+        if (this.state.sortKey) {
+            const column = this.columns.find((c) => c.key === this.state.sortKey);
+            const direction = this.state.sortDir === 'asc' ? 1 : -1;
+            const accessor = column?.sortValue || ((row) => row[this.state.sortKey]);
+
+            rows = [...rows].sort((a, b) => {
+                const av = accessor(a);
+                const bv = accessor(b);
+                if (av === bv) return 0;
+                if (av === null || av === undefined) return 1;   // blanks always last,
+                if (bv === null || bv === undefined) return -1;  // in both directions
+                if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * direction;
+                return String(av).localeCompare(String(bv), 'en-IN', { numeric: true, sensitivity: 'base' }) * direction;
+            });
+        }
+
+        return rows;
+    }
+
+    get pageRows() {
+        const rows = this.processed;
+        const start = (this.state.page - 1) * this.pageSize;
+        return rows.slice(start, start + this.pageSize);
+    }
+
+    get pageCount() {
+        return Math.max(1, Math.ceil(this.processed.length / this.pageSize));
+    }
+
+    /* ---------------------------------------------------------------- RENDER */
+
+    mount(container) {
+        this.container = container;
+        render(container, this.markup());
+        this.bind();
+        return this;
+    }
+
+    /** Re-renders body, toolbar counts and pagination without rebuilding the head. */
+    refresh() {
+        if (!this.container) return;
+        // Clamp the page after a filter shrinks the result set.
+        if (this.state.page > this.pageCount) this.state.page = this.pageCount;
+
+        const body = this.container.querySelector('tbody');
+        if (body) body.innerHTML = String(this.bodyMarkup());
+
+        const pagination = this.container.querySelector('[data-dt-pagination]');
+        if (pagination) pagination.outerHTML = String(this.paginationMarkup());
+
+        const selectionBar = this.container.querySelector('[data-dt-selection]');
+        if (selectionBar) selectionBar.outerHTML = String(this.selectionMarkup());
+
+        this.syncSortIndicators();
+        this.syncSelectAll();
+    }
+
+    markup() {
+        return html`
+            <div class="card" data-dt="${this.id}">
+                ${(this.searchable || this.toolbar.length) && html`
+                    <div class="table-toolbar">
+                        ${this.searchable && html`
+                            <div class="search-wrap">
+                                ${raw(icon('search', { size: 15, className: 'icon icon-search' }))}
+                                <input type="search" class="input input-search" data-dt-search
+                                       placeholder="${this.searchPlaceholder}"
+                                       aria-label="${this.searchPlaceholder}"
+                                       aria-controls="${this.id}-body">
+                            </div>`}
+                        ${this.toolbar}
+                    </div>`}
+
+                ${this.selectionMarkup()}
+
+                <div class="table-wrap">
+                    <table class="table ${this.pinFirst ? 'table-pin-first' : ''} ${this.onRowClick ? 'table-clickable' : ''}"
+                           id="${this.id}">
+                        ${this.caption && html`<caption class="sr-only">${this.caption}</caption>`}
+                        <thead>${this.headMarkup()}</thead>
+                        <tbody id="${this.id}-body">${this.bodyMarkup()}</tbody>
+                    </table>
+                </div>
+
+                ${this.paginationMarkup()}
+            </div>
+        `;
+    }
+
+    headMarkup() {
+        return html`<tr>
+            ${this.selectable && html`
+                <th class="col-check" scope="col">
+                    <label class="check">
+                        <input type="checkbox" data-dt-select-all aria-label="Select all rows on this page">
+                        <span class="check-box"></span>
+                    </label>
+                </th>`}
+            ${this.columns.map((col) => html`
+                <th scope="col"
+                    class="${col.align === 'right' ? 'col-num' : ''} ${col.align === 'actions' ? 'col-actions' : ''} ${col.sortable ? 'th-sort' : ''}"
+                    ${col.width ? raw(`style="width:${escapeHtml(col.width)}"`) : ''}
+                    ${col.sortable ? raw(`data-dt-sort="${escapeHtml(col.key)}" aria-sort="none" tabindex="0" role="columnheader"`) : ''}>
+                    <span class="th-sort-inner">
+                        ${col.label}
+                        ${col.sortable && raw(icon('arrow-up', { size: 12 }))}
+                    </span>
+                </th>`)}
+        </tr>`;
+    }
+
+    bodyMarkup() {
+        const rows = this.pageRows;
+        const span = this.columns.length + (this.selectable ? 1 : 0);
+
+        if (!rows.length) {
+            const filtered = this.state.search.trim().length > 0;
+            return html`<tr><td colspan="${span}" class="empty-cell">
+                <div class="empty empty-compact">
+                    <div class="empty-glyph">${raw(icon(filtered ? 'search' : this.emptyIcon, { size: 22 }))}</div>
+                    <p class="empty-title">${filtered ? `Nothing matches “${this.state.search}”` : this.emptyTitle}</p>
+                    <p class="empty-text">${filtered ? 'Try a shorter search, or clear it to see everything.' : this.emptyMessage}</p>
+                    ${filtered
+                        ? html`<div class="empty-actions"><button type="button" class="btn btn-sm btn-secondary" data-dt-clear-search>Clear search</button></div>`
+                        : this.emptyAction && html`<div class="empty-actions"><button type="button" class="btn btn-sm btn-primary" data-dt-empty-action>${this.emptyAction.label}</button></div>`}
+                </div>
+            </td></tr>`;
+        }
+
+        return rows.map((row) => {
+            const id = row[this.rowId];
+            const selected = this.state.selected.has(id);
+            return html`<tr data-dt-row="${id}" ${selected ? raw('aria-selected="true"') : ''}
+                            ${this.onRowClick ? raw('tabindex="0"') : ''}>
+                ${this.selectable && html`
+                    <td class="col-check">
+                        <label class="check">
+                            <input type="checkbox" data-dt-select="${id}" ${selected ? raw('checked') : ''}
+                                   aria-label="Select this row">
+                            <span class="check-box"></span>
+                        </label>
+                    </td>`}
+                ${this.columns.map((col) => html`
+                    <td class="${col.align === 'right' ? 'col-num' : ''} ${col.align === 'actions' ? 'col-actions' : ''}">
+                        ${col.render ? col.render(row) : row[col.key] ?? html`<span class="text-subtle">—</span>`}
+                    </td>`)}
+            </tr>`;
+        });
+    }
+
+    selectionMarkup() {
+        const count = this.state.selected.size;
+        if (!this.selectable || !count) return html`<div data-dt-selection hidden></div>`;
+
+        return html`<div class="table-selection-bar" data-dt-selection>
+            <span>${count} selected</span>
+            <button type="button" class="btn btn-sm btn-ghost" data-dt-clear-selection>Clear</button>
+            <div class="push-right row row-2">
+                ${this.bulkActions.map((action, index) => html`
+                    <button type="button" class="btn btn-sm btn-${action.variant || 'secondary'}" data-dt-bulk="${index}">
+                        ${action.label}
+                    </button>`)}
+            </div>
+        </div>`;
+    }
+
+    paginationMarkup() {
+        const total = this.processed.length;
+        const pageCount = this.pageCount;
+
+        if (total <= this.pageSize) {
+            return html`<div class="pagination" data-dt-pagination>
+                <span>${total} ${total === 1 ? 'record' : 'records'}</span>
+            </div>`;
+        }
+
+        const from = (this.state.page - 1) * this.pageSize + 1;
+        const to = Math.min(this.state.page * this.pageSize, total);
+
+        return html`<div class="pagination" data-dt-pagination>
+            <span>Showing ${from}–${to} of ${total}</span>
+            <div class="pagination-pages" role="navigation" aria-label="Pagination">
+                <button type="button" class="page-btn" data-dt-page="prev"
+                        ${this.state.page === 1 ? raw('disabled') : ''} aria-label="Previous page">
+                    ${raw(icon('chevron-left', { size: 14 }))}
+                </button>
+                ${pageNumbers(this.state.page, pageCount).map((entry) => entry === '…'
+                    ? html`<span class="page-ellipsis">…</span>`
+                    : html`<button type="button" class="page-btn" data-dt-page="${entry}"
+                                   ${entry === this.state.page ? raw('aria-current="page"') : ''}
+                                   aria-label="Page ${entry}">${entry}</button>`)}
+                <button type="button" class="page-btn" data-dt-page="next"
+                        ${this.state.page === pageCount ? raw('disabled') : ''} aria-label="Next page">
+                    ${raw(icon('chevron-right', { size: 14 }))}
+                </button>
+            </div>
+        </div>`;
+    }
+
+    /* ---------------------------------------------------------------- EVENTS */
+
+    bind() {
+        const root = this.container;
+
+        const search = root.querySelector('[data-dt-search]');
+        if (search) {
+            const run = debounce((value) => {
+                this.state.search = value;
+                this.state.page = 1;
+                this.refresh();
+                announce(`${this.processed.length} results`);
+            }, 200);
+            search.addEventListener('input', (event) => run(event.target.value));
+            this.disposers.push(() => run.cancel());
+        }
+
+        this.disposers.push(
+            on(root, 'click', '[data-dt-sort]', (_e, target) => this.sortBy(target.dataset.dtSort)),
+            on(root, 'keydown', '[data-dt-sort]', (event, target) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    this.sortBy(target.dataset.dtSort);
+                }
+            }),
+            on(root, 'click', '[data-dt-page]', (_e, target) => {
+                const value = target.dataset.dtPage;
+                if (value === 'prev') this.state.page = Math.max(1, this.state.page - 1);
+                else if (value === 'next') this.state.page = Math.min(this.pageCount, this.state.page + 1);
+                else this.state.page = Number(value);
+                this.refresh();
+                // `?.scrollTo?.()` rather than `?.scrollTo()`: Element.scrollTo is absent
+                // in older Safari, and paging a table should not throw there.
+                root.querySelector('.table-wrap')?.scrollTo?.({ top: 0 });
+            }),
+            on(root, 'change', '[data-dt-select]', (_e, target) => {
+                const id = target.dataset.dtSelect;
+                if (target.checked) this.state.selected.add(id);
+                else this.state.selected.delete(id);
+                target.closest('tr')?.setAttribute('aria-selected', String(target.checked));
+                this.refreshSelectionBar();
+            }),
+            on(root, 'change', '[data-dt-select-all]', (_e, target) => {
+                for (const row of this.pageRows) {
+                    if (target.checked) this.state.selected.add(row[this.rowId]);
+                    else this.state.selected.delete(row[this.rowId]);
+                }
+                this.refresh();
+            }),
+            on(root, 'click', '[data-dt-clear-selection]', () => {
+                this.state.selected.clear();
+                this.refresh();
+            }),
+            on(root, 'click', '[data-dt-bulk]', async (_e, target) => {
+                const action = this.bulkActions[Number(target.dataset.dtBulk)];
+                if (!action) return;
+                target.dataset.loading = 'true';
+                try {
+                    await action.onClick([...this.state.selected]);
+                } finally {
+                    delete target.dataset.loading;
+                }
+            }),
+            on(root, 'click', '[data-dt-clear-search]', () => {
+                this.state.search = '';
+                const input = root.querySelector('[data-dt-search]');
+                if (input) input.value = '';
+                this.refresh();
+            }),
+            on(root, 'click', '[data-dt-empty-action]', () => this.emptyAction?.onClick())
+        );
+
+        if (this.onRowClick) {
+            this.disposers.push(
+                on(root, 'click', '[data-dt-row]', (event, target) => {
+                    // A click on a control inside the row belongs to that
+                    // control, not to the row.
+                    if (event.target.closest('button, a, input, label, select')) return;
+                    const row = this.rows.find((r) => String(r[this.rowId]) === target.dataset.dtRow);
+                    if (row) this.onRowClick(row, event);
+                }),
+                on(root, 'keydown', '[data-dt-row]', (event, target) => {
+                    if (event.key !== 'Enter') return;
+                    const row = this.rows.find((r) => String(r[this.rowId]) === target.dataset.dtRow);
+                    if (row) this.onRowClick(row, event);
+                })
+            );
+        }
+    }
+
+    refreshSelectionBar() {
+        const existing = this.container.querySelector('[data-dt-selection]');
+        if (existing) existing.outerHTML = String(this.selectionMarkup());
+    }
+
+    sortBy(key) {
+        if (this.state.sortKey === key) {
+            this.state.sortDir = this.state.sortDir === 'asc' ? 'desc' : 'asc';
+        } else {
+            this.state.sortKey = key;
+            this.state.sortDir = 'asc';
+        }
+        this.state.page = 1;
+        this.refresh();
+
+        const column = this.columns.find((c) => c.key === key);
+        announce(`Sorted by ${column?.label || key}, ${this.state.sortDir === 'asc' ? 'ascending' : 'descending'}`);
+    }
+
+    syncSortIndicators() {
+        for (const th of this.container.querySelectorAll('[data-dt-sort]')) {
+            const active = th.dataset.dtSort === this.state.sortKey;
+            th.setAttribute('aria-sort', active ? (this.state.sortDir === 'asc' ? 'ascending' : 'descending') : 'none');
+        }
+    }
+
+    syncSelectAll() {
+        const box = this.container.querySelector('[data-dt-select-all]');
+        if (!box) return;
+        const ids = this.pageRows.map((r) => r[this.rowId]);
+        const chosen = ids.filter((id) => this.state.selected.has(id)).length;
+        box.checked = chosen > 0 && chosen === ids.length;
+        box.indeterminate = chosen > 0 && chosen < ids.length;
+    }
+
+    /* ---------------------------------------------------------------- EXPORT */
+
+    /** Rows currently visible after search and sort — what the user sees. */
+    toCSV() {
+        const header = this.columns
+            .filter((c) => c.align !== 'actions')
+            .map((c) => csvCell(c.label));
+
+        const lines = this.processed.map((row) => this.columns
+            .filter((c) => c.align !== 'actions')
+            .map((c) => csvCell(c.exportValue ? c.exportValue(row) : row[c.key]))
+            .join(','));
+
+        return [header.join(','), ...lines].join('\r\n');
+    }
+
+    destroy() {
+        this.disposers.forEach((d) => d());
+        this.disposers = [];
+        this.container = null;
+    }
 }
 
-/**
- * Vertical bars with a value axis. Used for monthly collection and attendance.
- * `formatValue` keeps currency formatting out of this module.
- */
-export function barChart(series, {
-    height = 220,
-    formatValue = (v) => String(v),
-    showGrid = true,
-    highlightLast = true,
-    title = 'Bar chart'
-} = {}) {
-    if (!series.length) return emptyChart(height);
-
-    const width = 640;
-    const padLeft = 52;
-    const padRight = 8;
-    const padTop = 12;
-    const padBottom = 28;
-
-    const plotWidth = width - padLeft - padRight;
-    const plotHeight = height - padTop - padBottom;
-
-    const max = Math.max(...series.map((d) => d.value), 1);
-    const ticks = niceTicks(max, 4);
-    const ceiling = ticks[ticks.length - 1];
-
-    const slot = plotWidth / series.length;
-    const barWidth = Math.min(slot * 0.6, 44);
-
-    const gridLines = showGrid ? ticks.map((tick) => {
-        const y = padTop + plotHeight - (tick / ceiling) * plotHeight;
-        return `<line class="chart-grid-line" x1="${padLeft}" y1="${y.toFixed(1)}" x2="${width - padRight}" y2="${y.toFixed(1)}"/>
-                <text class="chart-axis-label" x="${padLeft - 8}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${escapeHtml(formatValue(tick))}</text>`;
-    }).join('') : '';
-
-    const bars = series.map((point, index) => {
-        const barHeight = Math.max((point.value / ceiling) * plotHeight, point.value > 0 ? 2 : 0);
-        const x = padLeft + slot * index + (slot - barWidth) / 2;
-        const y = padTop + plotHeight - barHeight;
-        const isLast = highlightLast && index === series.length - 1;
-        const fill = point.color || (isLast ? 'var(--accent)' : 'var(--chart-1)');
-        const opacity = isLast || !highlightLast ? 1 : 0.55;
-
-        return `<g class="chart-bar">
-            <rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${barHeight.toFixed(1)}"
-                  rx="3" fill="${fill}" opacity="${opacity}">
-                <title>${escapeHtml(point.label)}: ${escapeHtml(formatValue(point.value))}</title>
-            </rect>
-            <text class="chart-axis-label" x="${(x + barWidth / 2).toFixed(1)}" y="${height - 9}" text-anchor="middle">${escapeHtml(point.label)}</text>
-        </g>`;
-    }).join('');
-
-    const summary = series.map((p) => `${p.label}: ${formatValue(p.value)}`).join(', ');
-
-    return `<svg class="chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet"
-                 role="img" aria-label="${escapeHtml(title)}. ${escapeHtml(summary)}">
-        ${gridLines}
-        ${bars}
-        <line class="chart-grid-line" x1="${padLeft}" y1="${padTop + plotHeight}" x2="${width - padRight}" y2="${padTop + plotHeight}"/>
-    </svg>`;
+/** Excel interprets a leading =, +, - or @ as a formula. Prefix breaks that. */
+function csvCell(value) {
+    let text = value === null || value === undefined ? '' : String(value);
+    if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+    return `"${text.replace(/"/g, '""')}"`;
 }
 
-/**
- * Multi-series line chart. Used for attendance rate and collection trend where
- * two quantities need comparing over the same months.
- */
-export function lineChart(series, labels, {
-    height = 220,
-    formatValue = (v) => String(v),
-    title = 'Line chart',
-    yMax = null
-} = {}) {
-    if (!series.length || !labels.length) return emptyChart(height);
+/** 1 … 4 5 [6] 7 8 … 20 */
+function pageNumbers(current, total) {
+    if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
 
-    const width = 640;
-    const padLeft = 52;
-    const padRight = 12;
-    const padTop = 12;
-    const padBottom = 28;
-    const plotWidth = width - padLeft - padRight;
-    const plotHeight = height - padTop - padBottom;
+    const pages = new Set([1, total, current, current - 1, current + 1]);
+    if (current <= 3) [2, 3, 4].forEach((p) => pages.add(p));
+    if (current >= total - 2) [total - 1, total - 2, total - 3].forEach((p) => pages.add(p));
 
-    const allValues = series.flatMap((s) => s.values).filter(Number.isFinite);
-    const max = yMax ?? Math.max(...allValues, 1);
-    const ticks = niceTicks(max, 4);
-    const ceiling = ticks[ticks.length - 1];
+    const sorted = [...pages].filter((p) => p >= 1 && p <= total).sort((a, b) => a - b);
 
-    const xFor = (index) => padLeft + (labels.length === 1 ? plotWidth / 2 : (index / (labels.length - 1)) * plotWidth);
-    const yFor = (value) => padTop + plotHeight - (value / ceiling) * plotHeight;
-
-    const grid = ticks.map((tick) => {
-        const y = yFor(tick);
-        return `<line class="chart-grid-line" x1="${padLeft}" y1="${y.toFixed(1)}" x2="${width - padRight}" y2="${y.toFixed(1)}"/>
-                <text class="chart-axis-label" x="${padLeft - 8}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${escapeHtml(formatValue(tick))}</text>`;
-    }).join('');
-
-    const lines = series.map((s, seriesIndex) => {
-        const colour = s.color || PALETTE[seriesIndex % PALETTE.length];
-        const path = s.values
-            .map((value, index) => `${index ? 'L' : 'M'}${xFor(index).toFixed(1)} ${yFor(value).toFixed(1)}`)
-            .join(' ');
-
-        const dots = s.values.map((value, index) =>
-            `<circle cx="${xFor(index).toFixed(1)}" cy="${yFor(value).toFixed(1)}" r="3" fill="${colour}">
-                <title>${escapeHtml(s.name)} — ${escapeHtml(labels[index])}: ${escapeHtml(formatValue(value))}</title>
-            </circle>`).join('');
-
-        return `<path d="${path}" fill="none" stroke="${colour}" stroke-width="2"
-                      stroke-linecap="round" stroke-linejoin="round"/>${dots}`;
-    }).join('');
-
-    const xLabels = labels.map((label, index) =>
-        `<text class="chart-axis-label" x="${xFor(index).toFixed(1)}" y="${height - 9}" text-anchor="middle">${escapeHtml(label)}</text>`
-    ).join('');
-
-    const summary = series.map((s) => `${s.name}: ${s.values.map(formatValue).join(', ')}`).join('. ');
-
-    return `<svg class="chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet"
-                 role="img" aria-label="${escapeHtml(title)}. ${escapeHtml(summary)}">
-        ${grid}${lines}${xLabels}
-        <line class="chart-grid-line" x1="${padLeft}" y1="${padTop + plotHeight}" x2="${width - padRight}" y2="${padTop + plotHeight}"/>
-    </svg>`;
-}
-
-/**
- * Donut. Reserved for genuine part-to-whole with few slices — fee status
- * (paid / partial / overdue), attendance breakdown. Not for rankings, which
- * belong in a bar chart.
- */
-export function donutChart(slices, { size = 168, thickness = 22, centreValue = '', centreLabel = '', title = 'Breakdown' } = {}) {
-    const total = slices.reduce((sum, s) => sum + s.value, 0);
-    if (!total) return emptyChart(size);
-
-    const radius = (size - thickness) / 2;
-    const circumference = 2 * Math.PI * radius;
-    const centre = size / 2;
-
-    let offset = 0;
-    const arcs = slices.filter((s) => s.value > 0).map((slice, index) => {
-        const fraction = slice.value / total;
-        const dash = fraction * circumference;
-        const colour = slice.color || PALETTE[index % PALETTE.length];
-        const element = `<circle cx="${centre}" cy="${centre}" r="${radius}" fill="none"
-            stroke="${colour}" stroke-width="${thickness}"
-            stroke-dasharray="${dash.toFixed(2)} ${(circumference - dash).toFixed(2)}"
-            stroke-dashoffset="${(-offset).toFixed(2)}"
-            transform="rotate(-90 ${centre} ${centre})">
-            <title>${escapeHtml(slice.label)}: ${slice.value} (${Math.round(fraction * 100)}%)</title>
-        </circle>`;
-        offset += dash;
-        return element;
-    }).join('');
-
-    const summary = slices.map((s) => `${s.label} ${Math.round((s.value / total) * 100)}%`).join(', ');
-
-    return `<svg class="chart" viewBox="0 0 ${size} ${size}" width="${size}" height="${size}"
-                 role="img" aria-label="${escapeHtml(title)}: ${escapeHtml(summary)}">
-        <circle cx="${centre}" cy="${centre}" r="${radius}" fill="none"
-                stroke="var(--surface-sunken)" stroke-width="${thickness}"/>
-        ${arcs}
-        ${centreValue ? `<text x="${centre}" y="${centre - 2}" text-anchor="middle"
-            font-size="20" font-weight="600" fill="var(--text-primary)"
-            font-family="var(--font-ui)">${escapeHtml(centreValue)}</text>` : ''}
-        ${centreLabel ? `<text x="${centre}" y="${centre + 15}" text-anchor="middle"
-            font-size="10" fill="var(--text-tertiary)"
-            font-family="var(--font-ui)">${escapeHtml(centreLabel)}</text>` : ''}
-    </svg>`;
-}
-
-/** Single-metric ring, e.g. today's attendance rate. */
-export function progressRing(percent, { size = 72, thickness = 7, tone = 'accent', label = '' } = {}) {
-    const value = Math.max(0, Math.min(100, Number(percent) || 0));
-    const radius = (size - thickness) / 2;
-    const circumference = 2 * Math.PI * radius;
-    const centre = size / 2;
-    const dash = (value / 100) * circumference;
-
-    const colour = tone === 'success' ? 'var(--success-500)'
-        : tone === 'warning' ? 'var(--warning-500)'
-        : tone === 'danger' ? 'var(--danger-500)'
-        : 'var(--accent)';
-
-    return `<svg class="chart" viewBox="0 0 ${size} ${size}" width="${size}" height="${size}"
-                 role="img" aria-label="${escapeHtml(label || 'Progress')}: ${Math.round(value)} percent">
-        <circle cx="${centre}" cy="${centre}" r="${radius}" fill="none"
-                stroke="var(--surface-sunken)" stroke-width="${thickness}"/>
-        <circle cx="${centre}" cy="${centre}" r="${radius}" fill="none"
-                stroke="${colour}" stroke-width="${thickness}" stroke-linecap="round"
-                stroke-dasharray="${dash.toFixed(2)} ${circumference.toFixed(2)}"
-                transform="rotate(-90 ${centre} ${centre})"/>
-        <text x="${centre}" y="${centre + 5}" text-anchor="middle" font-size="15" font-weight="600"
-              fill="var(--text-primary)" font-family="var(--font-ui)">${Math.round(value)}%</text>
-    </svg>`;
-}
-
-export function legend(items) {
-    return `<div class="chart-legend">${items.map((item, index) => `
-        <span class="chart-legend-item">
-            <span class="chart-legend-swatch" style="background:${item.color || PALETTE[index % PALETTE.length]}"></span>
-            ${escapeHtml(item.label)}
-        </span>`).join('')}</div>`;
-}
-
-function emptyChart(height) {
-    return `<div class="empty empty-compact" style="min-height:${height}px;justify-content:center">
-        <p class="empty-text">No data for this period yet.</p>
-    </div>`;
-}
-
-/** Axis ticks at 1/2/5 × 10ⁿ, so labels read as round numbers. */
-function niceTicks(max, count = 4) {
-    const rough = max / count;
-    const magnitude = 10 ** Math.floor(Math.log10(rough || 1));
-    const normalised = rough / magnitude;
-    const step = (normalised <= 1 ? 1 : normalised <= 2 ? 2 : normalised <= 5 ? 5 : 10) * magnitude;
-
-    const ticks = [];
-    for (let value = 0; value <= max + step * 0.001; value += step) ticks.push(Math.round(value));
-    if (ticks[ticks.length - 1] < max) ticks.push(ticks[ticks.length - 1] + step);
-    return ticks;
-}
-
-export { PALETTE as chartPalette };
-
-/* ==========================================================================
-   KPI CARD
-   --------------------------------------------------------------------------
-   The headline-figure card. This lived as a private `kpi` helper in seven
-   pages and as `stat` or `miniStat` in three more — ten copies of the same
-   nine lines, which had already drifted: three of them silently ignored the
-   tone argument because they were copied from the version written before
-   tones existed.
-   ========================================================================== */
-
-/**
- * @param {string} label   What the number is.
- * @param {*}      value   The number, already formatted.
- * @param {string} [foot]  A short line underneath — a comparison or a caveat.
- * @param {object} [options]
- * @param {'neutral'|'positive'|'negative'|'caution'} [options.tone]
- * @param {boolean} [options.costume]  Gold edge, for headline figures only.
- */
-export function kpiCard(label, value, foot = null, { tone = 'neutral', costume = false } = {}) {
-    return html`
-        <div class="kpi ${costume ? 'kpi-costume' : 'kpi-quiet'}" data-tone="${tone}">
-            <div class="kpi-head"><span class="kpi-label">${label}</span></div>
-            <div class="kpi-value">${value}</div>
-            ${foot ? html`<div class="kpi-foot">${foot}</div>` : ''}
-        </div>
-    `;
+    const out = [];
+    let previous = 0;
+    for (const page of sorted) {
+        if (page - previous > 1) out.push('…');
+        out.push(page);
+        previous = page;
+    }
+    return out;
 }

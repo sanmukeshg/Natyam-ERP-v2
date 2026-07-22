@@ -1,557 +1,267 @@
 /**
- * NATYAM ERP 2.0 — Admissions service
+ * Phase 2 verification — Curriculum & academic structure.
  *
- * The admissions pipeline and, at the end of it, the single most consequential
- * operation in the product: turning an approved application into a student.
+ * Reuses the render-QA jsdom + fake-indexeddb harness. Exercises the services
+ * and repositories against a real (in-memory) database, and renders the
+ * curriculum and settings pages to confirm wiring. jsdom has no layout, so this
+ * asserts structure and behaviour, not pixels.
  *
- * 1.0's version of that conversion is the bug this whole rebuild was shaped
- * around. It copied the application's fields onto a new student record but
- * never set `batchId`, because the application form had no batch field. The
- * student was created successfully, the toast said so, and they then appeared
- * on no roll call, in no batch roster and in no attendance report — visible
- * only in the students table, apparently enrolled, silently untaught. Here,
- * conversion refuses to proceed without a batch, and the wizard collects one.
+ * Covers: the migration's default level vocabulary; the seeded example
+ * curriculum; level and curriculum CRUD; the Level → Stage → Lesson structure
+ * operations (add / rename / reorder / remove) and the duplicate-level guard;
+ * student ↔ curriculum assignment persisting and staying independent of the
+ * batch; and the Academic-Year change in Settings (no standalone tab, a current
+ * -year control instead, with history preserved).
  */
+import { JSDOM } from 'jsdom';
+import 'fake-indexeddb/auto';
 
-import { bus, EVENTS } from '../core/bus.js';
-import { session } from '../core/session.js';
-import { db, request } from '../core/db.js';
-import { uid, sequenceNumber } from '../utils/id.js';
-import { localDate, nowISO, academicYearOf, ageFrom } from '../utils/date.js';
-import { ADMISSION_STATUS, STUDENT_STATUS, LEVELS, levelLabel } from '../config/app.config.js';
-import {
-    admissions$, drafts$, students$, batches$, feePlans$, branches$, settings$
-} from '../data/repositories.js';
-import { raiseSchedule } from './fees.service.js';
-import { notify } from './notifications.service.js';
+const dom = new JSDOM(
+    '<!doctype html><html data-theme="light"><body><div id="app"></div></body></html>',
+    { url: 'https://example.org/natyam/', pretendToBeVisual: true }
+);
+const { window } = dom;
+globalThis.window = window;
+globalThis.document = window.document;
+globalThis.HTMLElement = window.HTMLElement;
+globalThis.Node = window.Node;
+globalThis.Element = window.Element;
+globalThis.Event = window.Event;
+globalThis.CustomEvent = window.CustomEvent;
+globalThis.getComputedStyle = window.getComputedStyle.bind(window);
+globalThis.requestAnimationFrame = (fn) => setTimeout(() => fn(Date.now()), 0);
+globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, addListener() {} });
+window.matchMedia = globalThis.matchMedia;
+globalThis.localStorage = window.localStorage;
+globalThis.location = window.location;
+Object.defineProperty(globalThis.navigator, 'storage', {
+    configurable: true,
+    value: { estimate: async () => ({ usage: 0, quota: 1 }), persisted: async () => false, persist: async () => true }
+});
+globalThis.CSS = window.CSS || {};
+if (!globalThis.CSS.escape) globalThis.CSS.escape = (v) => String(v).replace(/[^\w-]/g, (c) => `\\${c}`);
+window.CSS = globalThis.CSS;
 
-/* ==========================================================================
-   THE WIZARD'S STEPS
-   Declared here, not in the page, because the service validates step by step
-   and the page renders step by step — both need the same definition or the
-   progress bar will disagree with what is actually required.
-   ========================================================================== */
+let pass = 0, fail = 0;
+const ok = (name, cond, extra = '') => { cond ? (pass++, console.log('  ok  ', name)) : (fail++, console.log('  FAIL', name, extra)); };
+const settle = () => new Promise((r) => setTimeout(r, 0));
 
-export const ADMISSION_STEPS = Object.freeze([
-    { key: 'applicant',  label: 'Applicant',   required: ['name', 'dateOfBirth', 'gender'] },
-    { key: 'guardian',   label: 'Parent',      required: ['guardianName', 'guardianRelation', 'guardianPhone'] },
-    { key: 'placement',  label: 'Placement',   required: ['branchId', 'level'] },
-    { key: 'batch',      label: 'Batch',       required: [] },
-    { key: 'experience', label: 'Experience',  required: [] },
-    { key: 'medical',    label: 'Medical',     required: [] },
-    { key: 'fees',       label: 'Fee plan',    required: ['feePlanId'] },
-    { key: 'documents',  label: 'Documents',   required: [] },
-    { key: 'review',     label: 'Confirm',     required: [] }
-]);
+const BASE = '../js';
+const { db } = await import(`${BASE}/core/db.js`);
+const { session } = await import(`${BASE}/core/session.js`);
+const { seedIfEmpty } = await import(`${BASE}/data/seed.js`);
+const { branches$, curricula$, curriculumLevels$, students$ } = await import(`${BASE}/data/repositories.js`);
+const { academicYearOf } = await import(`${BASE}/utils/date.js`);
+const curriculumSvc = await import(`${BASE}/services/curriculum.service.js`);
+const { updateStudent, profile, enrol } = await import(`${BASE}/services/students.service.js`);
+const { listAcademicYears } = await import(`${BASE}/services/settings.service.js`);
 
-const FIELD_LABELS = {
-    name: 'the applicant’s name',
-    dateOfBirth: 'date of birth',
-    gender: 'gender',
-    guardianName: 'the parent or guardian’s name',
-    guardianRelation: 'the relationship to the applicant',
-    guardianPhone: 'a contact number',
-    branchId: 'a branch',
-    level: 'a starting level',
-    feePlanId: 'a fee plan'
-};
+/* -------------------------------------------------------------------- BOOT */
 
-/**
- * Validates one step in isolation. Returns problems rather than throwing,
- * because a wizard needs to mark three fields at once, not stop at the first.
- *
- * @returns {{ok: boolean, errors: Object<string,string>}}
- */
-export function validateStep(stepKey, data) {
-    const step = ADMISSION_STEPS.find((s) => s.key === stepKey);
-    if (!step) throw new Error(`Unknown admission step "${stepKey}".`);
+await db.open();
+await seedIfEmpty();
+const branches = await branches$.active();
+session.hydrate({ user: { id: 'owner', name: 'Principal', role: 'owner' }, branches, activeBranchId: null });
+ok('session hydrated as owner', session.can('settings.edit'));
 
-    const errors = {};
-    for (const field of step.required) {
-        const value = data[field];
-        if (value === null || value === undefined || String(value).trim() === '') {
-            errors[field] = `Please provide ${FIELD_LABELS[field] || field}.`;
-        }
-    }
-
-    if (stepKey === 'applicant' && data.dateOfBirth) {
-        if (data.dateOfBirth > localDate()) {
-            errors.dateOfBirth = 'Date of birth cannot be in the future.';
-        } else {
-            const age = ageFrom(data.dateOfBirth);
-            if (age < 4) errors.dateOfBirth = `The applicant would be ${age}. The school takes students from age 4.`;
-            if (age > 75) errors.dateOfBirth = 'Please check the date of birth.';
-        }
-    }
-
-    if (stepKey === 'guardian' && data.guardianPhone) {
-        const digits = String(data.guardianPhone).replace(/\D/g, '');
-        if (digits.length < 10) errors.guardianPhone = 'A contact number needs at least 10 digits.';
-    }
-    if (stepKey === 'guardian' && data.guardianEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(data.guardianEmail)) {
-        errors.guardianEmail = 'That email address does not look right.';
-    }
-
-    if (stepKey === 'placement' && data.level && !LEVELS.some((l) => l.value === data.level)) {
-        errors.level = 'Choose a level from the list.';
-    }
-
-    return { ok: Object.keys(errors).length === 0, errors };
+/* ------------------------------------------- migration: default level vocab */
+{
+    const levels = await curriculumLevels$.ordered();
+    const names = levels.map((l) => l.name);
+    ok('migration seeded the 13 approved levels', levels.length >= 13, `got ${levels.length}`);
+    ok('approved level names are present',
+        ['Foundation - Level 1', 'Foundation - Level 8', 'Intermediate - Certificate',
+         'Intermediate - Diploma', 'Advanced - Masters', 'Advanced - Theory', 'Advanced - Practical']
+            .every((n) => names.includes(n)), names.join(','));
+    ok('placeholder levels were removed',
+        !names.includes('Beginner') && !names.includes('Advanced'), names.join(','));
+    ok('default levels have deterministic ids',
+        !!(await curriculumLevels$.find('CLV-FND-1')) && !!(await curriculumLevels$.find('CLV-ADV-MAS')));
 }
 
-/** Validates the whole application, returning the first incomplete step. */
-export function validateApplication(data) {
-    for (const step of ADMISSION_STEPS) {
-        const result = validateStep(step.key, data);
-        if (!result.ok) return { ok: false, step: step.key, errors: result.errors };
-    }
-    return { ok: true, step: null, errors: {} };
+/* --------------------------------------------------- seed: example curriculum */
+{
+    const all = await curriculumSvc.listCurricula();
+    const example = all.find((c) => c.code === 'KUCHI-FND');
+    ok('seed created the example curriculum', !!example);
+    ok('example curriculum has a non-trivial structure',
+        !!example && example.counts.levels >= 2 && example.counts.stages >= 1 && example.counts.lessons >= 1,
+        example && JSON.stringify(example.counts));
 }
 
-/* ==========================================================================
-   DRAFTS
-   --------------------------------------------------------------------------
-   A nine-step form is long enough that a phone call, a closed tab or a flat
-   battery in the middle of it is normal, not exceptional. Drafts are written
-   on every step change and debounced during typing by the page.
-   ========================================================================== */
+/* ------------------------------------------------------------- level CRUD */
+{
+    const created = await curriculumSvc.createCurriculumLevel({ name: 'Diploma' });
+    ok('createCurriculumLevel adds a level', !!created?.id);
+    ok('new level code is generated and uppercased', created.code === 'DIPLOMA', created.code);
 
-export async function saveDraft(draftId, data, { step = 0 } = {}) {
-    const id = draftId || uid('DRF');
-    const existing = draftId ? await drafts$.find(draftId) : null;
+    const updated = await curriculumSvc.updateCurriculumLevel(created.id, { name: 'Diploma (Senior)' });
+    ok('updateCurriculumLevel renames', updated.name === 'Diploma (Senior)');
 
-    const draft = {
-        id,
-        data,
-        step,
-        label: data.name?.trim() || 'Untitled application',
-        branchId: data.branchId || null,
-        createdAt: existing?.createdAt || nowISO(),
-        updatedAt: nowISO(),
-        updatedBy: session.actorId()
-    };
-
-    await db.put('admissionDrafts', draft);
-    return draft;
+    await curriculumSvc.setCurriculumLevelStatus(created.id, 'inactive');
+    const active = await curriculumSvc.listCurriculumLevels({ includeInactive: false });
+    ok('retired level is excluded from active list', !active.some((l) => l.id === created.id));
 }
 
-export async function listDrafts() {
-    return drafts$.mine();
-}
-
-export async function loadDraft(draftId) {
-    const draft = await drafts$.find(draftId);
-    if (!draft) throw new Error('That draft is no longer available. It may have been submitted or cleared.');
-    return draft;
-}
-
-export async function discardDraft(draftId) {
-    await db.remove('admissionDrafts', draftId);
-    return true;
-}
-
-/* ==========================================================================
-   THE PIPELINE
-   ========================================================================== */
-
-/**
- * Submits an application. If it came from a draft, the draft is removed in the
- * same unit of work — an application that exists twice, once as a draft and
- * once as a submission, is a duplicate waiting to be enrolled twice.
- */
-export async function submit(data, { draftId = null } = {}) {
-    session.require('admission.edit', 'submit an application');
-
-    const check = validateApplication(data);
-    if (!check.ok) {
-        const first = Object.values(check.errors)[0];
-        throw new Error(`The application is not complete: ${first}`);
-    }
-
-    const duplicate = await admissions$.findLikeness(data);
-    if (duplicate) {
-        throw new Error(
-            `An application for ${duplicate.name} on this number is already ${statusLabel(duplicate.status)} ` +
-            `(${duplicate.applicationNo}). Open that one instead of creating a second.`
-        );
-    }
-
-    const year = academicYearOf().start;
-    const seq = await settings$.nextSequence('application');
-
-    const admission = await admissions$.create({
-        ...data,
-        applicationNo: sequenceNumber('NAT/APP', year, seq),
-        status: ADMISSION_STATUS.SUBMITTED,
-        appliedOn: data.appliedOn || localDate(),
-        submittedBy: session.actorId()
+/* -------------------------------------------------------- curriculum CRUD */
+let curriculumId = null;
+{
+    const created = await curriculumSvc.createCurriculum({
+        name: 'Test Curriculum', code: 'test-crm', description: 'A test.', durationValue: 12, durationUnit: 'months'
     });
+    curriculumId = created.id;
+    ok('createCurriculum creates a record', !!created?.id);
+    ok('curriculum code is uppercased', created.code === 'TEST-CRM', created.code);
+    ok('new curriculum starts with an empty structure', (created.structure?.levels || []).length === 0);
 
-    if (draftId) await discardDraft(draftId);
+    const updated = await curriculumSvc.updateCurriculum(created.id, { name: 'Test Curriculum (v2)', durationValue: 18 });
+    ok('updateCurriculum edits metadata', updated.name === 'Test Curriculum (v2)' && updated.durationValue === 18);
 
-    await notify({
-        kind: 'admission',
-        title: `New application — ${admission.name}`,
-        body: `${levelLabel(admission.level)} at ${await branchName(admission.branchId)}.`,
-        link: `#/admissions/${admission.id}`
-    });
+    // Metadata update must not disturb an existing structure.
+    await curriculumSvc.addLevelToCurriculum(created.id, 'CLV-FND-1');
+    await curriculumSvc.updateCurriculum(created.id, { description: 'changed' });
+    const afterMeta = await curricula$.find(created.id);
+    ok('metadata update leaves the structure intact', (afterMeta.structure.levels || []).length === 1);
 
-    bus.emit(EVENTS.ADMISSION_SUBMITTED, { admission });
-    return admission;
+    await curriculumSvc.setCurriculumStatus(created.id, 'inactive');
+    const active = await curriculumSvc.listCurricula({ includeInactive: false });
+    ok('retired curriculum excluded from active list', !active.some((c) => c.id === created.id));
+    await curriculumSvc.setCurriculumStatus(created.id, 'active');
 }
 
-export async function updateApplication(id, changes) {
-    session.require('admission.edit', 'edit an application');
+/* -------------------------------------------- structure: Level→Stage→Lesson */
+{
+    // Duplicate-level guard.
+    let threw = false;
+    try { await curriculumSvc.addLevelToCurriculum(curriculumId, 'CLV-FND-1'); }
+    catch { threw = true; }
+    ok('adding a duplicate level is rejected', threw);
 
-    const existing = await admissions$.findOrFail(id);
-    if (existing.status === ADMISSION_STATUS.ENROLLED) {
-        throw new Error('This application has already been enrolled. Edit the student record instead.');
-    }
-    return admissions$.update(id, changes);
+    await curriculumSvc.addLevelToCurriculum(curriculumId, 'CLV-INT-CERT');
+    let detail = await curriculumSvc.curriculumDetail(curriculumId);
+    ok('two levels present after add', detail.structure.levels.length === 2);
+    const firstNode = detail.structure.levels.find((l) => l.levelId === 'CLV-FND-1');
+
+    await curriculumSvc.addStage(curriculumId, firstNode.id, { name: 'Stage A' });
+    await curriculumSvc.addStage(curriculumId, firstNode.id, { name: 'Stage B' });
+    detail = await curriculumSvc.curriculumDetail(curriculumId);
+    let level = detail.structure.levels.find((l) => l.id === firstNode.id);
+    ok('stages added under a level', level.stages.length === 2);
+
+    const stageA = level.stages.find((s) => s.name === 'Stage A');
+    const stageB = level.stages.find((s) => s.name === 'Stage B');
+    ok('stages sort in insertion order', level.stages[0].name === 'Stage A' && level.stages[1].name === 'Stage B');
+
+    // Reorder: move Stage B up; it should now precede Stage A.
+    await curriculumSvc.moveNode(curriculumId, 'stage', stageB.id, -1);
+    detail = await curriculumSvc.curriculumDetail(curriculumId);
+    level = detail.structure.levels.find((l) => l.id === firstNode.id);
+    ok('moveNode reorders stages', level.stages[0].name === 'Stage B' && level.stages[1].name === 'Stage A');
+
+    // Lessons.
+    await curriculumSvc.addLesson(curriculumId, stageA.id, { name: 'Lesson 1' });
+    await curriculumSvc.addLesson(curriculumId, stageA.id, { name: 'Lesson 2' });
+    detail = await curriculumSvc.curriculumDetail(curriculumId);
+    level = detail.structure.levels.find((l) => l.id === firstNode.id);
+    let stage = level.stages.find((s) => s.id === stageA.id);
+    ok('lessons added under a stage', stage.lessons.length === 2);
+
+    const lesson1 = stage.lessons.find((l) => l.name === 'Lesson 1');
+    await curriculumSvc.updateLesson(curriculumId, lesson1.id, { name: 'Lesson 1 (renamed)' });
+    detail = await curriculumSvc.curriculumDetail(curriculumId);
+    stage = detail.structure.levels.find((l) => l.id === firstNode.id).stages.find((s) => s.id === stageA.id);
+    ok('updateLesson renames a lesson', stage.lessons.some((l) => l.name === 'Lesson 1 (renamed)'));
+
+    await curriculumSvc.removeLesson(curriculumId, lesson1.id);
+    detail = await curriculumSvc.curriculumDetail(curriculumId);
+    stage = detail.structure.levels.find((l) => l.id === firstNode.id).stages.find((s) => s.id === stageA.id);
+    ok('removeLesson removes a lesson', stage.lessons.length === 1);
+
+    await curriculumSvc.removeStage(curriculumId, stageA.id);
+    detail = await curriculumSvc.curriculumDetail(curriculumId);
+    level = detail.structure.levels.find((l) => l.id === firstNode.id);
+    ok('removeStage removes a stage', level.stages.length === 1 && level.stages[0].name === 'Stage B');
+
+    await curriculumSvc.removeLevelFromCurriculum(curriculumId, firstNode.id);
+    detail = await curriculumSvc.curriculumDetail(curriculumId);
+    ok('removeLevelFromCurriculum removes a level', detail.structure.levels.length === 1);
 }
 
-/** Moves an application into review. Records who picked it up. */
-export async function beginReview(id) {
-    session.require('admission.edit', 'review an application');
+/* ------------------------------------- student assignment, batch-independent */
+{
+    const all = await students$.all();
+    const withBatch = all.find((s) => s.batchId);
+    ok('fixture has a student with a batch', !!withBatch);
 
-    const admission = await admissions$.findOrFail(id);
-    if (admission.status !== ADMISSION_STATUS.SUBMITTED) {
-        throw new Error(`This application is ${statusLabel(admission.status)}, not awaiting review.`);
-    }
-    return admissions$.update(id, {
-        status: ADMISSION_STATUS.REVIEWING,
-        reviewStartedOn: localDate(),
-        reviewedBy: session.actorId()
-    });
+    // Assign a curriculum to a student that has a batch — batch must be untouched.
+    const beforeBatch = withBatch.batchId;
+    await updateStudent(withBatch.id, { curriculumId });
+    let reloaded = await students$.find(withBatch.id);
+    ok('curriculum assignment persists', reloaded.curriculumId === curriculumId);
+    ok('assigning a curriculum leaves the batch untouched', reloaded.batchId === beforeBatch);
+
+    // Independence: a student can be enrolled with a curriculum and no batch.
+    const { student: fresh } = await enrol({
+        name: 'Curriculum Only Student', level: 'prarambhika',
+        guardianName: 'Guardian', guardianPhone: '9000000000',
+        branchId: branches[0].id, curriculumId
+    }, { raiseFees: false });
+    ok('a student can hold a curriculum with no batch', fresh.curriculumId === curriculumId && !fresh.batchId);
+
+    // profile() resolves the assigned curriculum.
+    const prof = await profile(withBatch.id);
+    ok('profile() surfaces the assigned curriculum', prof.curriculum?.id === curriculumId);
+
+    // Clearing the assignment stores null, not a blank string.
+    await updateStudent(withBatch.id, { curriculumId: '' });
+    reloaded = await students$.find(withBatch.id);
+    ok('clearing curriculum stores null', reloaded.curriculumId === null);
+
+    // The by-index lookup used for usage counts works.
+    const usersOfCurriculum = await students$.where('curriculumId', curriculumId);
+    ok('students are queryable by curriculumId index', usersOfCurriculum.length >= 1);
 }
 
-/**
- * Approves an application. Approval is a decision, not an enrolment — the
- * student record is created separately, because approving on the phone and
- * enrolling when the family pays are two different moments.
- */
-export async function approve(id, { note = null } = {}) {
-    session.require('admission.approve', 'approve an application');
+/* --------------------------------------- academic year: settings integration */
+{
+    const years = await listAcademicYears();
+    ok('academic-year history is preserved', years.length >= 1, `${years.length} years`);
+    ok('date-derived academic year still resolves', typeof academicYearOf().start === 'number');
 
-    const admission = await admissions$.findOrFail(id);
-    if (admission.status === ADMISSION_STATUS.ENROLLED) throw new Error('This applicant is already enrolled.');
-    if (admission.status === ADMISSION_STATUS.REJECTED) throw new Error('This application was rejected. Reopen it first.');
-    if (admission.status === ADMISSION_STATUS.APPROVED) return admission;
+    // Render the settings page and inspect its tabs + institute panel.
+    const settingsMod = await import(`${BASE}/modules/settings/settings.page.js`);
+    const SettingsPage = settingsMod.default;
+    const container = document.createElement('div');
+    const page = new SettingsPage({ params: {}, query: {}, container });
+    await page.render(container);
+    await settle();
 
-    const updated = await admissions$.update(id, {
-        status: ADMISSION_STATUS.APPROVED,
-        approvedOn: localDate(),
-        approvedBy: session.actorId(),
-        approvalNote: note?.trim() || null
-    });
-
-    bus.emit(EVENTS.ADMISSION_APPROVED, { admission: updated });
-    return updated;
+    const tabLabels = [...container.querySelectorAll('[data-tab]')].map((b) => b.textContent.trim());
+    ok('Settings has no standalone "Academic years" tab', !tabLabels.includes('Academic years'), tabLabels.join(','));
+    ok('Settings shows a "Current academic year" control',
+        container.textContent.includes('Current academic year'));
 }
 
-export async function reject(id, { reason }) {
-    session.require('admission.approve', 'reject an application');
+/* ------------------------------------------------- curriculum page renders */
+{
+    const mod = await import(`${BASE}/modules/curriculum/curriculum.page.js`);
+    const CurriculumPage = mod.default;
 
-    if (!reason?.trim()) throw new Error('Record why the application was declined — the family will ask.');
-    const admission = await admissions$.findOrFail(id);
-    if (admission.status === ADMISSION_STATUS.ENROLLED) throw new Error('This applicant is already enrolled and cannot be rejected.');
+    const listContainer = document.createElement('div');
+    const listPage = new CurriculumPage({ params: {}, query: {}, container: listContainer });
+    await listPage.render(listContainer);
+    await settle();
+    const tabs = [...listContainer.querySelectorAll('[data-tab]')].map((b) => b.dataset.tab);
+    ok('curriculum list renders Curricula and Levels tabs',
+        tabs.includes('curricula') && tabs.includes('levels'), tabs.join(','));
 
-    return admissions$.update(id, {
-        status: ADMISSION_STATUS.REJECTED,
-        rejectedOn: localDate(),
-        rejectedBy: session.actorId(),
-        rejectionReason: reason.trim()
-    });
+    const detailContainer = document.createElement('div');
+    const detailPage = new CurriculumPage({ params: { id: curriculumId }, query: {}, container: detailContainer });
+    await detailPage.render(detailContainer);
+    await settle();
+    ok('curriculum detail renders the Structure section', detailContainer.textContent.includes('Structure'));
 }
 
-/** Puts a rejected application back in the queue. */
-export async function reopen(id) {
-    session.require('admission.approve', 'reopen an application');
-
-    const admission = await admissions$.findOrFail(id);
-    if (admission.status !== ADMISSION_STATUS.REJECTED) throw new Error('Only a rejected application can be reopened.');
-    return admissions$.update(id, {
-        status: ADMISSION_STATUS.SUBMITTED,
-        rejectedOn: null, rejectedBy: null, rejectionReason: null,
-        reopenedOn: localDate()
-    });
-}
-
-/* ==========================================================================
-   CONVERSION — application to student
-   ========================================================================== */
-
-/**
- * Creates the student record for an approved application.
- *
- * Everything about this function is arranged around not repeating 1.0's
- * failure. In particular:
- *
- *  - a batch is mandatory, and it is checked for capacity and level before
- *    anything is written;
- *  - the application row and the student row are written in the *same*
- *    transaction, so an application can never be marked enrolled without a
- *    student existing, nor a student created twice by a double-click;
- *  - the fee schedule is raised afterwards, deliberately outside that
- *    transaction, because billing failing is recoverable and must not roll
- *    back an enrolment the family has already been told about.
- *
- * @param {string} admissionId
- * @param {object} options
- * @param {string} options.batchId          Required.
- * @param {string} [options.feePlanId]      Defaults to the application's plan.
- * @param {string} [options.joinedOn]       Defaults to today.
- * @param {boolean} [options.raiseFees=true]
- */
-export async function enrolApplicant(admissionId, { batchId, feePlanId = null, joinedOn = null, raiseFees = true } = {}) {
-    session.require('admission.approve', 'enrol an applicant');
-
-    const admission = await admissions$.findOrFail(admissionId);
-
-    if (admission.status === ADMISSION_STATUS.ENROLLED) {
-        throw new Error(`${admission.name} has already been enrolled.`);
-    }
-    if (admission.status !== ADMISSION_STATUS.APPROVED) {
-        throw new Error(`Approve this application before enrolling — it is currently ${statusLabel(admission.status)}.`);
-    }
-    if (!batchId) {
-        throw new Error('Choose the batch this student will attend. A student without a batch appears on no roll call.');
-    }
-
-    const batch = await batches$.findOrFail(batchId);
-    if (batch.status !== 'active') throw new Error(`${batch.name} is closed and cannot take students.`);
-    if (batch.level !== admission.level) {
-        throw new Error(`${admission.name} is joining at ${levelLabel(admission.level)}, but ${batch.name} teaches ${levelLabel(batch.level)}.`);
-    }
-
-    const roster = await students$.byBatch(batchId);
-    if (batch.capacity && roster.length >= batch.capacity) {
-        throw new Error(`${batch.name} is full — ${roster.length} of ${batch.capacity} seats taken. Choose another batch or raise its capacity.`);
-    }
-
-    const planId = feePlanId || admission.feePlanId;
-    const plan = planId ? await feePlans$.find(planId) : null;
-    if (planId && !plan) throw new Error('The chosen fee plan no longer exists. Pick another.');
-
-    const year = academicYearOf().start;
-    const seq = await settings$.nextSequence('admission');
-    const at = nowISO();
-    const actor = session.actorId();
-
-    const student = {
-        id: uid('STU'),
-        admissionNo: sequenceNumber('NAT/ADM', year, seq),
-        name: admission.name,
-        level: admission.level,
-        // Branch follows the batch, not the application: if the family was
-        // offered a place at the other campus, the batch is the truth.
-        branchId: batch.branchId,
-        batchId: batch.id,
-        feePlanId: planId || null,
-        status: STUDENT_STATUS.ACTIVE,
-        gender: admission.gender || null,
-        dateOfBirth: admission.dateOfBirth || null,
-        joinedOn: joinedOn || localDate(),
-        guardianName: admission.guardianName || null,
-        guardianRelation: admission.guardianRelation || 'Guardian',
-        guardianPhone: admission.guardianPhone || null,
-        guardianEmail: admission.guardianEmail || null,
-        alternatePhone: admission.alternatePhone || null,
-        address: admission.address || null,
-        bloodGroup: admission.bloodGroup || null,
-        medicalNotes: admission.medicalNotes || null,
-        emergencyContact: admission.emergencyContact || admission.guardianPhone || null,
-        previousExperience: admission.previousExperience || null,
-        photo: admission.photo || null,
-        admissionId: admission.id,
-        searchKey: [admission.name, sequenceNumber('NAT/ADM', year, seq), admission.guardianName, admission.level]
-            .filter(Boolean).join(' ').toLowerCase(),
-        createdAt: at, createdBy: actor, updatedAt: at, updatedBy: actor, deletedAt: null
-    };
-
-    const closedApplication = {
-        ...admission,
-        status: ADMISSION_STATUS.ENROLLED,
-        enrolledOn: localDate(),
-        enrolledBy: actor,
-        studentId: student.id,
-        updatedAt: at,
-        updatedBy: actor
-    };
-
-    await db.unit(['students', 'admissions', 'auditLog'], async (s) => {
-        await request(s.students.put(student));
-        await request(s.admissions.put(closedApplication));
-        await request(s.auditLog.put({
-            id: uid('AUD'), entity: 'Admission', entityId: admission.id, action: 'enrol',
-            detail: { studentId: student.id, admissionNo: student.admissionNo, batchId: batch.id },
-            actorId: actor, actorName: session.actorName(), at
-        }));
-    }, 'admission:enrol');
-
-    bus.emit(EVENTS.ADMISSION_ENROLLED, { admission: closedApplication, student });
-    bus.emit(EVENTS.STUDENT_CREATED, { student });
-
-    /* Billing, outside the transaction and reported separately. If the fee
-       plan is misconfigured the registrar needs to know — but the child is
-       enrolled either way, and rolling that back would be worse. */
-    let billing = null;
-    let billingError = null;
-    if (raiseFees && planId) {
-        try {
-            billing = await raiseSchedule(student.id, { feePlanId: planId, startDate: student.joinedOn });
-        } catch (err) {
-            billingError = err.message;
-        }
-    }
-
-    await notify({
-        kind: 'admission',
-        title: `${student.name} enrolled`,
-        body: `${batch.name} · ${student.admissionNo}`,
-        link: `#/students/${student.id}`
-    });
-
-    return { student, admission: closedApplication, billing, billingError };
-}
-
-/**
- * Batches a student could join, annotated with why they can or cannot — so the
- * wizard shows "Full (18/18)" next to a disabled option rather than hiding it
- * and leaving the registrar wondering where the batch went.
- */
-export async function eligibleBatches(admissionOrLevel, branchId = null) {
-    const level = typeof admissionOrLevel === 'string' ? admissionOrLevel : admissionOrLevel?.level;
-    const branch = branchId || (typeof admissionOrLevel === 'object' ? admissionOrLevel?.branchId : null);
-
-    const batches = await batches$.withOccupancy(branch);
-    return batches
-        .filter((b) => b.level === level)
-        .map((b) => ({
-            ...b,
-            selectable: b.status === 'active' && (!b.capacity || b.enrolled < b.capacity),
-            reason: b.status !== 'active' ? 'Closed'
-                : (b.capacity && b.enrolled >= b.capacity) ? `Full (${b.enrolled}/${b.capacity})`
-                : `${b.seatsLeft} seat${b.seatsLeft === 1 ? '' : 's'} left`
-        }))
-        .sort((a, b) => Number(b.selectable) - Number(a.selectable) || a.name.localeCompare(b.name));
-}
-
-/* ==========================================================================
-   PIPELINE ANALYTICS
-   ========================================================================== */
-
-/** Counts by stage, plus conversion rate — the admissions page header. */
-export async function pipeline(branchId = null) {
-    const all = (await admissions$.all()).filter((a) => !branchId || a.branchId === branchId);
-    const count = (status) => all.filter((a) => a.status === status).length;
-
-    const decided = count(ADMISSION_STATUS.ENROLLED) + count(ADMISSION_STATUS.REJECTED);
-    const thisMonth = localDate().slice(0, 7);
-
-    return {
-        total: all.length,
-        submitted: count(ADMISSION_STATUS.SUBMITTED),
-        reviewing: count(ADMISSION_STATUS.REVIEWING),
-        approved: count(ADMISSION_STATUS.APPROVED),
-        enrolled: count(ADMISSION_STATUS.ENROLLED),
-        rejected: count(ADMISSION_STATUS.REJECTED),
-        awaitingAction: count(ADMISSION_STATUS.SUBMITTED) + count(ADMISSION_STATUS.REVIEWING) + count(ADMISSION_STATUS.APPROVED),
-        thisMonth: all.filter((a) => (a.appliedOn || '').startsWith(thisMonth)).length,
-        conversionRate: decided ? Math.round((count(ADMISSION_STATUS.ENROLLED) / decided) * 100) : null,
-        byLevel: LEVELS.map((l) => ({
-            level: l.value, label: l.label,
-            count: all.filter((a) => a.level === l.value).length
-        })).filter((row) => row.count > 0)
-    };
-}
-
-/**
- * Applications that have been sitting too long. An approved application nobody
- * enrolled is a family who thinks they have a place and does not.
- */
-export async function stalled({ days = 7 } = {}) {
-    const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
-    return (await admissions$.pending())
-        .concat(await admissions$.byStatus(ADMISSION_STATUS.APPROVED))
-        .filter((a) => (a.appliedOn || '') < cutoff)
-        .sort((a, b) => (a.appliedOn || '').localeCompare(b.appliedOn || ''));
-}
-
-/* ------------------------------------------------------------------ HELPERS */
-
-function statusLabel(status) {
-    return {
-        [ADMISSION_STATUS.DRAFT]: 'a draft',
-        [ADMISSION_STATUS.SUBMITTED]: 'awaiting review',
-        [ADMISSION_STATUS.REVIEWING]: 'under review',
-        [ADMISSION_STATUS.APPROVED]: 'approved',
-        [ADMISSION_STATUS.ENROLLED]: 'enrolled',
-        [ADMISSION_STATUS.REJECTED]: 'rejected'
-    }[status] || status;
-}
-
-
-async function branchName(branchId) {
-    const branch = branchId ? await branches$.find(branchId) : null;
-    return branch?.name || 'the school';
-}
-
-/* ==========================================================================
-   LISTING
-   ========================================================================== */
-
-/**
- * Applications shaped for the list page: status, age, and whether the next
- * action is available. "Waiting days" is computed here rather than in the page
- * so the dashboard's stalled count and the list's amber row always agree.
- */
-export async function listApplications(branchId = null, { status = null } = {}) {
-    const all = (await admissions$.all()).filter((a) => !branchId || a.branchId === branchId);
-    const rows = status && status !== 'all' ? all.filter((a) => a.status === status) : all;
-
-    return rows
-        .map((application) => ({
-            ...application,
-            levelLabel: levelLabel(application.level),
-            waitingDays: application.appliedOn
-                ? Math.max(0, Math.round((Date.now() - new Date(`${application.appliedOn}T00:00:00`).getTime()) / 86400000))
-                : null,
-            stalled: application.appliedOn
-                && [ADMISSION_STATUS.SUBMITTED, ADMISSION_STATUS.REVIEWING, ADMISSION_STATUS.APPROVED].includes(application.status)
-                && (Date.now() - new Date(`${application.appliedOn}T00:00:00`).getTime()) / 86400000 > 7,
-            statusLabel: statusLabel(application.status),
-            nextAction: nextActionFor(application.status)
-        }))
-        .sort((a, b) => (b.appliedOn || '').localeCompare(a.appliedOn || ''));
-}
-
-/** One application with everything the detail drawer shows. */
-export async function applicationDetail(id) {
-    const application = await admissions$.findOrFail(id);
-    const [batches, likeness] = await Promise.all([
-        eligibleBatches(application),
-        admissions$.findLikeness ? admissions$.findLikeness(application) : Promise.resolve([])
-    ]);
-
-    return {
-        application,
-        levelLabel: levelLabel(application.level),
-        statusLabel: statusLabel(application.status),
-        nextAction: nextActionFor(application.status),
-        eligibleBatches: batches,
-        possibleDuplicates: (likeness || []).filter((row) => row.id !== application.id)
-    };
-}
-
-/** What a person can do next with an application in this state. */
-export function nextActionFor(status) {
-    return {
-        [ADMISSION_STATUS.DRAFT]: { key: 'submit', label: 'Submit application' },
-        [ADMISSION_STATUS.SUBMITTED]: { key: 'review', label: 'Begin review' },
-        [ADMISSION_STATUS.REVIEWING]: { key: 'approve', label: 'Approve' },
-        [ADMISSION_STATUS.APPROVED]: { key: 'enrol', label: 'Enrol' },
-        [ADMISSION_STATUS.ENROLLED]: null,
-        [ADMISSION_STATUS.REJECTED]: { key: 'reopen', label: 'Reopen' }
-    }[status] || null;
-}
+/* -------------------------------------------------------------------- DONE */
+console.log(`\nPhase 2: ${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);

@@ -1,360 +1,401 @@
 /**
- * NATYAM ERP 2.0 — Analytics service
+ * NATYAM ERP 2.0 — Certificate service
  *
- * Trends and comparisons, for the analytics dashboard.
+ * A certificate is the only artefact this system produces that leaves the
+ * building and outlives it. A parent will present a Praveshika certificate to
+ * a college admissions officer in eleven years' time, and the only thing
+ * standing behind it will be a serial number this module minted.
  *
- * This service is almost entirely composition: it asks finance for its monthly
- * series, attendance for its trend, fees for its collection summary, and joins
- * the answers. It deliberately does not recompute any of those from the raw
- * stores. If analytics derived revenue its own way, the school would have two
- * revenue numbers that differed by rounding and a fortnight of arguments about
- * which screen was lying.
+ * That shapes three decisions:
  *
- * The one thing genuinely computed here is student growth, because no other
- * module needs "how did the roll move month by month" and there was nowhere
- * honest to put it.
+ *  - serials are allocated from the settings counter, never derived from a
+ *    row count, so deleting a record can never cause a serial to be reissued;
+ *  - a certificate is never hard-deleted, only revoked, and a revoked serial
+ *    still verifies — returning "revoked on 12 March, reason: issued in error"
+ *    rather than "not found", because "not found" is indistinguishable from a
+ *    typo and tells the person holding the paper nothing;
+ *  - eligibility is checked and *explained*, so a registrar is told the
+ *    student's attendance is 61% rather than simply being refused.
  */
 
+import { bus, EVENTS } from '../core/bus.js';
 import { session } from '../core/session.js';
-import { localDate, lastMonths, monthKey, formatMonth, addMonths, startOfMonth, endOfMonth } from '../utils/date.js';
-import { students$, admissions$, batches$, invoices$ } from '../data/repositories.js';
-import { STUDENT_STATUS, ADMISSION_STATUS } from '../config/app.config.js';
-
-import { monthlySeries, profitAndLoss, branchPerformance as financeByBranch } from './finance.service.js';
-import { trend as attendanceTrend, teacherCompliance } from './attendance.service.js';
-import { collectionSummary } from './fees.service.js';
-import { programSummary, listPrograms } from './programs.service.js';
-import { listStaff } from './staff.service.js';
-import { listBranches } from './settings.service.js';
+import { db, request } from '../core/db.js';
+import { uid } from '../utils/id.js';
+import { localDate, nowISO, academicYearOf, formatDateLong, daysBetween } from '../utils/date.js';
+import { LEVELS, levelLabel } from '../config/app.config.js';
+import {
+    certificates$, students$, programs$, staff$, attendance$, settings$, AttendanceMath
+} from '../data/repositories.js';
+import { notify } from './notifications.service.js';
 
 /* ==========================================================================
-   EXECUTIVE SUMMARY
+   TEMPLATES
+   --------------------------------------------------------------------------
+   Data, not markup. The template decides what a certificate *says* and what
+   must be true before it may be issued; how it looks belongs to the print
+   view, and keeping the two apart means the school can restyle its
+   certificates without anyone touching the eligibility rules.
+   ========================================================================== */
+
+export const TEMPLATES = Object.freeze([
+    {
+        id: 'level-completion',
+        name: 'Level completion',
+        title: (ctx) => `Certificate of Completion — ${ctx.levelLabel}`,
+        body: (ctx) =>
+            `This is to certify that ${ctx.student.name} has successfully completed the ${ctx.levelLabel} level ` +
+            `of the Kuchipudi curriculum at NATYAM — School of Kuchipudi, having maintained an attendance of ` +
+            `${ctx.attendanceRate}% during the ${ctx.academicYear} academic year.`,
+        requires: { minAttendance: 75, minTenureDays: 180, needsLevel: true },
+        signatories: ['Principal', 'Guru']
+    },
+    {
+        id: 'participation',
+        name: 'Programme participation',
+        title: (ctx) => `Certificate of Participation — ${ctx.program?.name || 'Programme'}`,
+        body: (ctx) =>
+            `This is to certify that ${ctx.student.name} participated in ${ctx.program?.name} ` +
+            `held on ${formatDateLong(ctx.program?.date)}${ctx.program?.venue ? ` at ${ctx.program.venue}` : ''}, ` +
+            `representing NATYAM — School of Kuchipudi.`,
+        requires: { needsProgram: true },
+        signatories: ['Principal']
+    },
+    {
+        id: 'merit',
+        name: 'Merit award',
+        title: () => 'Certificate of Merit',
+        body: (ctx) =>
+            `Awarded to ${ctx.student.name} in recognition of outstanding dedication and achievement ` +
+            `in the study and performance of Kuchipudi${ctx.citation ? `: ${ctx.citation}` : ''}.`,
+        requires: { needsCitation: true },
+        signatories: ['Principal', 'Guru']
+    },
+    {
+        id: 'diploma',
+        name: 'Performance diploma',
+        title: () => 'Diploma in Kuchipudi — Alankara',
+        body: (ctx) =>
+            `This is to certify that ${ctx.student.name} has completed the full course of study at ` +
+            `NATYAM — School of Kuchipudi, culminating in the Alankara performance diploma, ` +
+            `having trained under the school since ${formatDateLong(ctx.student.joinedOn)}.`,
+        requires: { minAttendance: 80, minTenureDays: 1460, onlyLevel: 'alankara' },
+        signatories: ['Principal', 'Guru', 'Examiner']
+    }
+]);
+
+export function template(id) {
+    const found = TEMPLATES.find((t) => t.id === id);
+    if (!found) throw new Error(`Unknown certificate template "${id}".`);
+    return found;
+}
+
+/* ==========================================================================
+   ELIGIBILITY
    ========================================================================== */
 
 /**
- * The half-dozen numbers an owner actually wants, each with the direction of
- * travel. A KPI without a comparison is a number without meaning — "82%
- * attendance" only matters next to last month's 76%.
+ * Checks whether a certificate may be issued, and says why not when it may
+ * not. Returns rather than throws so the UI can grey out a button with a
+ * tooltip instead of waiting for a click to produce an error.
  */
-export async function executiveKPIs(branchId = null) {
-    session.require('report.view', 'view analytics');
+export async function checkEligibility({ studentId, templateId, programId = null, citation = null }) {
+    const student = await students$.findOrFail(studentId);
+    const spec = template(templateId);
+    const rules = spec.requires || {};
+    const reasons = [];
 
-    const thisMonth = monthKey();
-    const lastMonth = monthKey(addMonths(localDate(), -1));
+    const rows = await attendance$.forStudent(studentId);
+    const attendanceRate = AttendanceMath.rateOf(rows);
+    const tenure = student.joinedOn ? daysBetween(student.joinedOn, localDate()) : 0;
 
-    const [roll, growth, revenue, attendance, collection, previousCollection] = await Promise.all([
-        students$.active(branchId),
-        studentGrowth(2, branchId),
-        monthlySeries(2, branchId),
-        attendanceTrend(2, branchId),
-        collectionSummary({
-            from: startOfMonth(localDate()), to: localDate(), branchId
-        }),
-        collectionSummary({
-            from: startOfMonth(addMonths(localDate(), -1)),
-            to: endOfMonth(addMonths(localDate(), -1)),
-            branchId
-        })
-    ]);
+    if (rules.minAttendance !== undefined) {
+        if (attendanceRate === null) reasons.push('No attendance has been recorded for this student yet.');
+        else if (attendanceRate < rules.minAttendance) {
+            reasons.push(`Attendance is ${attendanceRate}%, below the ${rules.minAttendance}% this certificate requires.`);
+        }
+    }
+    if (rules.minTenureDays !== undefined && tenure < rules.minTenureDays) {
+        const years = (rules.minTenureDays / 365).toFixed(1).replace(/\.0$/, '');
+        reasons.push(`${student.name} has been enrolled ${Math.floor(tenure / 30)} months; this certificate requires ${years} year${years === '1' ? '' : 's'}.`);
+    }
+    if (rules.onlyLevel && student.level !== rules.onlyLevel) {
+        reasons.push(`This certificate is only for students at ${levelLabel(rules.onlyLevel)}. ${student.name} is at ${levelLabel(student.level)}.`);
+    }
+    if (rules.needsProgram && !programId) {
+        reasons.push('Choose the programme this certificate is for.');
+    }
+    if (rules.needsCitation && !citation?.trim()) {
+        reasons.push('A merit award needs a citation describing what is being recognised.');
+    }
 
-    const current = revenue.find((r) => r.period === thisMonth) || { income: 0, net: 0 };
-    const previous = revenue.find((r) => r.period === lastMonth) || { income: 0, net: 0 };
-    const attendanceNow = attendance.find((a) => a.period === thisMonth)?.rate ?? null;
-    const attendanceThen = attendance.find((a) => a.period === lastMonth)?.rate ?? null;
-    const joinedNow = growth.at(-1)?.joined ?? 0;
-    const joinedThen = growth.at(-2)?.joined ?? 0;
+    const duplicate = (await certificates$.forStudent(studentId)).find((c) =>
+        c.templateId === templateId &&
+        c.status !== 'revoked' &&
+        (!programId || c.programId === programId) &&
+        (!rules.needsLevel || c.level === student.level)
+    );
+    if (duplicate) {
+        reasons.push(`${student.name} already holds this certificate (${duplicate.serial}, issued ${formatDateLong(duplicate.issuedOn)}).`);
+    }
 
     return {
-        students: kpi('Students on the roll', roll.length, roll.length - (growth.at(-1)?.opening ?? roll.length)),
-        joined: kpi('Joined this month', joinedNow, joinedNow - joinedThen),
-        revenue: kpi('Income this month', current.income, current.income - previous.income, 'money'),
-        net: kpi('Net this month', current.net, current.net - previous.net, 'money'),
-        collected: kpi('Collected this month', collection.collected,
-            collection.collected - previousCollection.collected, 'money'),
-        outstanding: kpi('Outstanding', collection.outstanding,
-            collection.outstanding - previousCollection.outstanding, 'money', true),
-        attendance: kpi('Attendance this month', attendanceNow,
-            attendanceNow === null || attendanceThen === null ? null : attendanceNow - attendanceThen, 'percent')
+        ok: reasons.length === 0,
+        reasons,
+        context: { student, attendanceRate, tenureDays: tenure, level: student.level }
     };
 }
 
-function kpi(label, value, delta, format = 'number', lowerIsBetter = false) {
-    const direction = delta === null || delta === 0 ? 'flat' : delta > 0 ? 'up' : 'down';
-    const good = direction === 'flat'
-        ? null
-        : lowerIsBetter ? direction === 'down' : direction === 'up';
-
-    return { label, value, delta, direction, good, format };
-}
-
 /* ==========================================================================
-   TRENDS
+   ISSUANCE
    ========================================================================== */
 
 /**
- * The roll month by month: who joined, who left, and where the total stood at
- * the end. Leavers are inferred from a status that is no longer active rather
- * than from a deletion, because archiving is a soft delete and a hard-deleted
- * student would silently vanish from history.
+ * Issues a certificate.
+ *
+ * The serial and the row are written in one transaction with the audit entry.
+ * `force` exists for the genuine case — a guru overriding an attendance rule
+ * for a student who was ill — and demands a reason, which is stored on the
+ * certificate itself so the override is visible forever rather than only in a
+ * log somebody has to think to check.
  */
-export async function studentGrowth(months = 12, branchId = null) {
-    const keys = lastMonths(months);
-    const all = (await students$.all()).filter((s) => !branchId || s.branchId === branchId);
+export async function issue({ studentId, templateId, programId = null, citation = null, issuedOn = null, force = false, overrideReason = null }) {
+    session.require('certificate.issue', 'issue a certificate');
 
-    let running = all.filter((student) => {
-        const joined = student.joinedOn || student.createdAt?.slice(0, 10);
-        return joined && joined < `${keys[0]}-01`
-            && !(student.leftOn && student.leftOn < `${keys[0]}-01`);
-    }).length;
+    const eligibility = await checkEligibility({ studentId, templateId, programId, citation });
+    if (!eligibility.ok) {
+        if (!force) {
+            const err = new Error(eligibility.reasons[0]);
+            err.reasons = eligibility.reasons;
+            throw err;
+        }
+        if (!overrideReason?.trim()) {
+            throw new Error('Overriding the eligibility rules requires a reason. It is recorded on the certificate.');
+        }
+    }
 
-    return keys.map((period) => {
-        const opening = running;
+    const student = eligibility.context.student;
+    const spec = template(templateId);
+    const program = programId ? await programs$.findOrFail(programId) : null;
+    const principal = await settings$.get('institute', {});
+    const year = academicYearOf();
 
-        const joined = all.filter((s) => (s.joinedOn || s.createdAt?.slice(0, 10) || '').startsWith(period)).length;
-        const left = all.filter((s) => (s.leftOn || '').startsWith(period)).length;
+    const context = {
+        student,
+        program,
+        citation: citation?.trim() || null,
+        levelLabel: levelLabel(student.level),
+        attendanceRate: eligibility.context.attendanceRate ?? 0,
+        academicYear: `${year.start}–${year.end}`
+    };
 
-        running = opening + joined - left;
+    const seq = await settings$.nextSequence('certificate');
+    const serial = formatSerial(seq, year.start);
+    const at = nowISO();
+    const actor = session.actorId();
 
-        return {
-            period,
-            label: formatMonth(period),
-            opening,
-            joined,
-            left,
-            total: running,
-            netChange: joined - left
-        };
-    });
-}
+    const certificate = {
+        id: uid('CRT'),
+        serial,
+        templateId,
+        studentId: student.id,
+        studentName: student.name,
+        admissionNo: student.admissionNo,
+        programId: program?.id || null,
+        programName: program?.name || null,
+        branchId: student.branchId,
+        level: student.level,
+        title: spec.title(context),
+        body: spec.body(context),
+        citation: context.citation,
+        signatories: spec.signatories,
+        principal: principal?.principal || null,
+        attendanceRate: context.attendanceRate,
+        academicYear: context.academicYear,
+        issuedOn: issuedOn || localDate(),
+        issuedBy: actor,
+        issuedByName: session.actorName(),
+        status: 'issued',
+        overridden: !eligibility.ok,
+        overrideReason: eligibility.ok ? null : overrideReason.trim(),
+        searchKey: [serial, student.name, spec.name, program?.name].filter(Boolean).join(' ').toLowerCase(),
+        createdAt: at, createdBy: actor, updatedAt: at, updatedBy: actor, deletedAt: null
+    };
 
-/** Income, expenditure and net by month — read straight from the ledger. */
-export async function revenueTrend(months = 12, branchId = null) {
-    return monthlySeries(months, branchId);
-}
+    await db.unit(['certificates', 'auditLog'], async (s) => {
+        await request(s.certificates.put(certificate));
+        await request(s.auditLog.put({
+            id: uid('AUD'), entity: 'Certificate', entityId: certificate.id, action: 'issue',
+            detail: { serial, studentId: student.id, templateId, overridden: certificate.overridden },
+            actorId: actor, actorName: session.actorName(), at
+        }));
+    }, 'certificate:issue');
 
-/** Attendance rate by month. */
-export async function attendanceTrendSeries(months = 12, branchId = null) {
-    const rows = await attendanceTrend(months, branchId);
-    return rows.map((row) => ({ ...row, label: formatMonth(row.period) }));
+    bus.emit(EVENTS.CERTIFICATE_ISSUED, { certificate });
+    return certificate;
 }
 
 /**
- * Billed against collected, month by month. The gap between the two lines is
- * the arrears the school is carrying, which is a more useful thing to look at
- * than either line alone.
+ * Issues the same certificate to a whole cast at once.
+ *
+ * Unlike most bulk operations in this codebase this one does *not* fail as a
+ * unit. Eighteen students performed; if two of them are short on attendance,
+ * refusing all eighteen helps nobody. Each is attempted independently and the
+ * failures are reported back by name so the registrar can decide about them
+ * individually.
  */
-export async function collectionTrend(months = 12, branchId = null) {
-    const keys = lastMonths(months);
-    const invoices = (await invoices$.all()).filter((i) => !branchId || i.branchId === branchId);
+export async function issueBatch({ studentIds, templateId, programId = null, force = false, overrideReason = null }) {
+    session.require('certificate.issue', 'issue certificates');
 
-    return Promise.all(keys.map(async (period) => {
-        const billed = invoices
-            .filter((invoice) => (invoice.issuedOn || invoice.dueDate || '').startsWith(period))
-            .filter((invoice) => invoice.status !== 'cancelled')
-            .reduce((sum, invoice) => sum + (invoice.amount || 0), 0);
+    const issued = [];
+    const failed = [];
 
-        const summary = await collectionSummary({
-            from: `${period}-01`,
-            to: endOfMonth(`${period}-01`),
-            branchId
+    for (const studentId of studentIds) {
+        try {
+            issued.push(await issue({ studentId, templateId, programId, force, overrideReason }));
+        } catch (err) {
+            const student = await students$.find(studentId);
+            failed.push({ studentId, name: student?.name || studentId, reason: err.message });
+        }
+    }
+
+    if (issued.length) {
+        await notify({
+            kind: 'certificate',
+            key: `certificates:batch:${Date.now()}`,
+            title: `${issued.length} certificate${issued.length === 1 ? '' : 's'} issued`,
+            body: programId ? (await programs$.find(programId))?.name : template(templateId).name,
+            link: '#/certificates'
         });
+    }
 
+    return { issued, failed };
+}
+
+/**
+ * Revokes a certificate. The record and its serial survive; only the status
+ * changes, so a revoked certificate presented to a verifier is correctly
+ * identified rather than appearing never to have existed.
+ */
+export async function revoke(id, { reason }) {
+    session.require('certificate.issue', 'revoke a certificate');
+
+    if (!reason?.trim()) throw new Error('Revoking a certificate requires a reason. It is shown to anyone who verifies the serial.');
+
+    const certificate = await certificates$.findOrFail(id);
+    if (certificate.status === 'revoked') throw new Error('This certificate has already been revoked.');
+
+    const revoked = await certificates$.update(id, {
+        status: 'revoked',
+        revokedOn: localDate(),
+        revokedBy: session.actorId(),
+        revokeReason: reason.trim()
+    });
+
+    bus.emit(EVENTS.CERTIFICATE_REVOKED, { certificate: revoked });
+    return revoked;
+}
+
+/* ==========================================================================
+   VERIFICATION
+   ========================================================================== */
+
+/**
+ * Looks up a serial. The public-facing operation: whatever the answer, it is
+ * phrased for a person holding a piece of paper, not for a developer.
+ */
+export async function verify(serial) {
+    const cleaned = String(serial || '').trim().toUpperCase();
+    if (!cleaned) return { found: false, message: 'Enter a certificate serial number.' };
+
+    const certificate = await certificates$.verify(cleaned);
+    if (!certificate) {
         return {
-            period,
-            label: formatMonth(period),
-            billed,
-            collected: summary.collected,
-            gap: billed - summary.collected,
-            rate: billed ? Math.round((summary.collected / billed) * 100) : null
+            found: false,
+            message: `No certificate with the serial ${cleaned} was issued by this school. Check for transcription errors — the format is NAT/CRT/YY/0000.`
         };
-    }));
-}
+    }
 
-/* ==========================================================================
-   COMPARISONS
-   ========================================================================== */
-
-/** Every branch side by side. */
-export async function branchComparison({ from, to }) {
-    const [branches, financials] = await Promise.all([
-        listBranches(),
-        financeByBranch({ from, to })
-    ]);
-
-    const byId = new Map(financials.map((row) => [row.branch.id, row]));
-
-    return Promise.all(branches.map(async (branch) => {
-        const [roll, batchRows, collection] = await Promise.all([
-            students$.active(branch.id),
-            batches$.active(branch.id),
-            collectionSummary({ from, to, branchId: branch.id })
-        ]);
-
-        const financial = byId.get(branch.id) || { income: 0, expense: 0, net: 0, margin: null };
-
+    if (certificate.status === 'revoked') {
         return {
-            branch,
-            students: roll.length,
-            batches: batchRows.length,
-            capacity: batchRows.reduce((sum, b) => sum + (b.capacity || 0), 0),
-            occupancy: batchRows.reduce((sum, b) => sum + (b.capacity || 0), 0)
-                ? Math.round((roll.length / batchRows.reduce((sum, b) => sum + (b.capacity || 0), 0)) * 100)
-                : null,
-            collected: collection.collected,
-            outstanding: collection.outstanding,
-            income: financial.income,
-            expense: financial.expense,
-            net: financial.net,
-            margin: financial.margin
+            found: true,
+            valid: false,
+            certificate,
+            message: `This certificate was revoked on ${formatDateLong(certificate.revokedOn)}. Reason recorded: ${certificate.revokeReason}`
         };
-    }));
-}
-
-/**
- * Teacher performance, which needs stating carefully: this measures register
- * compliance and the attendance of the classes they teach. It does not measure
- * teaching. A guru with the school's hardest batch will look worse than one
- * with the keenest, and the numbers are presented as prompts for a
- * conversation rather than a ranking.
- */
-export async function teacherPerformance({ from, to, branchId = null }) {
-    const [staff, compliance] = await Promise.all([
-        listStaff(branchId),
-        teacherCompliance({ from, to, branchId })
-    ]);
-
-    const byTeacher = new Map(compliance.map((row) => [row.teacher.id, row]));
-
-    return staff
-        .filter((member) => member.role === 'teacher')
-        .map((member) => {
-            const record = byTeacher.get(member.id) || {};
-            return {
-                staff: member,
-                name: member.name,
-                batches: member.batchCount,
-                students: member.studentCount,
-                weeklySessions: member.weeklySessions,
-                expected: record.expected ?? 0,
-                marked: record.marked ?? 0,
-                compliance: record.compliance ?? null
-            };
-        })
-        .sort((a, b) => (b.compliance ?? -1) - (a.compliance ?? -1));
-}
-
-/** Programmes by type, participation and financial result. */
-export async function programAnalytics(branchId = null, { from = null, to = null } = {}) {
-    const [summary, rows] = await Promise.all([
-        programSummary(branchId),
-        listPrograms(branchId, { from, to })
-    ]);
-
-    const completed = rows.filter((program) => program.status === 'completed');
+    }
 
     return {
-        ...summary,
-        held: completed.length,
-        totalIncome: completed.reduce((sum, p) => sum + (p.income || 0), 0),
-        totalCost: completed.reduce((sum, p) => sum + (p.expenditure || 0), 0),
-        net: completed.reduce((sum, p) => sum + ((p.income || 0) - (p.expenditure || 0)), 0),
-        averageCast: completed.length
-            ? Math.round(completed.reduce((sum, p) => sum + (p.participantCount || 0), 0) / completed.length)
-            : 0,
-        byType: summary.byType.map((entry) => {
-            const ofType = completed.filter((p) => p.type === entry.type);
-            return {
-                ...entry,
-                net: ofType.reduce((sum, p) => sum + ((p.income || 0) - (p.expenditure || 0)), 0),
-                participants: ofType.reduce((sum, p) => sum + (p.participantCount || 0), 0)
-            };
-        }),
-        mostAttended: [...completed]
-            .sort((a, b) => (b.participantCount || 0) - (a.participantCount || 0))
-            .slice(0, 5)
+        found: true,
+        valid: true,
+        certificate,
+        message: `Valid. Issued to ${certificate.studentName} on ${formatDateLong(certificate.issuedOn)}.`
     };
 }
 
 /* ==========================================================================
-   FUNNEL
+   VIEWS
    ========================================================================== */
 
-/**
- * Application to enrolment, as a funnel. The number worth watching is not the
- * conversion rate but the count sitting at "approved" — those are families who
- * have been told yes and are not yet on any register.
- */
-export async function admissionFunnel(branchId = null, { months = 6 } = {}) {
-    const since = `${lastMonths(months)[0]}-01`;
-    const all = (await admissions$.all())
-        .filter((a) => !branchId || a.branchId === branchId)
-        .filter((a) => (a.appliedOn || '') >= since);
+/** The certificate register. */
+export async function listCertificates({ branchId = null, studentId = null, programId = null, status = null } = {}) {
+    let rows = await certificates$.all();
 
-    const count = (status) => all.filter((a) => a.status === status).length;
+    if (branchId) rows = rows.filter((c) => c.branchId === branchId);
+    if (studentId) rows = rows.filter((c) => c.studentId === studentId);
+    if (programId) rows = rows.filter((c) => c.programId === programId);
+    if (status) rows = rows.filter((c) => c.status === status);
 
-    const applied = all.length;
-    const enrolled = count(ADMISSION_STATUS.ENROLLED);
-    const decided = enrolled + count(ADMISSION_STATUS.REJECTED);
-
-    return {
-        stages: [
-            { key: 'applied', label: 'Applied', value: applied },
-            { key: 'reviewing', label: 'In review', value: count(ADMISSION_STATUS.SUBMITTED) + count(ADMISSION_STATUS.REVIEWING) },
-            { key: 'approved', label: 'Approved', value: count(ADMISSION_STATUS.APPROVED) },
-            { key: 'enrolled', label: 'Enrolled', value: enrolled }
-        ],
-        conversionRate: decided ? Math.round((enrolled / decided) * 100) : null,
-        awaitingEnrolment: count(ADMISSION_STATUS.APPROVED)
-    };
+    return rows
+        .map((c) => ({
+            ...c,
+            templateName: TEMPLATES.find((t) => t.id === c.templateId)?.name || c.templateId,
+            levelLabel: levelLabel(c.level)
+        }))
+        .sort((a, b) => b.issuedOn.localeCompare(a.issuedOn) || b.serial.localeCompare(a.serial));
 }
 
-/* ==========================================================================
-   COMPOSITE
-   ========================================================================== */
-
 /**
- * Everything the analytics page needs, resolved in parallel with each panel
- * isolated: one slow or broken panel must not blank the whole dashboard.
+ * Everything the print view needs, resolved here so the printable page has no
+ * queries of its own and can be rendered into a new window synchronously.
  */
-export async function analyticsOverview({ branchId = null, months = 12, from = null, to = null } = {}) {
-    session.require('report.view', 'view analytics');
-
-    const range = {
-        from: from || `${lastMonths(months)[0]}-01`,
-        to: to || localDate()
-    };
-
-    const panels = await Promise.allSettled([
-        executiveKPIs(branchId),
-        studentGrowth(months, branchId),
-        revenueTrend(months, branchId),
-        attendanceTrendSeries(months, branchId),
-        collectionTrend(months, branchId),
-        branchComparison(range),
-        teacherPerformance({ ...range, branchId }),
-        programAnalytics(branchId, range),
-        admissionFunnel(branchId, { months: 6 }),
-        profitAndLoss({ ...range, branchId })
+export async function printData(id) {
+    const certificate = await certificates$.findOrFail(id);
+    const [student, institute, signatory] = await Promise.all([
+        students$.find(certificate.studentId),
+        settings$.get('institute', {}),
+        staff$.find(certificate.issuedBy).catch(() => null)
     ]);
 
-    const [kpis, growth, revenue, attendance, collection, branches, teachers, programs, funnel, pl] =
-        panels.map((panel) => (panel.status === 'fulfilled' ? panel.value : null));
-
-    const failed = panels
-        .map((panel, index) => (panel.status === 'rejected' ? PANEL_NAMES[index] : null))
-        .filter(Boolean);
-
     return {
-        range, months,
-        kpis, growth, revenue, attendance, collection,
-        branches, teachers, programs, funnel, profitAndLoss: pl,
-        failed
+        certificate,
+        student,
+        institute,
+        signatory,
+        verifyHint: `Verify this certificate at the school office quoting serial ${certificate.serial}.`
     };
 }
 
-const PANEL_NAMES = [
-    'headline figures', 'student growth', 'revenue', 'attendance', 'collection',
-    'branches', 'teachers', 'programmes', 'admissions', 'profit and loss'
-];
+/** Headline figures for the certificates page. */
+export async function certificateSummary(branchId = null) {
+    const rows = await listCertificates({ branchId });
+    const year = String(academicYearOf().start);
 
-export { STUDENT_STATUS };
+    return {
+        total: rows.length,
+        thisYear: rows.filter((c) => (c.academicYear || '').startsWith(year)).length,
+        revoked: rows.filter((c) => c.status === 'revoked').length,
+        overridden: rows.filter((c) => c.overridden).length,
+        byTemplate: TEMPLATES
+            .map((t) => ({ id: t.id, name: t.name, count: rows.filter((c) => c.templateId === t.id).length }))
+            .filter((row) => row.count > 0),
+        latest: rows[0] || null
+    };
+}
+
+/* ------------------------------------------------------------------ HELPERS */
+
+function formatSerial(sequence, year) {
+    return `NAT/CRT/${String(year).slice(-2)}/${String(sequence).padStart(4, '0')}`;
+}
+

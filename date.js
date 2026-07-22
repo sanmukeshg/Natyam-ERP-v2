@@ -1,266 +1,317 @@
 /**
- * NATYAM ERP 2.0 — Backup and restore service
+ * NATYAM ERP 2.0 — Batch service
  *
- * This application stores everything in one browser on one machine. There is
- * no server holding a copy. If the laptop is stolen, the profile is reset or
- * the browser decides to reclaim space, the school's entire record goes with
- * it — eighty-seven students, four years of attendance, every receipt.
+ * A batch is where a level, a teacher, a room and a timetable meet, and almost
+ * every conflict the school actually experiences is a collision between two of
+ * those. This module enforces the ones that matter: a teacher cannot be in two
+ * halls at once, a hall cannot hold two batches at once, and a batch cannot be
+ * closed while students are still sitting in it.
  *
- * So backup is not a nice-to-have feature tucked in settings; it is the only
- * thing standing between the school and total loss, and it is written
- * accordingly: a backup file is self-describing, a restore states plainly what
- * it is about to destroy, and a partial restore is impossible.
+ * 1.0 had none of these checks. It was possible — and did happen — to schedule
+ * two batches into Hall A on Saturday morning, which nobody discovered until
+ * both sets of parents arrived.
  */
 
 import { bus, EVENTS } from '../core/bus.js';
 import { session } from '../core/session.js';
-import { db } from '../core/db.js';
-import { APP, SCHEMA, STORE_NAMES, CAPABILITIES } from '../config/app.config.js';
-import { nowISO, localDate, formatDateTime } from '../utils/date.js';
-import { downloadFile } from '../utils/dom.js';
-import { settings$ } from '../data/repositories.js';
+import { localDate, dayName, addDays } from '../utils/date.js';
+import { LEVELS, levelLabel } from '../config/app.config.js';
+import { batches$, students$, staff$, attendance$, AttendanceMath } from '../data/repositories.js';
 
-const FILE_KIND = 'natyam-erp-backup';
-
-/* ==========================================================================
-   EXPORT
-   ========================================================================== */
-
-/**
- * Builds a complete backup object.
- *
- * The envelope matters as much as the data. A bare dump of object stores is
- * unreadable in two years' time; this records the app version, the schema
- * version, when it was taken and by whom, so a future restore can tell whether
- * it understands the file before it starts overwriting anything.
- */
-export async function buildBackup({ note = null } = {}) {
-    // db.exportAll() returns an envelope — { format, schemaVersion, exportedAt,
-    // counts, data } — and the store map is the `data` property inside it.
-    // Taking the envelope whole put the records one level too deep, so every
-    // backup file carried five sections named after envelope fields and no
-    // store data that restore could recognise. Restore then filtered all five
-    // out, cleared the database and wrote nothing back.
-    const exported = await db.exportAll();
-    const data = exported.data;
-    const counts = Object.fromEntries(Object.entries(data).map(([store, rows]) => [store, rows.length]));
-
-    return {
-        kind: FILE_KIND,
-        app: APP.name,
-        appVersion: APP.version,
-        schemaVersion: SCHEMA.version,
-        takenAt: nowISO(),
-        takenBy: session.actorName(),
-        note: note?.trim() || null,
-        counts,
-        totalRecords: Object.values(counts).reduce((a, b) => a + b, 0),
-        data
-    };
-}
-
-/** Builds a backup and hands it to the browser as a download. */
-export async function downloadBackup({ note = null } = {}) {
-    session.require(CAPABILITIES.BACKUP_MANAGE, 'take a backup');
-
-    const backup = await buildBackup({ note });
-    const filename = `natyam-backup-${localDate()}.json`;
-
-    downloadFile(filename, JSON.stringify(backup, null, 2), 'application/json');
-    await settings$.set('lastBackupAt', backup.takenAt);
-
-    return { filename, ...summarise(backup) };
-}
-
-/** When the school last took a backup, and whether that is long enough ago to worry. */
-export async function backupStatus() {
-    const last = await settings$.get('lastBackupAt', null);
-    if (!last) {
-        return { everBackedUp: false, lastAt: null, ageDays: null, stale: true, message: 'No backup has ever been taken from this browser.' };
-    }
-
-    const ageDays = Math.floor((Date.now() - new Date(last).getTime()) / 86400000);
-    return {
-        everBackedUp: true,
-        lastAt: last,
-        ageDays,
-        stale: ageDays > 7,
-        message: ageDays === 0
-            ? `Last backup taken today at ${formatDateTime(last).split(', ').pop()}.`
-            : `Last backup was ${ageDays} day${ageDays === 1 ? '' : 's'} ago.`
-    };
-}
+const DAY_CODES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+export const WEEK = Object.freeze(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']);
 
 /* ==========================================================================
-   INSPECTION
+   SCHEDULING RULES
    ========================================================================== */
 
-/**
- * Reads and validates a backup file without writing anything.
- *
- * Always called before a restore so the confirmation dialog can say "this file
- * holds 87 students from 3 July" rather than asking the user to accept an
- * irreversible action on faith.
- */
-export async function inspectBackup(file) {
-    let parsed;
-    try {
-        parsed = JSON.parse(await file.text());
-    } catch {
-        throw new Error('That file is not readable as a backup. It should be the .json file this app produced.');
-    }
-
-    if (parsed.kind !== FILE_KIND) {
-        throw new Error('That file was not produced by NATYAM ERP. Restoring it could corrupt the school’s records.');
-    }
-    if (!parsed.data || typeof parsed.data !== 'object') {
-        throw new Error('That backup file is missing its data section and cannot be restored.');
-    }
-
-    const unknownStores = Object.keys(parsed.data).filter((store) => !STORE_NAMES.includes(store));
-    const newerSchema = (parsed.schemaVersion || 0) > SCHEMA.version;
-
-    return {
-        backup: parsed,
-        ...summarise(parsed),
-        unknownStores,
-        newerSchema,
-        warnings: [
-            newerSchema && 'This backup came from a newer version of the app. Some data may not be understood.',
-            unknownStores.length && `${unknownStores.length} unrecognised section${unknownStores.length === 1 ? '' : 's'} will be ignored.`
-        ].filter(Boolean)
-    };
+/** Do two time ranges on the same day overlap? Touching ends do not count. */
+function overlaps(a, b) {
+    return a.startTime < b.endTime && b.startTime < a.endTime;
 }
 
-/* ==========================================================================
-   RESTORE
-   ========================================================================== */
+function sharesDay(a, b) {
+    return (a.days || []).some((d) => (b.days || []).includes(d));
+}
 
 /**
- * Replaces the entire database with the contents of a backup.
+ * Finds every scheduling conflict a proposed batch would create.
  *
- * Destructive and deliberately so — a "merge" restore sounds safer and is not:
- * it silently produces two copies of every student whose id changed, and the
- * school discovers this months later. What actually protects the user is a
- * safety copy of the current state, taken and offered for download before
- * anything is overwritten.
- *
- * @param {object} backup            A backup object from inspectBackup.
- * @param {boolean} [options.safetyCopy=true]  Download current data first.
+ * Returns a list rather than throwing on the first, because a badly-timed new
+ * batch typically clashes with the teacher *and* the room, and being told
+ * about them one at a time is three round trips of frustration.
  */
-export async function restore(backup, { safetyCopy = true } = {}) {
-    session.require(CAPABILITIES.BACKUP_MANAGE, 'restore from a backup');
+export async function findConflicts(candidate) {
+    const others = (await batches$.active()).filter((b) => b.id !== candidate.id && b.status === 'active');
+    const conflicts = [];
 
-    if (backup.kind !== FILE_KIND) throw new Error('That is not a NATYAM ERP backup file.');
+    for (const other of others) {
+        if (!sharesDay(candidate, other) || !overlaps(candidate, other)) continue;
 
-    let safety = null;
-    if (safetyCopy) {
-        const current = await buildBackup({ note: 'Automatic safety copy taken before a restore' });
-        if (current.totalRecords > 0) {
-            downloadFile(`natyam-before-restore-${localDate()}.json`, JSON.stringify(current), 'application/json');
-            safety = summarise(current);
+        const days = (candidate.days || []).filter((d) => (other.days || []).includes(d));
+        const when = `${days.join(', ')} ${other.startTime}–${other.endTime}`;
+
+        if (candidate.teacherId && candidate.teacherId === other.teacherId) {
+            conflicts.push({ type: 'teacher', batch: other, message: `The same teacher already takes ${other.name} on ${when}.` });
+        }
+        if (candidate.room && candidate.branchId === other.branchId && candidate.room === other.room) {
+            conflicts.push({ type: 'room', batch: other, message: `${candidate.room} is occupied by ${other.name} on ${when}.` });
         }
     }
 
-    const known = Object.fromEntries(
-        Object.entries(backup.data).filter(([store]) => STORE_NAMES.includes(store))
-    );
-
-    // A restore that recognises nothing must not proceed. `importAll` with
-    // `clear` would empty every store and write nothing back, which is the
-    // worst possible outcome of an operation the user reached for precisely
-    // because they wanted their data returned to them.
-    if (!Object.keys(known).length) {
-        throw new Error(
-            'This backup contains no recognisable data, so nothing was changed. '
-            + 'The file may be from a different application or an incompatible version.'
-        );
-    }
-
-    await db.importAll(known, { mode: 'replace' });
-    await settings$.set('lastRestoreAt', nowISO());
-
-    const result = { ...summarise(backup), safety };
-    bus.emit(EVENTS.BACKUP_RESTORED, result);
-    bus.emit(EVENTS.DATA_IMPORTED, result);
-
-    return result;
+    return conflicts;
 }
 
 /* ==========================================================================
-   PARTIAL EXPORT
+   LIFECYCLE
    ========================================================================== */
 
-/**
- * Exports one store as JSON — the answer to "send me the student list" that
- * does not involve handing over the whole ledger. Not a backup, and labelled
- * so nobody mistakes it for one.
- */
-export async function exportStore(storeName, { pretty = true } = {}) {
-    session.require(CAPABILITIES.BACKUP_MANAGE, 'export data');
+export async function createBatch(data, { allowConflicts = false } = {}) {
+    session.require('student.edit', 'create a batch');
 
-    if (!STORE_NAMES.includes(storeName)) throw new Error(`There is no "${storeName}" data to export.`);
+    const candidate = normalise(data);
+    assertShape(candidate);
 
-    const rows = await db.all(storeName);
-    const payload = {
-        kind: 'natyam-erp-extract',
-        store: storeName,
-        app: APP.name,
-        takenAt: nowISO(),
-        count: rows.length,
-        rows
-    };
+    const conflicts = await findConflicts(candidate);
+    if (conflicts.length && !allowConflicts) {
+        const err = new Error(`This clashes with an existing batch. ${conflicts[0].message}`);
+        err.conflicts = conflicts;
+        throw err;
+    }
 
-    downloadFile(`natyam-${storeName}-${localDate()}.json`, JSON.stringify(payload, null, pretty ? 2 : 0), 'application/json');
-    return { store: storeName, count: rows.length };
+    const batch = await batches$.create(candidate);
+    bus.emit(EVENTS.BATCH_CREATED, { batch });
+    return { batch, conflicts };
 }
 
-/**
- * Wipes everything and starts again with fresh seed data. Genuinely useful
- * when a school has been trialling the app and wants to begin for real, and
- * genuinely dangerous, so it demands a safety copy first like a restore does.
- */
-export async function resetEverything({ safetyCopy = true } = {}) {
-    session.require(CAPABILITIES.BACKUP_MANAGE, 'erase all data');
+export async function updateBatch(id, changes, { allowConflicts = false } = {}) {
+    session.require('student.edit', 'edit a batch');
 
-    if (safetyCopy) {
-        const current = await buildBackup({ note: 'Automatic safety copy taken before a full reset' });
-        if (current.totalRecords > 0) {
-            downloadFile(`natyam-before-reset-${localDate()}.json`, JSON.stringify(current), 'application/json');
+    const existing = await batches$.findOrFail(id);
+    const candidate = normalise({ ...existing, ...changes, id });
+    assertShape(candidate);
+
+    /* Changing the level of a batch that has students in it would silently
+       leave them at the wrong level for promotion and certification. */
+    if (candidate.level !== existing.level) {
+        const roster = await students$.byBatch(id);
+        if (roster.length) {
+            throw new Error(
+                `${roster.length} student${roster.length === 1 ? ' is' : 's are'} enrolled at ${levelLabel(existing.level)} in this batch. ` +
+                'Move them out before changing the level.'
+            );
         }
     }
 
-    for (const store of STORE_NAMES) {
-        await db.clear(store);
+    const conflicts = await findConflicts(candidate);
+    if (conflicts.length && !allowConflicts) {
+        const err = new Error(`This clashes with an existing batch. ${conflicts[0].message}`);
+        err.conflicts = conflicts;
+        throw err;
     }
 
-    bus.emit(EVENTS.DATA_IMPORTED, { reset: true });
-    return true;
+    const batch = await batches$.update(id, candidate);
+    bus.emit(EVENTS.BATCH_UPDATED, { batch, before: existing });
+    return { batch, conflicts };
+}
+
+/**
+ * Closes a batch. Refuses while students remain, and offers the caller the
+ * roster so the UI can propose moving them somewhere rather than just saying
+ * no. A closed batch keeps its attendance history for reporting.
+ */
+export async function closeBatch(id, { reason = null, moveTo = null } = {}) {
+    session.require('student.edit', 'close a batch');
+
+    const batch = await batches$.findOrFail(id);
+    const roster = await students$.byBatch(id);
+
+    if (roster.length && !moveTo) {
+        const err = new Error(`${batch.name} still has ${roster.length} student${roster.length === 1 ? '' : 's'}. Choose where they should go.`);
+        err.roster = roster;
+        throw err;
+    }
+
+    if (roster.length && moveTo) {
+        const target = await batches$.findOrFail(moveTo);
+        if (target.status !== 'active') throw new Error(`${target.name} is not active.`);
+        if (target.level !== batch.level) throw new Error(`${target.name} teaches ${levelLabel(target.level)}, not ${levelLabel(batch.level)}.`);
+
+        const existing = await students$.byBatch(moveTo);
+        if (target.capacity && existing.length + roster.length > target.capacity) {
+            throw new Error(`${target.name} seats ${target.capacity} and already has ${existing.length}. It cannot take ${roster.length} more.`);
+        }
+        for (const student of roster) {
+            await students$.update(student.id, { batchId: moveTo, branchId: target.branchId });
+        }
+    }
+
+    const closed = await batches$.update(id, {
+        status: 'closed',
+        closedOn: localDate(),
+        closeReason: reason?.trim() || null
+    });
+
+    bus.emit(EVENTS.BATCH_CLOSED, { batch: closed, moved: roster.length });
+    return { batch: closed, moved: roster.length };
+}
+
+export async function reopenBatch(id) {
+    session.require('student.edit', 'reopen a batch');
+    const batch = await batches$.update(id, { status: 'active', closedOn: null, closeReason: null });
+    bus.emit(EVENTS.BATCH_UPDATED, { batch });
+    return batch;
+}
+
+/* ==========================================================================
+   VIEWS
+   ========================================================================== */
+
+/** The batch list, with occupancy, teacher name and recent attendance rate. */
+export async function listBatches(branchId = null, { includeClosed = false } = {}) {
+    const [withOccupancy, teachers, recent] = await Promise.all([
+        batches$.withOccupancy(branchId),
+        staff$.teachers(),
+        attendance$.between(addDays(localDate(), -30), localDate(), branchId)
+    ]);
+
+    const teacherName = new Map(teachers.map((t) => [t.id, t.name]));
+    const byBatch = new Map();
+    for (const row of recent) {
+        if (!byBatch.has(row.batchId)) byBatch.set(row.batchId, []);
+        byBatch.get(row.batchId).push(row);
+    }
+
+    let rows = withOccupancy;
+    if (includeClosed) {
+        const all = (await batches$.all()).filter((b) => !branchId || b.branchId === branchId);
+        const seen = new Set(rows.map((r) => r.id));
+        rows = rows.concat(all.filter((b) => !seen.has(b.id)).map((b) => ({ ...b, enrolled: 0, seatsLeft: 0, occupancy: 0 })));
+    }
+
+    return rows
+        .map((batch) => ({
+            ...batch,
+            teacherName: teacherName.get(batch.teacherId) || 'Unassigned',
+            levelLabel: levelLabel(batch.level),
+            schedule: describeSchedule(batch),
+            attendanceRate: AttendanceMath.rateOf(byBatch.get(batch.id) || [])
+        }))
+        .sort((a, b) => a.levelOrder - b.levelOrder || a.name.localeCompare(b.name));
+}
+
+/** Everything the batch detail view shows. */
+export async function batchDetail(id) {
+    const batch = await batches$.findOrFail(id);
+    const [roster, teacher, recent, conflicts] = await Promise.all([
+        students$.byBatch(id),
+        batch.teacherId ? staff$.find(batch.teacherId) : null,
+        attendance$.between(addDays(localDate(), -60), localDate()),
+        findConflicts(batch)
+    ]);
+
+    const mine = recent.filter((r) => r.batchId === id);
+    const perStudent = new Map();
+    for (const row of mine) {
+        if (!perStudent.has(row.studentId)) perStudent.set(row.studentId, []);
+        perStudent.get(row.studentId).push(row);
+    }
+
+    return {
+        batch: {
+            ...batch,
+            levelLabel: levelLabel(batch.level),
+            schedule: describeSchedule(batch),
+            enrolled: roster.length,
+            seatsLeft: batch.capacity ? Math.max(0, batch.capacity - roster.length) : null,
+            occupancy: batch.capacity ? Math.round((roster.length / batch.capacity) * 100) : null
+        },
+        teacher,
+        conflicts,
+        attendanceRate: AttendanceMath.rateOf(mine),
+        roster: roster.map((student) => ({
+            ...student,
+            attendanceRate: AttendanceMath.rateOf(perStudent.get(student.id) || [])
+        })).sort((a, b) => (a.attendanceRate ?? 101) - (b.attendanceRate ?? 101))
+    };
+}
+
+/**
+ * The week's timetable, grouped by day and sorted by start time. This is the
+ * view that makes a double-booking obvious at a glance, which is why it exists
+ * as well as the conflict check.
+ */
+export async function timetable(branchId = null) {
+    const [batches, teachers] = await Promise.all([batches$.active(branchId), staff$.teachers()]);
+    const teacherName = new Map(teachers.map((t) => [t.id, t.name]));
+
+    return WEEK.map((day) => ({
+        day,
+        label: dayName(nextDateFor(day)),
+        sessions: batches
+            .filter((b) => (b.days || []).includes(day))
+            .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''))
+            .map((b) => ({
+                ...b,
+                teacherName: teacherName.get(b.teacherId) || 'Unassigned',
+                levelLabel: levelLabel(b.level)
+            }))
+    }));
+}
+
+/** A teacher's own week — the teacher dashboard's schedule panel. */
+export async function teacherSchedule(teacherId) {
+    const batches = await batches$.byTeacher(teacherId);
+    const rosters = await Promise.all(batches.map((b) => students$.byBatch(b.id)));
+
+    return WEEK.map((day) => ({
+        day,
+        sessions: batches
+            .map((b, i) => ({ ...b, enrolled: rosters[i].length, levelLabel: levelLabel(b.level) }))
+            .filter((b) => (b.days || []).includes(day))
+            .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''))
+    })).filter((d) => d.sessions.length);
 }
 
 /* ------------------------------------------------------------------ HELPERS */
 
-/** The human summary of a backup: what a person needs to decide about it. */
-function summarise(backup) {
-    const counts = backup.counts || Object.fromEntries(
-        Object.entries(backup.data || {}).map(([store, rows]) => [store, rows.length])
-    );
-
+function normalise(data) {
+    const level = LEVELS.find((l) => l.value === data.level);
     return {
-        takenAt: backup.takenAt,
-        takenBy: backup.takenBy,
-        note: backup.note,
-        appVersion: backup.appVersion,
-        schemaVersion: backup.schemaVersion,
-        totalRecords: backup.totalRecords ?? Object.values(counts).reduce((a, b) => a + b, 0),
-        highlights: [
-            { label: 'Students', count: counts.students || 0 },
-            { label: 'Attendance records', count: counts.attendance || 0 },
-            { label: 'Invoices', count: counts.invoices || 0 },
-            { label: 'Payments', count: counts.payments || 0 },
-            { label: 'Ledger entries', count: counts.ledgerEntries || 0 },
-            { label: 'Certificates', count: counts.certificates || 0 }
-        ],
-        counts
+        ...data,
+        name: String(data.name || '').trim(),
+        code: String(data.code || '').trim().toUpperCase(),
+        room: data.room?.trim() || null,
+        days: Array.isArray(data.days) ? WEEK.filter((d) => data.days.includes(d)) : [],
+        capacity: Number(data.capacity) || 0,
+        levelOrder: level?.order || 99,
+        status: data.status || 'active'
     };
+}
+
+function assertShape(batch) {
+    if (!batch.name) throw new Error('A batch needs a name.');
+    if (!batch.code) throw new Error('A batch needs a short code, e.g. HYD-PRA-A.');
+    if (!batch.branchId) throw new Error('Choose which branch this batch runs at.');
+    if (!batch.level) throw new Error('Choose the level this batch teaches.');
+    if (!batch.days.length) throw new Error('Choose at least one day the batch meets.');
+    if (!batch.startTime || !batch.endTime) throw new Error('Give the start and end time.');
+    if (batch.endTime <= batch.startTime) throw new Error('The batch cannot end before it starts.');
+    if (batch.capacity < 0) throw new Error('Capacity cannot be negative.');
+}
+
+function describeSchedule(batch) {
+    if (!batch.days?.length) return 'Not scheduled';
+    const days = WEEK.filter((d) => batch.days.includes(d)).join(', ');
+    return `${days} · ${batch.startTime}–${batch.endTime}`;
+}
+
+
+
+/** The next calendar date falling on a given day code, for label formatting. */
+function nextDateFor(dayCode) {
+    const target = DAY_CODES.indexOf(dayCode);
+    const d = new Date();
+    while (d.getDay() !== target) d.setDate(d.getDate() + 1);
+    return localDate(d);
 }

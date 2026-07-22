@@ -1,283 +1,434 @@
 /**
- * NATYAM ERP 2.0 — Staff service
+ * NATYAM ERP 2.0 — Settings service
  *
- * Staff, teachers and the teacher dashboard. A dance school's staff record is
- * small but load-bearing: it decides who can be assigned to a batch, what the
- * salary run pays out, and whose name appears on a certificate.
+ * Institute details, branches, academic years, fee plans, users and roles.
+ * These are the records everything else points at, which makes them the ones
+ * where a careless delete does the most damage — so almost every operation
+ * here is a check that something is not still in use before allowing it to
+ * change.
  *
- * The rule worth stating: a teacher who leaves must not silently disappear
- * from the batches they were running. Deactivating a teacher reports the
- * batches left without one rather than orphaning them — which is what 1.0 did,
- * producing batches whose teacher field pointed at a record that no longer
- * resolved and a timetable column reading "undefined".
+ * Branch administration lives in this module rather than in a service of its
+ * own. A branch has three operations — create, rename, deactivate — and one
+ * interesting rule (you cannot close a branch with active students). A
+ * separate file for that would be an empty ceremony; what matters is that the
+ * rule exists and lives in the service layer.
  */
 
 import { bus, EVENTS } from '../core/bus.js';
 import { session } from '../core/session.js';
-import { localDate, monthKey, daysBetween, lastMonths, addDays } from '../utils/date.js';
-import { staff$, batches$, students$, salaries$, attendance$, programs$, AttendanceMath } from '../data/repositories.js';
-import { teacherSchedule } from './batches.service.js';
-
-export const STAFF_ROLES = Object.freeze([
-    { value: 'teacher',  label: 'Teacher',      teaches: true },
-    { value: 'musician', label: 'Musician',     teaches: false },
-    { value: 'admin',    label: 'Administration', teaches: false },
-    { value: 'support',  label: 'Support',      teaches: false }
-]);
+import { db } from '../core/db.js';
+import { localDate } from '../utils/date.js';
+import { toPaise } from '../utils/money.js';
+import { CAPABILITIES, PREFERENCE_DEFAULTS, curriculum, levelLabel, roleTable, roleCapabilities, roleLabel, configureCurriculum, configureRoles, DEFAULT_FEE_FREQUENCY, feeFrequency } from '../config/app.config.js';
+import {
+    settings$, branches$, academicYears$, feePlans$, users$, students$, staff$, batches$, invoices$
+} from '../data/repositories.js';
 
 /* ==========================================================================
-   LIFECYCLE
+   INSTITUTE
    ========================================================================== */
 
-export async function hire(data) {
-    session.require('staff.edit', 'add a staff member');
+const INSTITUTE_DEFAULTS = {
+    name: 'NATYAM — School of Kuchipudi',
+    tagline: 'Classical Kuchipudi, taught in the traditional guru-shishya parampara',
+    principal: '',
+    email: '',
+    phone: '',
+    address: '',
+    website: '',
+    gstin: '',
+    logo: null
+};
 
-    const record = normalise(data);
-    assertShape(record);
-
-    if (record.employeeNo) {
-        const clash = (await staff$.all()).find((s) => s.employeeNo === record.employeeNo);
-        if (clash) throw new Error(`Employee number ${record.employeeNo} already belongs to ${clash.name}.`);
-    } else {
-        record.employeeNo = await nextEmployeeNumber();
-    }
-
-    const member = await staff$.create(record);
-    bus.emit(EVENTS.STAFF_CREATED, { staff: member });
-    return member;
+export async function institute() {
+    const stored = await settings$.get('institute', {});
+    return { ...INSTITUTE_DEFAULTS, ...stored };
 }
 
-export async function updateStaff(id, changes) {
-    session.require('staff.edit', 'edit a staff member');
+export async function updateInstitute(changes) {
+    session.require('settings.edit', 'change the institute details');
 
-    const existing = await staff$.findOrFail(id);
-    const record = normalise({ ...existing, ...changes, id });
-    assertShape(record);
+    const current = await institute();
+    const next = { ...current, ...changes };
 
-    // Demoting a teacher out of a teaching role while they still run batches
-    // would leave those batches unassignable through the normal UI.
-    if (existing.role === 'teacher' && record.role !== 'teacher') {
-        const owned = await batches$.byTeacher(id);
-        if (owned.length) {
-            throw new Error(`${existing.name} still teaches ${owned.length} batch${owned.length === 1 ? '' : 'es'}. Reassign them first.`);
-        }
-    }
+    if (!next.name?.trim()) throw new Error('The school needs a name — it appears on every receipt and certificate.');
+    if (next.email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(next.email)) throw new Error('That email address does not look right.');
 
-    const member = await staff$.update(id, record);
-    bus.emit(EVENTS.STAFF_UPDATED, { staff: member, before: existing });
-    return member;
+    await settings$.set('institute', next);
+    bus.emit(EVENTS.SETTINGS_CHANGED, { key: 'institute', value: next });
+    return next;
+}
+
+/** Arbitrary key/value settings — opening balance, fee reminders, and so on. */
+export async function getSetting(key, fallback = null) {
+    return settings$.get(key, fallback);
+}
+
+export async function setSetting(key, value) {
+    session.require('settings.edit', 'change a setting');
+    await settings$.set(key, value);
+    bus.emit(EVENTS.SETTINGS_CHANGED, { key, value });
+    return value;
 }
 
 /**
- * Ends someone's employment. Batches they ran are reported back, optionally
- * reassigned in the same call, and never left pointing at an inactive person.
+ * Settings keys under which the school's edited curriculum ladder and role
+ * matrix are stored once those editors exist. Named here so the future editor
+ * and this loader can never disagree on the key.
  */
-export async function deactivate(id, { reason, lastDay = null, reassignTo = null } = {}) {
-    session.require('staff.edit', 'deactivate a staff member');
+const STRUCTURAL_OVERRIDE_KEYS = Object.freeze({
+    curriculum: 'curriculum.override',
+    roles: 'roles.override'
+});
 
-    const member = await staff$.findOrFail(id);
-    if (!reason?.trim()) throw new Error('Record why this staff member is leaving.');
-
-    const owned = await batches$.byTeacher(id);
-    if (owned.length && !reassignTo) {
-        const err = new Error(`${member.name} teaches ${owned.length} batch${owned.length === 1 ? '' : 'es'}. Choose who takes them over.`);
-        err.batches = owned;
-        throw err;
+/**
+ * Installs any database-stored curriculum/role overrides into the resolution
+ * seam in app.config, once, at boot — before the session hydrates, so a
+ * customised matrix already governs capability gating.
+ *
+ * No override has been written yet, so both reads return null and this is a
+ * genuine no-op that leaves the frozen defaults in force. A malformed override
+ * must never brick start-up, so failures fall back to defaults with a warning
+ * rather than propagating.
+ */
+export async function applyStructuralOverrides() {
+    try {
+        const [levels, roles] = await Promise.all([
+            getSetting(STRUCTURAL_OVERRIDE_KEYS.curriculum, null),
+            getSetting(STRUCTURAL_OVERRIDE_KEYS.roles, null)
+        ]);
+        configureCurriculum(levels);
+        configureRoles(roles);
+    } catch (err) {
+        console.warn('Could not load structural overrides; using built-in defaults.', err);
+        configureCurriculum(null);
+        configureRoles(null);
     }
-
-    if (owned.length && reassignTo) {
-        const replacement = await staff$.findOrFail(reassignTo);
-        if (replacement.role !== 'teacher' || replacement.status !== 'active') {
-            throw new Error(`${replacement.name} is not an active teacher.`);
-        }
-        for (const batch of owned) {
-            await batches$.update(batch.id, { teacherId: reassignTo });
-        }
-    }
-
-    const updated = await staff$.update(id, {
-        status: 'inactive',
-        leftOn: lastDay || localDate(),
-        leaveReason: reason.trim()
-    });
-
-    bus.emit(EVENTS.STAFF_UPDATED, { staff: updated, before: member });
-    return { staff: updated, reassigned: owned.length };
-}
-
-export async function reactivate(id) {
-    session.require('staff.edit', 'reactivate a staff member');
-    const member = await staff$.update(id, { status: 'active', leftOn: null, leaveReason: null });
-    bus.emit(EVENTS.STAFF_UPDATED, { staff: member });
-    return member;
 }
 
 /* ==========================================================================
-   VIEWS
+   BRANCHES
    ========================================================================== */
 
-/** The staff list with teaching load attached. */
-export async function listStaff(branchId = null, { includeInactive = false } = {}) {
-    const rows = includeInactive
-        ? (await staff$.all()).filter((s) => !branchId || s.branchId === branchId)
-        : await staff$.activeStaff(branchId);
-
-    const [batches, students] = await Promise.all([batches$.active(), students$.active()]);
-    const rosterCount = new Map();
-    for (const student of students) {
-        if (student.batchId) rosterCount.set(student.batchId, (rosterCount.get(student.batchId) || 0) + 1);
-    }
-
-    return rows
-        .map((member) => {
-            const own = batches.filter((b) => b.teacherId === member.id);
-            return {
-                ...member,
-                roleLabel: STAFF_ROLES.find((r) => r.value === member.role)?.label || member.role,
-                batchCount: own.length,
-                studentCount: own.reduce((sum, b) => sum + (rosterCount.get(b.id) || 0), 0),
-                weeklySessions: own.reduce((sum, b) => sum + (b.days?.length || 0), 0),
-                tenureDays: member.joinedOn ? daysBetween(member.joinedOn, localDate()) : 0
-            };
-        })
-        .sort((a, b) => a.name.localeCompare(b.name, 'en-IN'));
-}
-
-/**
- * The teacher dashboard: their week, their students, how reliably they mark
- * registers, and how their classes are attending.
- */
-export async function teacherDashboard(staffId) {
-    const member = await staff$.findOrFail(staffId);
-
-    const [schedule, batches, salaryHistory, allPrograms] = await Promise.all([
-        teacherSchedule(staffId),
-        batches$.byTeacher(staffId),
-        salaries$.forStaff(staffId),
-        programs$.all()
+export async function listBranches({ includeInactive = false } = {}) {
+    const rows = includeInactive ? await branches$.all() : await branches$.active();
+    const [students, staffRows, batchRows] = await Promise.all([
+        students$.active(), staff$.activeStaff(), batches$.active()
     ]);
 
-    const from = addDays(localDate(), -60);
-    const marks = await attendance$.between(from, localDate());
-    const mine = marks.filter((r) => batches.some((b) => b.id === r.batchId));
-
-    const rosters = await Promise.all(batches.map((b) => students$.byBatch(b.id)));
-    const students = rosters.flat();
-
-    const perBatch = batches.map((batch, index) => {
-        const rows = mine.filter((r) => r.batchId === batch.id);
-        return {
-            batch,
-            enrolled: rosters[index].length,
-            attendanceRate: AttendanceMath.rateOf(rows),
-            sessionsMarked: new Set(rows.map((r) => r.date)).size
-        };
-    });
-
-    return {
-        staff: member,
-        schedule,
-        batches: perBatch,
-        studentCount: students.length,
-        attendanceRate: AttendanceMath.rateOf(mine),
-        salaries: salaryHistory.slice(0, 12),
-        lastPaid: salaryHistory.find((s) => s.status === 'paid') || null,
-        programs: allPrograms
-            .filter((p) => p.leadStaffId === staffId || (p.staffIds || []).includes(staffId))
-            .sort((a, b) => b.date.localeCompare(a.date))
-            .slice(0, 8),
-        atRisk: perBatch.filter((b) => b.attendanceRate !== null && b.attendanceRate < 75)
-    };
-}
-
-/**
- * Teachers who can take a batch at a given level and time — the picker on the
- * batch form. Availability is computed rather than assumed, so a fully-booked
- * teacher is shown as such instead of being silently offered.
- */
-export async function availableTeachers({ branchId = null, days = [], startTime = null, endTime = null, excludeBatchId = null } = {}) {
-    const [teachers, batches] = await Promise.all([staff$.teachers(branchId), batches$.active()]);
-
-    return teachers.map((teacher) => {
-        const own = batches.filter((b) => b.teacherId === teacher.id && b.id !== excludeBatchId);
-        const clash = (days.length && startTime && endTime)
-            ? own.find((b) =>
-                (b.days || []).some((d) => days.includes(d)) &&
-                startTime < b.endTime && b.startTime < endTime)
-            : null;
-
-        return {
-            ...teacher,
-            load: own.length,
-            weeklySessions: own.reduce((sum, b) => sum + (b.days?.length || 0), 0),
-            available: !clash,
-            clashWith: clash ? clash.name : null
-        };
-    }).sort((a, b) => Number(b.available) - Number(a.available) || a.load - b.load);
-}
-
-/** Payroll cost by month — used by finance and the staff page header. */
-export async function payrollTrend(months = 6) {
-    const keys = lastMonths(months);
-    const rows = await Promise.all(keys.map((key) => salaries$.forPeriod(key)));
-
-    return keys.map((period, index) => ({
-        period,
-        gross: rows[index].reduce((s, r) => s + (r.gross || 0), 0),
-        net: rows[index].reduce((s, r) => s + (r.net || 0), 0),
-        paid: rows[index].filter((r) => r.status === 'paid').length,
-        pending: rows[index].filter((r) => r.status !== 'paid').length
+    return rows.map((branch) => ({
+        ...branch,
+        studentCount: students.filter((s) => s.branchId === branch.id).length,
+        staffCount: staffRows.filter((s) => s.branchId === branch.id).length,
+        batchCount: batchRows.filter((b) => b.branchId === branch.id).length
     }));
 }
 
-/** Headline staff figures. */
-export async function staffSummary(branchId = null) {
-    const active = await staff$.activeStaff(branchId);
-    const teachers = active.filter((s) => s.role === 'teacher');
-    const period = monthKey();
-    const salaries = await salaries$.forPeriod(period);
+export async function createBranch(data) {
+    session.require('settings.edit', 'add a branch');
 
-    return {
-        total: active.length,
-        teachers: teachers.length,
-        others: active.length - teachers.length,
-        monthlyWageBill: active.reduce((sum, s) => sum + (s.monthlySalary || 0), 0),
-        payrollRun: salaries.length > 0,
-        payrollPaid: salaries.filter((s) => s.status === 'paid').length,
-        payrollPending: salaries.filter((s) => s.status !== 'paid').length
+    const record = {
+        ...data,
+        name: String(data.name || '').trim(),
+        code: String(data.code || '').trim().toUpperCase(),
+        status: 'active'
     };
+
+    if (!record.name) throw new Error('A branch needs a name.');
+    if (!record.code) throw new Error('A branch needs a short code, e.g. HYD-C.');
+
+    const clash = (await branches$.all()).find((b) => b.code === record.code);
+    if (clash) throw new Error(`The code ${record.code} is already used by ${clash.name}.`);
+
+    const branch = await branches$.create(record);
+    bus.emit(EVENTS.SETTINGS_CHANGED, { key: 'branches', value: branch });
+    return branch;
 }
 
-/* ------------------------------------------------------------------ HELPERS */
+export async function updateBranch(id, changes) {
+    session.require('settings.edit', 'edit a branch');
+    const branch = await branches$.update(id, changes);
+    bus.emit(EVENTS.SETTINGS_CHANGED, { key: 'branches', value: branch });
+    return branch;
+}
 
-function normalise(data) {
-    return {
+/**
+ * Closes a branch. Refuses while anything still points at it — a branch with
+ * active students is a branch that is still open, whatever the record says.
+ */
+export async function closeBranch(id, { reason }) {
+    session.require('settings.edit', 'close a branch');
+
+    if (!reason?.trim()) throw new Error('Record why the branch is closing.');
+    const branch = await branches$.findOrFail(id);
+
+    const [students, staffRows, batchRows] = await Promise.all([
+        students$.active(id), staff$.activeStaff(id), batches$.active(id)
+    ]);
+
+    const blockers = [];
+    if (students.length) blockers.push(`${students.length} active student${students.length === 1 ? '' : 's'}`);
+    if (staffRows.length) blockers.push(`${staffRows.length} staff member${staffRows.length === 1 ? '' : 's'}`);
+    if (batchRows.length) blockers.push(`${batchRows.length} active batch${batchRows.length === 1 ? '' : 'es'}`);
+
+    if (blockers.length) {
+        throw new Error(`${branch.name} still has ${blockers.join(', ')}. Move or close them before closing the branch.`);
+    }
+
+    const closed = await branches$.update(id, { status: 'inactive', closedOn: localDate(), closeReason: reason.trim() });
+    bus.emit(EVENTS.SETTINGS_CHANGED, { key: 'branches', value: closed });
+    return closed;
+}
+
+/* ==========================================================================
+   ACADEMIC YEARS
+   ========================================================================== */
+
+/**
+ * Academic years, newest first.
+ *
+ * The field names here are `label`, `startsOn`, `endsOn` and `isCurrent`,
+ * which is what the schema indexes, the repository queries and the seed writes.
+ * This service had been reading `startDate`/`endDate` and writing `name`/
+ * `current` — three different vocabularies for one record — so listing the
+ * years threw on a field that never existed and the whole screen was dead.
+ */
+export async function listAcademicYears() {
+    return (await academicYears$.all())
+        .sort((a, b) => (b.startsOn || '').localeCompare(a.startsOn || ''));
+}
+
+export async function createAcademicYear(data) {
+    session.require('settings.edit', 'add an academic year');
+
+    if (!data.label?.trim()) throw new Error('Name the academic year, e.g. 2026–27.');
+    if (!data.startsOn || !data.endsOn) throw new Error('Give the start and end dates.');
+    if (data.endsOn <= data.startsOn) throw new Error('The year cannot end before it starts.');
+
+    const overlapping = (await academicYears$.all()).find((y) =>
+        data.startsOn <= y.endsOn && y.startsOn <= data.endsOn);
+    if (overlapping) throw new Error(`That overlaps with ${overlapping.label}.`);
+
+    const created = await academicYears$.create({
         ...data,
-        name: String(data.name || '').trim().replace(/\s+/g, ' '),
-        email: data.email?.trim().toLowerCase() || null,
-        specialisation: data.specialisation?.trim() || null,
-        monthlySalary: Math.round(Number(data.monthlySalary) || 0),
+        label: data.label.trim(),
+        isCurrent: 0
+    });
+
+    // The switch on the form is a request to make it current, and that has to
+    // go through makeCurrent so exactly one year holds the flag.
+    if (data.makeCurrent) return academicYears$.makeCurrent(created.id);
+    return created;
+}
+
+/** Makes a year current. The repository does the swap atomically. */
+export async function setCurrentYear(id) {
+    session.require('settings.edit', 'change the current academic year');
+    const year = await academicYears$.makeCurrent(id);
+    bus.emit(EVENTS.SETTINGS_CHANGED, { key: 'academicYear', value: year });
+    return year;
+}
+
+/* ==========================================================================
+   FEE PLANS
+   --------------------------------------------------------------------------
+   1.0 could create fee structures but never edit them, so a price rise meant
+   creating a parallel plan and hoping the right one got picked. Editing is
+   allowed here, with the one guard that matters: changing a plan does not
+   touch invoices already raised from it.
+   ========================================================================== */
+
+export async function listFeePlans({ includeInactive = false } = {}) {
+    const rows = includeInactive ? await feePlans$.all() : await feePlans$.active();
+    const counts = await Promise.all(rows.map((plan) => feePlans$.usageCount(plan.id)));
+
+    return rows.map((plan, i) => ({
+        ...plan,
+        levelLabel: levelLabel(plan.level, 'Any level'),
+        inUse: counts[i],
+        frequencyLabel: feeFrequency(plan.frequency).label,
+        // What the year adds up to, derived from the cadence rather than stored,
+        // so it stays correct if a future frequency is introduced.
+        yearlyTotal: (Number(plan.amount) || 0) * feeFrequency(plan.frequency).periodsPerYear
+    })).sort((a, b) => (a.levelOrder || 0) - (b.levelOrder || 0) || a.name.localeCompare(b.name));
+}
+
+export async function createFeePlan(data) {
+    session.require('settings.edit', 'create a fee plan');
+    return feePlans$.create(normalisePlan(data));
+}
+
+/**
+ * Edits a fee plan. Invoices already raised keep the amounts they were raised
+ * with — a bill the family has already been given does not change because the
+ * price list did. The caller is told how many students are affected going
+ * forward.
+ */
+export async function updateFeePlan(id, changes) {
+    session.require('settings.edit', 'edit a fee plan');
+
+    const existing = await feePlans$.findOrFail(id);
+    const plan = await feePlans$.update(id, normalisePlan({ ...existing, ...changes }));
+    const affected = await feePlans$.usageCount(id);
+
+    bus.emit(EVENTS.SETTINGS_CHANGED, { key: 'feePlans', value: plan });
+    return { plan, affected };
+}
+
+/** Retires a plan. Students already on it keep their existing invoices. */
+export async function retireFeePlan(id) {
+    session.require('settings.edit', 'retire a fee plan');
+
+    const inUse = await feePlans$.usageCount(id);
+    const plan = await feePlans$.update(id, { status: 'inactive', retiredOn: localDate() });
+
+    return { plan, inUse };
+}
+
+function normalisePlan(data) {
+    // The form supplies `amount` in paise. A plan written before the monthly
+    // change is read through its yearly figure so an edit never zeroes it.
+    const supplied = data.amount != null
+        ? data.amount
+        : (data.annualAmount != null ? Math.round(Number(data.annualAmount) / 12) : 0);
+    const amount = typeof supplied === 'number' ? supplied : toPaise(supplied || 0);
+    const record = {
+        ...data,
+        name: String(data.name || '').trim(),
+        frequency: data.frequency || DEFAULT_FEE_FREQUENCY,
+        amount: Math.round(amount),
+        registrationFee: Math.round(Number(data.registrationFee) || 0),
+        costumeFee: Math.round(Number(data.costumeFee) || 0),
+        levelOrder: curriculum().find((l) => l.value === data.level)?.order || 0,
         status: data.status || 'active'
     };
+
+    if (!record.name) throw new Error('A fee plan needs a name.');
+    if (record.amount <= 0) throw new Error('The monthly fee must be more than zero.');
+    if (!feeFrequency(record.frequency)) throw new Error('That fee frequency is not recognised.');
+    return record;
 }
 
-function assertShape(member) {
-    if (!member.name) throw new Error('A staff member needs a name.');
-    if (!member.role) throw new Error('Choose a role.');
-    if (!STAFF_ROLES.some((r) => r.value === member.role)) throw new Error(`"${member.role}" is not a recognised staff role.`);
-    if (!member.branchId) throw new Error('Choose which branch they are based at.');
-    if (!member.phone) throw new Error('A contact number is required.');
-    if (member.monthlySalary < 0) throw new Error('Salary cannot be negative.');
-    if (member.email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(member.email)) throw new Error('That email address does not look right.');
-    if (member.joinedOn && member.joinedOn > localDate()) throw new Error('The joining date cannot be in the future.');
+/* ==========================================================================
+   USERS AND ROLES
+   --------------------------------------------------------------------------
+   Worth being honest about what this is. There is no server, so these roles
+   are an *operational* boundary, not a security one: they decide which
+   buttons a receptionist sees, and they stop an accountant from accidentally
+   deleting a student. Anyone with the browser's developer tools can bypass
+   them entirely. Presenting them as security would be a lie that leads a
+   school to store things here it should not.
+   ========================================================================== */
+
+export async function listUsers() {
+    const rows = await users$.all();
+    return rows.map((user) => ({
+        ...user,
+        roleLabel: roleLabel(user.role) || user.role,
+        capabilities: roleCapabilities(user.role)
+    }));
 }
 
-async function nextEmployeeNumber() {
-    const rows = await staff$.all({ includeDeleted: true });
-    const highest = rows.reduce((max, s) => {
-        const n = Number(String(s.employeeNo || '').split('/').pop());
-        return Number.isFinite(n) && n > max ? n : max;
-    }, 0);
-    return `NAT/EMP/${String(highest + 1).padStart(3, '0')}`;
+export async function createUser(data) {
+    session.require('settings.edit', 'add a user');
+
+    const record = {
+        ...data,
+        name: String(data.name || '').trim(),
+        email: data.email?.trim().toLowerCase() || null,
+        role: data.role,
+        status: 'active'
+    };
+
+    if (!record.name) throw new Error('A user needs a name.');
+    if (!record.role || !roleTable()[record.role]) throw new Error('Choose a valid role.');
+
+    const clash = record.email && (await users$.all()).find((u) => u.email === record.email);
+    if (clash) throw new Error(`${clash.name} already uses that email address.`);
+
+    return users$.create(record);
 }
 
+export async function updateUser(id, changes) {
+    session.require('settings.edit', 'edit a user');
+
+    const existing = await users$.findOrFail(id);
+    if (changes.role && !roleTable()[changes.role]) throw new Error('Choose a valid role.');
+
+    // The school must not be able to lock itself out of its own owner account.
+    if (existing.role === 'owner' && changes.role && changes.role !== 'owner') {
+        const owners = (await users$.activeUsers()).filter((u) => u.role === 'owner');
+        if (owners.length <= 1) throw new Error('There must always be at least one owner.');
+    }
+
+    return users$.update(id, changes);
+}
+
+export async function deactivateUser(id) {
+    session.require('settings.edit', 'deactivate a user');
+
+    const user = await users$.findOrFail(id);
+    if (user.role === 'owner') {
+        const owners = (await users$.activeUsers()).filter((u) => u.role === 'owner');
+        if (owners.length <= 1) throw new Error('The last owner account cannot be deactivated.');
+    }
+    if (user.id === session.actorId()) throw new Error('You cannot deactivate the account you are signed in with.');
+
+    return users$.update(id, { status: 'inactive', deactivatedOn: localDate() });
+}
+
+/** The role matrix, for the permissions screen. */
+export function roleMatrix() {
+    const capabilities = Object.entries(CAPABILITIES).map(([key, label]) => ({ key, label }));
+    return {
+        capabilities,
+        roles: Object.entries(roleTable()).map(([value, role]) => ({
+            value,
+            label: role.label,
+            description: role.description,
+            grants: Object.fromEntries(capabilities.map((c) => [
+                c.key,
+                role.capabilities.includes('*') || role.capabilities.includes(c.key)
+            ]))
+        }))
+    };
+}
+
+/* ==========================================================================
+   PREFERENCES
+   ========================================================================== */
+
+export function preferences() {
+    return { ...PREFERENCE_DEFAULTS, ...session.prefs() };
+}
+
+export function setPreference(key, value) {
+    if (!(key in PREFERENCE_DEFAULTS)) throw new Error(`"${key}" is not a known preference.`);
+    session.setPref(key, value);
+    return preferences();
+}
+
+/* ==========================================================================
+   STORAGE
+   ========================================================================== */
+
+/**
+ * How much room the school's data is taking and whether the browser has
+ * promised to keep it. Worth surfacing plainly: this application's data lives
+ * in one browser on one machine, and a user who does not understand that will
+ * not take backups.
+ */
+export async function storageStatus() {
+    const [usage, persisted] = await Promise.all([db.usage(), navigator.storage?.persisted?.() ?? false]);
+    return {
+        ...usage,
+        persisted,
+        advice: persisted
+            ? 'This browser has been asked not to clear the school’s data automatically.'
+            : 'The browser may clear this data if the device runs low on space. Take regular backups.'
+    };
+}
+
+export async function requestPersistence() {
+    return db.requestPersistence();
+}

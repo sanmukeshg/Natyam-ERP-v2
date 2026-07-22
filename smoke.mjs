@@ -1,300 +1,280 @@
 /**
- * NATYAM ERP 2.0 — Search service
+ * Navigation regression suite.
  *
- * Backs the header search box and the command palette. One module, because
- * they are the same question asked two ways: "take me to the thing I am
- * thinking of". Splitting entity search from command search would mean typing
- * "sruthi" in one place and "mark attendance" in another, which is exactly the
- * friction a palette exists to remove.
+ * This exists because of a bug that every other test missed. The render suite
+ * mounted page classes directly — `new StudentsPage().render(container)` — which
+ * proved each page works but never asked the router which page a URL resolves
+ * to. Meanwhile a stray '/:id' catch-all was routing fifteen of sixteen screens
+ * to the dashboard. The URL changed, the sidebar highlighted, nothing threw,
+ * and the content never moved.
  *
- * Ranking matters more than matching here. A registrar typing "sru" wants
- * Sruthi Reddy, not the seventeen expense narrations containing those letters,
- * so exact prefix matches on names and identifiers outrank substring hits
- * anywhere else, and each result carries the route that opens it.
+ * So this suite never constructs a page. It sets `window.location.hash`, waits,
+ * and asserts that the *viewport contents actually changed to the right page*.
+ * That is the only assertion that would have caught it.
  */
 
-import { session } from '../core/session.js';
-import { NAVIGATION } from '../config/app.config.js';
-import { formatMoney } from '../utils/money.js';
-import { formatDate } from '../utils/date.js';
-import {
-    students$, admissions$, batches$, staff$, invoices$,
-    programs$, certificates$, expenses$
-} from '../data/repositories.js';
+import { JSDOM } from 'jsdom';
+import 'fake-indexeddb/auto';
 
-/* ==========================================================================
-   ENTITY SEARCH
-   ========================================================================== */
+/* ---------------------------------------------------------------- DOM SETUP */
 
-const SOURCES = [
-    {
-        key: 'students', label: 'Students', icon: 'users', capability: 'student.view',
-        load: (branchId) => students$.all(),
-        scope: (row, branchId) => !branchId || row.branchId === branchId,
-        fields: (s) => [s.name, s.admissionNo, s.guardianName, s.guardianPhone],
-        map: (s) => ({
-            id: s.id,
-            title: s.name,
-            subtitle: [s.admissionNo, s.level].filter(Boolean).join(' · '),
-            meta: s.status === 'active' ? null : s.status,
-            route: `#/students/${s.id}`
-        })
-    },
-    {
-        key: 'admissions', label: 'Applications', icon: 'inbox', capability: 'admission.view',
-        load: () => admissions$.all(),
-        scope: (row, branchId) => !branchId || row.branchId === branchId,
-        fields: (a) => [a.name, a.applicationNo, a.guardianName, a.guardianPhone],
-        map: (a) => ({
-            id: a.id,
-            title: a.name,
-            subtitle: [a.applicationNo, a.status].filter(Boolean).join(' · '),
-            route: `#/admissions/${a.id}`
-        })
-    },
-    {
-        key: 'batches', label: 'Batches', icon: 'layers', capability: 'student.view',
-        load: () => batches$.all(),
-        scope: (row, branchId) => !branchId || row.branchId === branchId,
-        fields: (b) => [b.name, b.code, b.room],
-        map: (b) => ({
-            id: b.id,
-            title: b.name,
-            subtitle: [b.code, b.level].filter(Boolean).join(' · '),
-            meta: b.status === 'active' ? null : 'Closed',
-            route: `#/batches/${b.id}`
-        })
-    },
-    {
-        key: 'staff', label: 'Staff', icon: 'user-check', capability: 'staff.view',
-        load: () => staff$.all(),
-        scope: (row, branchId) => !branchId || row.branchId === branchId,
-        fields: (s) => [s.name, s.employeeNo, s.phone, s.specialisation],
-        map: (s) => ({
-            id: s.id,
-            title: s.name,
-            subtitle: [s.employeeNo, s.role].filter(Boolean).join(' · '),
-            route: `#/staff/${s.id}`
-        })
-    },
-    {
-        key: 'invoices', label: 'Invoices', icon: 'receipt', capability: 'fee.view',
-        load: () => invoices$.all(),
-        scope: (row, branchId) => !branchId || row.branchId === branchId,
-        fields: (i) => [i.invoiceNo, i.studentName, i.description],
-        map: (i) => ({
-            id: i.id,
-            title: i.invoiceNo,
-            subtitle: [i.studentName, formatMoney(i.amount)].filter(Boolean).join(' · '),
-            meta: i.status,
-            route: `#/fees/${i.id}`
-        })
-    },
-    {
-        key: 'programs', label: 'Programmes', icon: 'star', capability: 'program.view',
-        load: () => programs$.all(),
-        scope: (row, branchId) => !branchId || row.branchId === branchId,
-        fields: (p) => [p.name, p.venue, p.description],
-        map: (p) => ({
-            id: p.id,
-            title: p.name,
-            subtitle: [formatDate(p.date), p.venue].filter(Boolean).join(' · '),
-            route: `#/programs/${p.id}`
-        })
-    },
-    {
-        key: 'certificates', label: 'Certificates', icon: 'award', capability: 'program.view',
-        load: () => certificates$.all(),
-        scope: (row, branchId) => !branchId || row.branchId === branchId,
-        fields: (c) => [c.serial, c.studentName, c.title],
-        map: (c) => ({
-            id: c.id,
-            title: c.serial,
-            subtitle: c.studentName,
-            meta: c.status === 'revoked' ? 'Revoked' : null,
-            route: `#/certificates/${c.id}`
-        })
-    },
-    {
-        key: 'expenses', label: 'Expenses', icon: 'trending-down', capability: 'finance.view',
-        load: () => expenses$.all(),
-        scope: (row, branchId) => !branchId || row.branchId === branchId,
-        fields: (e) => [e.description, e.category, e.paidTo, e.reference],
-        map: (e) => ({
-            id: e.id,
-            title: e.description,
-            subtitle: [e.category, formatMoney(e.amount)].join(' · '),
-            meta: formatDate(e.date),
-            route: `#/finance?expense=${e.id}`
-        })
+const dom = new JSDOM(
+    '<!doctype html><html><body><div id="app"></div></body></html>',
+    { url: 'https://user.github.io/natyam/', pretendToBeVisual: true }
+);
+
+const { window } = dom;
+
+globalThis.window = window;
+globalThis.document = window.document;
+globalThis.HTMLElement = window.HTMLElement;
+globalThis.Element = window.Element;
+globalThis.Node = window.Node;
+globalThis.Event = window.Event;
+globalThis.CustomEvent = window.CustomEvent;
+globalThis.KeyboardEvent = window.KeyboardEvent;
+globalThis.MouseEvent = window.MouseEvent;
+globalThis.getComputedStyle = window.getComputedStyle.bind(window);
+globalThis.requestAnimationFrame = (fn) => setTimeout(() => fn(Date.now()), 0);
+globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, addListener() {} });
+window.matchMedia = globalThis.matchMedia;
+globalThis.localStorage = window.localStorage;
+globalThis.location = window.location;
+globalThis.addEventListener = window.addEventListener.bind(window);
+globalThis.scrollTo = () => {};
+window.scrollTo = () => {};
+
+globalThis.CSS = { escape: (v) => String(v).replace(/[^\w-]/g, (c) => `\\${c}`) };
+window.CSS = globalThis.CSS;
+
+Object.defineProperty(globalThis.navigator, 'storage', {
+    configurable: true,
+    value: {
+        estimate: async () => ({ usage: 1024, quota: 1024 * 1024 }),
+        persisted: async () => false,
+        persist: async () => true
     }
-];
+});
 
-/**
- * Scores one record against a query.
- *
- * The scale is deliberately coarse — exact, prefix, word-start, substring —
- * because fine-grained relevance scoring on eighty students is false
- * precision. What people actually notice is whether the thing they typed the
- * start of is first.
- */
-function score(fields, query) {
-    let best = 0;
+globalThis.URL.createObjectURL = () => 'blob:stub';
+globalThis.URL.revokeObjectURL = () => {};
+window.open = () => ({ document: { write() {}, close() {} }, focus() {}, print() {}, close() {} });
 
-    for (const field of fields) {
-        if (!field) continue;
-        const value = String(field).toLowerCase();
+const consoleErrors = [];
+console.error = (...args) => consoleErrors.push(args.map(String).join(' '));
 
-        if (value === query) return 100;
-        if (value.startsWith(query)) { best = Math.max(best, 80); continue; }
+/* ------------------------------------------------------------------ HARNESS */
 
-        // A word beginning with the query: "reddy" matching "Sruthi Reddy".
-        if (value.split(/[\s/\-]+/).some((word) => word.startsWith(query))) { best = Math.max(best, 60); continue; }
-        if (value.includes(query)) best = Math.max(best, 30);
+let passed = 0;
+let failed = 0;
+const failures = [];
+
+async function check(label, fn) {
+    consoleErrors.length = 0;
+    try {
+        await fn();
+        passed += 1;
+        console.log(`  ok   ${label}`);
+    } catch (err) {
+        failed += 1;
+        failures.push({ label, err });
+        console.log(`  FAIL ${label}\n         ${err.message}`);
     }
+}
 
-    return best;
+function assert(condition, message) {
+    if (!condition) throw new Error(message);
 }
 
 /**
- * Searches across every entity the current user is allowed to see.
- *
- * @param {string} query
- * @param {object} [options]
- * @param {string[]} [options.only]   Restrict to certain source keys.
- * @param {number} [options.limit=8]  Results per source.
+ * jsdom fires hashchange asynchronously, and the router then awaits a dynamic
+ * import and an async render. Poll until the viewport settles rather than
+ * guessing at a fixed delay.
  */
-export async function search(query, { only = null, limit = 8, branchId = undefined } = {}) {
-    const q = String(query || '').trim().toLowerCase();
-    if (q.length < 2) return [];
+async function navigate(hash, { timeout = 4000 } = {}) {
+    const before = viewport.innerHTML;
+    window.location.hash = hash;
 
-    const scope = branchId === undefined ? session.activeBranchId : branchId;
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+        const now = viewport.innerHTML;
+        // Settled when the content has changed and is no longer the skeleton.
+        if (now !== before && !now.includes('skeleton-title')) return;
+    }
+}
 
-    const sources = SOURCES
-        .filter((source) => !only || only.includes(source.key))
-        .filter((source) => session.can(source.capability));
+/* -------------------------------------------------------------------- BOOT */
 
-    const groups = await Promise.all(sources.map(async (source) => {
-        let rows;
-        try {
-            rows = await source.load(scope);
-        } catch {
-            return null;   // one unavailable store must not blank the palette
+const BASE = '../js';
+
+const { db } = await import(`${BASE}/core/db.js`);
+const { session } = await import(`${BASE}/core/session.js`);
+const { seedIfEmpty } = await import(`${BASE}/data/seed.js`);
+const { branches$ } = await import(`${BASE}/data/repositories.js`);
+const { ROUTES } = await import(`${BASE}/config/app.config.js`);
+const { router } = await import(`${BASE}/core/router.js`);
+const { Shell } = await import(`${BASE}/ui/shell.js`);
+
+let viewport = null;
+
+console.log('\n== Boot the real application ==');
+
+await check('the app boots exactly as app.js does', async () => {
+    await db.open();
+    await seedIfEmpty();
+
+    const branches = await branches$.active();
+    session.hydrate({
+        user: { id: 'owner', name: 'Principal', role: 'owner' },
+        branches,
+        activeBranchId: null
+    });
+
+    // Route registration copied from app.js. If that function changes shape,
+    // this suite must be updated with it — deliberately, so the coupling is
+    // visible rather than mocked away.
+    for (const route of ROUTES) {
+        router.register(route.path, { load: route.load, cap: route.cap, title: route.label });
+        if (route.detail !== false && route.path !== '/') {
+            router.register(`${route.path}/:id`, {
+                load: route.load, cap: route.cap, title: route.label
+            });
         }
-
-        const hits = rows
-            .filter((row) => source.scope(row, scope))
-            .map((row) => ({ row, weight: score(source.fields(row), q) }))
-            .filter((hit) => hit.weight > 0)
-            .sort((a, b) => b.weight - a.weight)
-            .slice(0, limit)
-            .map((hit) => ({ ...source.map(hit.row), weight: hit.weight, source: source.key, icon: source.icon }));
-
-        return hits.length ? { key: source.key, label: source.label, icon: source.icon, results: hits } : null;
-    }));
-
-    return groups
-        .filter(Boolean)
-        .sort((a, b) => b.results[0].weight - a.results[0].weight);
-}
-
-/** A single flat, ranked list — what the command palette renders. */
-export async function searchFlat(query, { limit = 12 } = {}) {
-    const groups = await search(query, { limit: 5 });
-    return groups
-        .flatMap((group) => group.results.map((r) => ({ ...r, group: group.label })))
-        .sort((a, b) => b.weight - a.weight)
-        .slice(0, limit);
-}
-
-/* ==========================================================================
-   COMMANDS
-   ========================================================================== */
-
-/**
- * Actions the palette can run, as opposed to records it can open.
- *
- * Each is gated by capability, so an accountant's palette does not offer to
- * mark attendance — a menu that lists things you are not allowed to do is
- * worse than one that does not.
- */
-const COMMANDS = [
-    { id: 'new-admission',  label: 'New application',        hint: 'Start the admissions wizard', icon: 'plus',        capability: 'admission.edit',   route: '#/admissions/new' },
-    { id: 'new-student',    label: 'Add student directly',   hint: 'Skip the application',        icon: 'user-plus',   capability: 'student.edit',     route: '#/students/new' },
-    { id: 'mark-attendance',label: 'Mark attendance',        hint: 'Today’s registers',           icon: 'check-square',capability: 'attendance.mark',  route: '#/attendance' },
-    { id: 'collect-fee',    label: 'Record a payment',       hint: 'Issue a receipt',             icon: 'receipt',     capability: 'fee.collect',      route: '#/fees?action=collect' },
-    { id: 'add-expense',    label: 'Record an expense',      hint: 'Post to the ledger',          icon: 'trending-down',capability: 'finance.edit',    route: '#/finance?action=expense' },
-    { id: 'run-payroll',    label: 'Prepare payroll',        hint: 'This month’s salaries',       icon: 'briefcase',   capability: 'finance.edit',     route: '#/finance?tab=payroll' },
-    { id: 'new-batch',      label: 'Create a batch',         hint: 'Timetable a new class',       icon: 'layers',      capability: 'student.edit',     route: '#/batches/new' },
-    { id: 'schedule-program',label: 'Schedule a programme',  hint: 'Performance or workshop',     icon: 'star',        capability: 'program.edit',     route: '#/programs/new' },
-    { id: 'issue-certificate',label: 'Issue a certificate',  hint: 'For a student or programme',  icon: 'award',       capability: 'certificate.issue',route: '#/certificates?action=issue' },
-    { id: 'verify-certificate',label: 'Verify a certificate',hint: 'Look up a serial',            icon: 'search',      capability: 'program.view', route: '#/certificates?action=verify' },
-    { id: 'run-report',     label: 'Run a report',           hint: 'Export or print',             icon: 'file-text',   capability: 'report.view',      route: '#/reports' },
-    { id: 'take-backup',    label: 'Take a backup',          hint: 'Download all data',           icon: 'download',    capability: 'backup.manage',  route: '#/settings?tab=backup' },
-    { id: 'audit-log',      label: 'Open the audit log',     hint: 'Who changed what',            icon: 'shield',      capability: 'audit.view',       route: '#/settings?tab=audit' }
-];
-
-/** Commands and navigation destinations the current user can reach. */
-export function commands(query = '') {
-    const q = String(query || '').trim().toLowerCase();
-
-    const actions = COMMANDS
-        .filter((command) => session.can(command.capability))
-        .map((command) => ({ ...command, kind: 'action', weight: q ? score([command.label, command.hint], q) : 50 }));
-
-    // NAVIGATION groups carry `group` and their items carry `cap` and `path`.
-    // An earlier version read `group.label`, `item.capability` and `item.id`,
-    // none of which exist: the palette threw on every open, and the capability
-    // filter silently passed everything because `undefined` is falsy.
-    const destinations = NAVIGATION
-        .flatMap((group) => group.items.map((item) => ({ ...item, groupName: group.group })))
-        .filter((item) => !item.cap || session.can(item.cap))
-        .map((item) => ({
-            id: `go-${item.path}`,
-            label: item.label,
-            hint: `Go to ${item.groupName.toLowerCase()}`,
-            icon: item.icon,
-            route: item.path,
-            kind: 'navigate',
-            weight: q ? score([item.label, item.groupName], q) : 40
-        }));
-
-    return [...actions, ...destinations]
-        .filter((entry) => !q || entry.weight > 0)
-        .sort((a, b) => b.weight - a.weight);
-}
-
-/**
- * What the palette shows for a given input: commands when the box is empty or
- * the query looks like an instruction, records once it looks like a name.
- * Both are always offered — the ordering is what changes.
- */
-export async function palette(query = '') {
-    const q = String(query || '').trim();
-
-    if (q.length < 2) {
-        return { commands: commands().slice(0, 8), records: [], empty: true };
     }
 
-    const [records, matched] = await Promise.all([searchFlat(q, { limit: 10 }), Promise.resolve(commands(q))]);
-    return { commands: matched.slice(0, 5), records, empty: !records.length && !matched.length };
+    const shell = new Shell(document.querySelector('#app'));
+    viewport = shell.mount();
+    router.mount(viewport).start();
+
+    await new Promise((r) => setTimeout(r, 400));
+    assert(viewport.innerHTML.length > 0, 'the router rendered nothing at boot');
+});
+
+/* -------------------------------------------------- THE REGRESSION ITSELF */
+
+console.log('\n== Every route resolves to its own page ==');
+
+await check('the matcher maps each path to the route that owns it', async () => {
+    const wrong = [];
+    for (const route of ROUTES) {
+        const match = router.match(route.path);
+        assert(match, `${route.path} matches no route at all`);
+        if (match.route.title !== route.label) {
+            wrong.push(`${route.path} -> "${match.route.title}" via "${match.route.pattern}"`);
+        }
+    }
+    assert(wrong.length === 0,
+        `${wrong.length} of ${ROUTES.length} paths resolve to the wrong page:\n         `
+        + wrong.join('\n         '));
+});
+
+await check('no route pattern is a catch-all for other routes', async () => {
+    // A pattern whose segments are all parameters will swallow any path of the
+    // same length. '/:id' is the one that caused the outage.
+    const greedy = router.routes.filter((r) =>
+        r.shape.length > 0 && r.shape.every((segment) => segment === 1));
+
+    assert(greedy.length === 0,
+        `catch-all patterns registered: ${greedy.map((r) => r.pattern).join(', ')}`);
+});
+
+console.log('\n== Navigating actually replaces the content ==');
+
+/**
+ * A fingerprint of what is on screen. The h1 alone is not enough — two pages
+ * could share a heading — so this also takes a hash of the body length.
+ */
+function fingerprint() {
+    const heading = viewport.querySelector('h1')?.textContent.trim() || '';
+    return { heading, size: viewport.innerHTML.length };
 }
 
-/** Suggestions for an empty search box — the recently touched records. */
-export async function recentSuggestions(limit = 5) {
-    if (!session.can('student.view')) return [];
+const seen = new Map();
 
-    const rows = (await students$.all())
-        .filter((s) => s.status === 'active')
-        .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))
-        .slice(0, limit);
+for (const route of ROUTES) {
+    await check(`${route.path} swaps the main content to "${route.label}"`, async () => {
+        await navigate(`#${route.path}`);
 
-    return rows.map((s) => ({
-        id: s.id,
-        title: s.name,
-        subtitle: s.admissionNo,
-        route: `#/students/${s.id}`,
-        icon: 'users',
-        group: 'Recent'
-    }));
+        const view = fingerprint();
+
+        assert(view.heading.length > 0, 'the viewport has no heading after navigating');
+        assert(!viewport.innerHTML.includes('skeleton-title'),
+            'the viewport is still showing the loading skeleton');
+        assert(!viewport.innerHTML.includes('Page not found'),
+            'the router rendered its not-found view');
+        assert(!viewport.innerHTML.includes('could not be opened'),
+            'the router rendered its load-failure view');
+
+        // The heading must belong to this route, not a previous one.
+        const previous = seen.get(view.heading);
+        assert(previous === undefined || previous === route.path,
+            `this screen is identical to ${previous} — the content did not change`);
+        seen.set(view.heading, route.path);
+
+        assert(router.path() === route.path,
+            `router.path() is ${router.path()} after navigating to ${route.path}`);
+
+        const errors = consoleErrors.filter((e) => !e.includes('Not implemented'));
+        assert(errors.length === 0, `console error: ${errors[0]}`);
+    });
 }
+
+await check('every screen was distinct — none silently fell back to another', async () => {
+    assert(seen.size === ROUTES.length,
+        `${ROUTES.length} routes produced only ${seen.size} distinct screens`);
+});
+
+console.log('\n== Router behaviour ==');
+
+await check('going back to a visited route re-renders it', async () => {
+    await navigate('#/students');
+    const students = fingerprint().heading;
+    await navigate('#/fees');
+    await navigate('#/students');
+    assert(fingerprint().heading === students, 'returning to a route did not re-render it');
+});
+
+await check('the previous page is destroyed before the next renders', async () => {
+    await navigate('#/students');
+    const first = router.currentPage;
+    await navigate('#/attendance');
+    assert(router.currentPage !== first, 'the router still holds the previous page');
+});
+
+await check('a detail URL reaches the same page with its parameter', async () => {
+    const match = router.match('/students/STU-0001');
+    assert(match, '/students/STU-0001 matches nothing');
+    assert(match.route.title === 'Students', `detail URL routed to ${match.route.title}`);
+    assert(match.params.id === 'STU-0001', `parameter came through as ${match.params.id}`);
+});
+
+await check('an unknown URL renders the not-found view, not a real page', async () => {
+    window.location.hash = '#/no-such-screen';
+    await new Promise((r) => setTimeout(r, 400));
+    assert(router.match('/no-such-screen') === null, 'an unknown path matched a route');
+});
+
+await check('a query string is parsed and does not affect matching', async () => {
+    const match = router.match('/fees');
+    assert(match?.route.title === 'Fee collection', 'plain /fees did not match');
+    window.location.hash = '#/fees?filter=overdue';
+    await new Promise((r) => setTimeout(r, 500));
+    assert(router.path() === '/fees', `router.path() returned ${router.path()}`);
+});
+
+/* ------------------------------------------------------------------ RESULT */
+
+console.log(`\n${'='.repeat(58)}`);
+console.log(`  ${passed} passed, ${failed} failed`);
+console.log('='.repeat(58));
+
+if (failed) {
+    console.log('\nFailures:\n');
+    for (const { label, err } of failures) {
+        console.log(`  ${label}`);
+        console.log(`    ${(err.stack || err.message).split('\n').slice(0, 4).join('\n    ')}\n`);
+    }
+}
+
+process.exitCode = failed ? 1 : 0;

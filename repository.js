@@ -1,845 +1,522 @@
 /**
- * NATYAM ERP 2.0 — Report service
+ * NATYAM ERP 2.0 — Fee collection service
  *
- * Every report the school can produce, defined as data: a name, the filters it
- * accepts, the columns it returns, and a function that builds the rows. The
- * reports *page* renders whatever this module describes, which means adding a
- * report is adding an entry here rather than building another screen.
+ * Scope, stated once so it is not eroded later: this module manages what a
+ * family owes and what they have paid. It is not the accounting system. It
+ * emits an event that finance listens to; it never decides how the school's
+ * books are structured.
  *
- * On export formats, an honest note about the constraint this product runs
- * under. There is no server, no build step and no CDN, so a genuine .xlsx or
- * a laid-out .pdf would mean shipping a bundled copy of a library like SheetJS
- * or pdfmake — several hundred kilobytes of vendored code that nobody in the
- * school can audit or update. The alternative used here:
- *
- *  - CSV, which Excel opens natively and which is trivially correct;
- *  - SpreadsheetML (.xls), a plain-XML format Excel has read for twenty years,
- *    generated as text, so column widths and number formats survive;
- *  - print-to-PDF via the browser's own print pipeline with a proper print
- *    stylesheet, which produces a better-looking document than a hand-rolled
- *    PDF writer would and is one keystroke from a real PDF on every platform.
- *
- * This is a smaller, more maintainable product than one carrying two vendored
- * binaries, and for a school printing a fee statement it is indistinguishable
- * in outcome.
+ * Every write that touches money is a single `db.unit()` — the invoice, the
+ * payment row, the ledger entry and the sequence counter either all land or
+ * none of them do. 1.0 wrote them as separate `put()` calls, which meant a
+ * quota error between the second and third silently left an invoice marked
+ * paid with no receipt behind it and no ledger income.
  */
 
+import { db, request } from '../core/db.js';
+import { bus, EVENTS } from '../core/bus.js';
 import { session } from '../core/session.js';
-import { localDate, startOfMonth, endOfMonth, monthKey, formatDate, formatDateTime, formatMonth, academicYearOf } from '../utils/date.js';
-import { formatMoney, toRupees } from '../utils/money.js';
-import { escapeHtml, downloadFile } from '../utils/dom.js';
-import { LEVELS, ATTENDANCE_STATUS, levelLabel } from '../config/app.config.js';
+import { uid, sequenceNumber } from '../utils/id.js';
+import { localDate, nowISO, addDays, monthKey, academicYearOf } from '../utils/date.js';
+import { auditRow } from './audit.service.js';
 import {
-    students$, batches$, admissions$, invoices$, payments$, expenses$,
-    staff$, programs$, certificates$, branches$, attendance$, salaries$,
-    AttendanceMath, PaymentMath
+    INVOICE_STATUS, PAYMENT_STATUS, PAYMENT_MODES, feeFrequency
+} from '../config/app.config.js';
+import {
+    invoices$, payments$, students$, feePlans$, settings$
 } from '../data/repositories.js';
-import { summary as attendanceSummary, teacherCompliance } from './attendance.service.js';
-import { collectionSummary } from './fees.service.js';
-import { profitAndLoss, ledgerView, expenseBreakdown } from './finance.service.js';
-import { institute } from './settings.service.js';
 
 /* ==========================================================================
-   REPORT DEFINITIONS
+   STATUS DERIVATION
+   One function decides an invoice's status from its numbers. Nothing else in
+   the codebase is allowed to set `status` on an invoice by hand — that is how
+   1.0 ended up with invoices marked "paid" carrying a non-zero balance.
    ========================================================================== */
 
-const money = (v) => formatMoney(v || 0);
+export function deriveInvoiceStatus(invoice) {
+    if (invoice.status === INVOICE_STATUS.CANCELLED) return INVOICE_STATUS.CANCELLED;
+    if (invoice.status === INVOICE_STATUS.WAIVED) return INVOICE_STATUS.WAIVED;
+    if (invoice.status === INVOICE_STATUS.DRAFT) return INVOICE_STATUS.DRAFT;
 
-export const REPORTS = Object.freeze([
-    {
-        id: 'student-roll',
-        name: 'Student roll',
-        group: 'Students',
-        description: 'Every active student with their batch, level and contact details.',
-        filters: ['branch', 'batch', 'level', 'status'],
-        columns: [
-            { key: 'admissionNo', label: 'Admission no.' },
-            { key: 'name', label: 'Student' },
-            { key: 'levelLabel', label: 'Level' },
-            { key: 'batchName', label: 'Batch' },
-            { key: 'joinedOn', label: 'Joined', format: formatDate },
-            { key: 'guardianName', label: 'Parent' },
-            { key: 'guardianPhone', label: 'Contact' },
-            { key: 'status', label: 'Status' }
-        ],
-        build: buildStudentRoll
-    },
-    {
-        id: 'attendance-register',
-        name: 'Attendance register',
-        group: 'Attendance',
-        description: 'Per-student attendance across a period, with percentages.',
-        filters: ['branch', 'batch', 'dateRange'],
-        columns: [
-            { key: 'admissionNo', label: 'Admission no.' },
-            { key: 'name', label: 'Student' },
-            { key: 'batchName', label: 'Batch' },
-            { key: 'present', label: 'Present', align: 'right' },
-            { key: 'absent', label: 'Absent', align: 'right' },
-            { key: 'excused', label: 'Excused', align: 'right' },
-            { key: 'sessions', label: 'Sessions', align: 'right' },
-            { key: 'rate', label: 'Attendance', align: 'right', format: (v) => (v === null ? '—' : `${v}%`) }
-        ],
-        build: buildAttendanceRegister
-    },
-    {
-        id: 'teacher-compliance',
-        name: 'Register compliance',
-        group: 'Attendance',
-        description: 'How reliably each teacher marks their registers.',
-        filters: ['branch', 'dateRange'],
-        columns: [
-            { key: 'teacherName', label: 'Teacher' },
-            { key: 'batches', label: 'Batches', align: 'right' },
-            { key: 'expected', label: 'Expected', align: 'right' },
-            { key: 'marked', label: 'Marked', align: 'right' },
-            { key: 'compliance', label: 'Compliance', align: 'right', format: (v) => (v === null ? '—' : `${v}%`) }
-        ],
-        build: buildTeacherCompliance
-    },
-    {
-        id: 'fee-collection',
-        name: 'Fee collection',
-        group: 'Fees',
-        description: 'Every payment received in a period, by mode.',
-        filters: ['branch', 'dateRange'],
-        columns: [
-            { key: 'receiptNo', label: 'Receipt' },
-            { key: 'paidOn', label: 'Date', format: formatDate },
-            { key: 'studentName', label: 'Student' },
-            { key: 'mode', label: 'Mode' },
-            { key: 'reference', label: 'Reference' },
-            { key: 'amount', label: 'Amount', align: 'right', format: money, numeric: true }
-        ],
-        build: buildFeeCollection
-    },
-    {
-        id: 'fee-outstanding',
-        name: 'Outstanding fees',
-        group: 'Fees',
-        description: 'Unpaid and part-paid invoices, oldest first, with ageing.',
-        filters: ['branch', 'batch'],
-        columns: [
-            { key: 'invoiceNo', label: 'Invoice' },
-            { key: 'studentName', label: 'Student' },
-            { key: 'batchName', label: 'Batch' },
-            { key: 'dueDate', label: 'Due', format: formatDate },
-            { key: 'ageDays', label: 'Age', align: 'right', format: (v) => (v > 0 ? `${v} days` : 'Not due') },
-            { key: 'amount', label: 'Billed', align: 'right', format: money, numeric: true },
-            { key: 'paid', label: 'Paid', align: 'right', format: money, numeric: true },
-            { key: 'balance', label: 'Outstanding', align: 'right', format: money, numeric: true }
-        ],
-        build: buildOutstanding
-    },
-    {
-        id: 'profit-loss',
-        name: 'Profit and loss',
-        group: 'Finance',
-        description: 'Income and expenditure by account for a period.',
-        filters: ['branch', 'dateRange'],
-        columns: [
-            { key: 'section', label: 'Section' },
-            { key: 'account', label: 'Account' },
-            { key: 'amount', label: 'Amount', align: 'right', format: money, numeric: true }
-        ],
-        build: buildProfitAndLoss
-    },
-    {
-        id: 'ledger',
-        name: 'Ledger',
-        group: 'Finance',
-        description: 'Every entry in date order with a running balance.',
-        filters: ['branch', 'dateRange'],
-        columns: [
-            { key: 'date', label: 'Date', format: formatDate },
-            { key: 'account', label: 'Account' },
-            { key: 'narration', label: 'Narration' },
-            { key: 'income', label: 'Income', align: 'right', format: money, numeric: true },
-            { key: 'expense', label: 'Expenditure', align: 'right', format: money, numeric: true },
-            { key: 'balance', label: 'Balance', align: 'right', format: money, numeric: true }
-        ],
-        build: buildLedger
-    },
-    {
-        id: 'expenses',
-        name: 'Expenditure',
-        group: 'Finance',
-        description: 'Expenses in a period, by category.',
-        filters: ['branch', 'dateRange'],
-        columns: [
-            { key: 'date', label: 'Date', format: formatDate },
-            { key: 'category', label: 'Category' },
-            { key: 'description', label: 'Description' },
-            { key: 'paidTo', label: 'Paid to' },
-            { key: 'mode', label: 'Mode' },
-            { key: 'amount', label: 'Amount', align: 'right', format: money, numeric: true }
-        ],
-        build: buildExpenses
-    },
-    {
-        id: 'admissions',
-        name: 'Admissions',
-        group: 'Admissions',
-        description: 'Applications received in a period and what became of them.',
-        filters: ['branch', 'dateRange', 'status'],
-        columns: [
-            { key: 'applicationNo', label: 'Application' },
-            { key: 'appliedOn', label: 'Applied', format: formatDate },
-            { key: 'name', label: 'Applicant' },
-            { key: 'levelLabel', label: 'Level' },
-            { key: 'guardianPhone', label: 'Contact' },
-            { key: 'status', label: 'Status' },
-            { key: 'outcome', label: 'Outcome' }
-        ],
-        build: buildAdmissions
-    },
-    {
-        id: 'programs',
-        name: 'Programmes',
-        group: 'Programmes',
-        description: 'Programmes held, participation and their financial result.',
-        filters: ['branch', 'dateRange'],
-        columns: [
-            { key: 'date', label: 'Date', format: formatDate },
-            { key: 'name', label: 'Programme' },
-            { key: 'typeLabel', label: 'Type' },
-            { key: 'venue', label: 'Venue' },
-            { key: 'participantCount', label: 'Participants', align: 'right' },
-            { key: 'income', label: 'Income', align: 'right', format: money, numeric: true },
-            { key: 'expenditure', label: 'Costs', align: 'right', format: money, numeric: true },
-            { key: 'net', label: 'Net', align: 'right', format: money, numeric: true }
-        ],
-        build: buildPrograms
-    },
-    {
-        id: 'staff-roster',
-        name: 'Staff roster',
-        group: 'Staff',
-        description: 'Everyone on the staff, their teaching load and their pay.',
-        filters: ['branch', 'status'],
-        columns: [
-            { key: 'employeeNo', label: 'Employee no.' },
-            { key: 'name', label: 'Name' },
-            { key: 'roleLabel', label: 'Role' },
-            { key: 'specialisation', label: 'Specialisation' },
-            { key: 'joinedOn', label: 'Joined', format: formatDate },
-            { key: 'batchCount', label: 'Batches', align: 'right' },
-            { key: 'studentCount', label: 'Students', align: 'right' },
-            { key: 'weeklySessions', label: 'Sessions/week', align: 'right' },
-            { key: 'monthlySalary', label: 'Salary', align: 'right', format: money, numeric: true },
-            { key: 'status', label: 'Status' }
-        ],
-        build: buildStaffRoster
-    },
-    {
-        id: 'payroll',
-        name: 'Payroll',
-        group: 'Staff',
-        description: 'Salaries processed in a period, with adjustments.',
-        filters: ['branch', 'dateRange'],
-        columns: [
-            { key: 'period', label: 'Period', format: formatMonth },
-            { key: 'staffName', label: 'Staff' },
-            { key: 'gross', label: 'Gross', align: 'right', format: money, numeric: true },
-            { key: 'allowances', label: 'Allowances', align: 'right', format: money, numeric: true },
-            { key: 'deductions', label: 'Deductions', align: 'right', format: money, numeric: true },
-            { key: 'net', label: 'Net', align: 'right', format: money, numeric: true },
-            { key: 'status', label: 'Status' }
-        ],
-        build: buildPayroll
-    },
-    {
-        id: 'branch-performance',
-        name: 'Branch performance',
-        group: 'Branches',
-        description: 'Every branch side by side — roll, attendance, collection and net.',
-        filters: ['dateRange'],
-        columns: [
-            { key: 'branchName', label: 'Branch' },
-            { key: 'students', label: 'Students', align: 'right' },
-            { key: 'batches', label: 'Batches', align: 'right' },
-            { key: 'staff', label: 'Staff', align: 'right' },
-            { key: 'attendanceRate', label: 'Attendance', align: 'right', format: (v) => (v === null ? '—' : `${v}%`) },
-            { key: 'collected', label: 'Collected', align: 'right', format: money, numeric: true },
-            { key: 'outstanding', label: 'Outstanding', align: 'right', format: money, numeric: true },
-            { key: 'net', label: 'Net', align: 'right', format: money, numeric: true }
-        ],
-        build: buildBranchPerformance
-    },
-    {
-        id: 'certificates',
-        name: 'Certificates issued',
-        group: 'Certificates',
-        description: 'The certificate register, with serials for verification.',
-        filters: ['branch', 'dateRange'],
-        columns: [
-            { key: 'serial', label: 'Serial' },
-            { key: 'issuedOn', label: 'Issued', format: formatDate },
-            { key: 'studentName', label: 'Student' },
-            { key: 'templateName', label: 'Certificate' },
-            { key: 'issuedByName', label: 'Issued by' },
-            { key: 'status', label: 'Status' }
-        ],
-        build: buildCertificates
-    }
-]);
-
-export function reportById(id) {
-    const found = REPORTS.find((r) => r.id === id);
-    if (!found) throw new Error(`There is no report called "${id}".`);
-    return found;
+    const balance = Math.max(0, (invoice.amount || 0) - (invoice.paidAmount || 0));
+    if (balance === 0) return INVOICE_STATUS.PAID;
+    if ((invoice.paidAmount || 0) > 0) return INVOICE_STATUS.PARTIAL;
+    return invoice.dueDate < localDate() ? INVOICE_STATUS.OVERDUE : INVOICE_STATUS.OPEN;
 }
 
-/** Reports grouped for the reports page navigation. */
-export function reportCatalogue() {
-    const groups = new Map();
-    for (const report of REPORTS) {
-        if (!groups.has(report.group)) groups.set(report.group, []);
-        groups.get(report.group).push({ id: report.id, name: report.name, description: report.description, filters: report.filters });
-    }
-    return [...groups.entries()].map(([group, reports]) => ({ group, reports }));
+/** Recomputes amounts and status together, so they cannot disagree. */
+function reconcile(invoice) {
+    const paidAmount = Math.max(0, Math.round(invoice.paidAmount || 0));
+    const amount = Math.round(invoice.amount || 0);
+    const next = { ...invoice, amount, paidAmount, balance: Math.max(0, amount - paidAmount) };
+    return { ...next, status: deriveInvoiceStatus(next) };
 }
 
 /* ==========================================================================
-   RUNNING A REPORT
+   BILLING
    ========================================================================== */
 
 /**
- * Runs a report and returns rows plus everything needed to render or export
- * it. Filters are normalised here so every builder receives the same shape and
- * none of them has to guess what "this month" meant.
+ * Raises the full instalment schedule for a student against their fee plan.
+ *
+ * Idempotent by design: it refuses to bill a plan that has already been billed
+ * for the same academic year rather than quietly doubling a family's fees,
+ * which is the single most damaging mistake this module could make.
+ *
+ * @returns {Promise<{invoices: object[], skipped: boolean}>}
  */
-export async function run(reportId, filters = {}) {
-    session.require('report.view', 'run reports');
+export async function raiseSchedule(studentId, { feePlanId = null, startDate = null, includeExtras = true } = {}) {
+    session.require('fee.collect', 'raise invoices');
 
-    const report = reportById(reportId);
-    const resolved = {
-        from: filters.from || startOfMonth(),
-        to: filters.to || localDate(),
-        branchId: filters.branchId ?? session.activeBranchId ?? null,
-        batchId: filters.batchId || null,
-        level: filters.level || null,
-        status: filters.status || null
-    };
+    const student = await students$.findOrFail(studentId);
+    const plan = await feePlans$.findOrFail(feePlanId || student.feePlanId);
+    const year = academicYearOf().start;
 
-    const { rows, totals = null, note = null } = await report.build(resolved);
-
-    return {
-        report: { id: report.id, name: report.name, description: report.description, columns: report.columns },
-        filters: resolved,
-        rows,
-        totals,
-        note,
-        count: rows.length,
-        generatedAt: new Date().toISOString(),
-        generatedBy: session.actorName()
-    };
-}
-
-/* ==========================================================================
-   BUILDERS
-   ========================================================================== */
-
-async function buildStudentRoll({ branchId, batchId, level, status }) {
-    const [all, batches] = await Promise.all([students$.all(), batches$.all()]);
-    const batchName = new Map(batches.map((b) => [b.id, b.name]));
-
-    let rows = all;
-    if (branchId) rows = rows.filter((s) => s.branchId === branchId);
-    if (batchId) rows = rows.filter((s) => s.batchId === batchId);
-    if (level) rows = rows.filter((s) => s.level === level);
-    rows = rows.filter((s) => (status ? s.status === status : s.status === 'active'));
-
-    return {
-        rows: rows
-            .map((s) => ({
-                ...s,
-                levelLabel: levelLabel(s.level, '—'),
-                batchName: batchName.get(s.batchId) || 'Not placed'
-            }))
-            .sort((a, b) => a.batchName.localeCompare(b.batchName) || a.name.localeCompare(b.name, 'en-IN')),
-        totals: null
-    };
-}
-
-async function buildAttendanceRegister({ from, to, branchId, batchId }) {
-    const [marks, roster, batches] = await Promise.all([
-        attendance$.between(from, to, branchId),
-        students$.active(branchId),
-        batches$.all()
-    ]);
-
-    const batchName = new Map(batches.map((b) => [b.id, b.name]));
-    const scoped = batchId ? marks.filter((m) => m.batchId === batchId) : marks;
-
-    const byStudent = new Map();
-    for (const row of scoped) {
-        if (!byStudent.has(row.studentId)) byStudent.set(row.studentId, []);
-        byStudent.get(row.studentId).push(row);
+    const existing = await invoices$.forStudent(studentId);
+    const alreadyBilled = existing.some((i) =>
+        i.feePlanId === plan.id &&
+        i.status !== INVOICE_STATUS.CANCELLED &&
+        (i.academicYear || year) === year
+    );
+    if (alreadyBilled) {
+        return { invoices: [], skipped: true, reason: `${student.name} has already been billed for ${plan.name} this year.` };
     }
 
-    const rows = roster
-        .filter((s) => !batchId || s.batchId === batchId)
-        .map((student) => {
-            const own = byStudent.get(student.id) || [];
-            const breakdown = AttendanceMath.breakdownOf(own);
-            return {
-                admissionNo: student.admissionNo,
-                name: student.name,
-                batchName: batchName.get(student.batchId) || 'Not placed',
-                present: (breakdown[ATTENDANCE_STATUS.PRESENT] || 0) + (breakdown[ATTENDANCE_STATUS.LATE] || 0),
-                absent: breakdown[ATTENDANCE_STATUS.ABSENT] || 0,
-                excused: breakdown[ATTENDANCE_STATUS.EXCUSED] || 0,
-                sessions: own.filter((r) => r.status !== ATTENDANCE_STATUS.HOLIDAY).length,
-                rate: AttendanceMath.rateOf(own)
-            };
-        })
-        .sort((a, b) => (a.rate ?? 101) - (b.rate ?? 101));
+    const from = startDate || student.joinedOn || localDate();
+    // Cadence comes from the frequency table, so adding a future frequency is a
+    // data change rather than a rewrite of this generator.
+    const cadence = feeFrequency(plan.frequency);
+    const periods = cadence.periodsPerYear;
+    const perPeriod = Number(plan.amount) || 0;
 
-    const overall = await attendanceSummary({ from, to, branchId, batchId });
-    return {
-        rows,
-        totals: { label: 'Overall attendance', value: overall.rate === null ? '—' : `${overall.rate}%` },
-        note: `${overall.sessions} class sessions across ${rows.length} students.`
-    };
-}
-
-async function buildTeacherCompliance({ from, to, branchId }) {
-    const rows = await teacherCompliance({ from, to, branchId });
-    return {
-        rows: rows.map((r) => ({
-            teacherName: r.teacher.name,
-            batches: r.batches,
-            expected: r.expected,
-            marked: r.marked,
-            compliance: r.compliance
-        })),
-        totals: null
-    };
-}
-
-async function buildFeeCollection({ from, to, branchId }) {
-    const [rows, students, summary] = await Promise.all([
-        payments$.between(from, to, branchId),
-        students$.all(),
-        collectionSummary({ from, to, branchId })
-    ]);
-
-    const nameOf = new Map(students.map((s) => [s.id, s.name]));
-    const cleared = rows.filter((p) => p.status === 'cleared');
-
-    return {
-        rows: cleared
-            .map((p) => ({ ...p, studentName: nameOf.get(p.studentId) || '—' }))
-            .sort((a, b) => a.paidOn.localeCompare(b.paidOn)),
-        totals: { label: 'Total collected', value: money(summary.collected) },
-        note: summary.byMode.map((m) => `${m.mode}: ${money(m.amount)}`).join(' · ')
-    };
-}
-
-async function buildOutstanding({ branchId, batchId }) {
-    const [invoices, students, batches] = await Promise.all([
-        invoices$.outstanding(branchId),
-        students$.all(),
-        batches$.all()
-    ]);
-
-    const studentById = new Map(students.map((s) => [s.id, s]));
-    const batchName = new Map(batches.map((b) => [b.id, b.name]));
-    const today = localDate();
-
-    const rows = invoices
-        .map((invoice) => {
-            const student = studentById.get(invoice.studentId);
-            return {
-                ...invoice,
-                studentName: student?.name || '—',
-                batchName: batchName.get(student?.batchId) || 'Not placed',
-                batchId: student?.batchId || null,
-                ageDays: invoice.dueDate < today
-                    ? Math.floor((new Date(today) - new Date(invoice.dueDate)) / 86400000)
-                    : 0
-            };
-        })
-        .filter((r) => !batchId || r.batchId === batchId)
-        .sort((a, b) => b.ageDays - a.ageDays || b.balance - a.balance);
-
-    const total = rows.reduce((sum, r) => sum + r.balance, 0);
-    return {
-        rows,
-        totals: { label: 'Total outstanding', value: money(total) },
-        note: `${rows.filter((r) => r.ageDays > 0).length} of ${rows.length} invoices are past their due date.`
-    };
-}
-
-async function buildProfitAndLoss({ from, to, branchId }) {
-    const pl = await profitAndLoss({ from, to, branchId });
-
-    const rows = [
-        ...pl.income.map((a) => ({ section: 'Income', account: a.account, amount: a.amount })),
-        { section: 'Income', account: 'Total income', amount: pl.totalIncome, emphasis: true },
-        ...pl.expense.map((a) => ({ section: 'Expenditure', account: a.account, amount: a.amount })),
-        { section: 'Expenditure', account: 'Total expenditure', amount: pl.totalExpense, emphasis: true }
-    ];
-
-    return {
-        rows,
-        totals: { label: pl.net >= 0 ? 'Surplus' : 'Deficit', value: money(Math.abs(pl.net)) },
-        note: pl.margin === null ? null : `Margin ${pl.margin}% on ${pl.entryCount} ledger entries.`
-    };
-}
-
-async function buildLedger({ from, to, branchId }) {
-    const view = await ledgerView({ from, to, branchId });
-
-    return {
-        rows: view.rows.map((entry) => ({
-            ...entry,
-            income: entry.type === 'income' ? entry.amount : 0,
-            expense: entry.type === 'expense' ? entry.amount : 0
-        })),
-        totals: { label: 'Closing balance', value: money(view.totals.net) }
-    };
-}
-
-async function buildExpenses({ from, to, branchId }) {
-    const [rows, breakdown] = await Promise.all([
-        expenses$.between(from, to, branchId),
-        expenseBreakdown({ from, to, branchId })
-    ]);
-
-    return {
-        rows: rows.sort((a, b) => a.date.localeCompare(b.date)),
-        totals: { label: 'Total expenditure', value: money(breakdown.total) },
-        note: breakdown.categories.slice(0, 3).map((c) => `${c.category} ${c.share}%`).join(' · ')
-    };
-}
-
-async function buildAdmissions({ from, to, branchId, status }) {
-    let rows = (await admissions$.all()).filter((a) => (a.appliedOn || '') >= from && (a.appliedOn || '') <= to);
-    if (branchId) rows = rows.filter((a) => a.branchId === branchId);
-    if (status) rows = rows.filter((a) => a.status === status);
-
-    return {
-        rows: rows
-            .map((a) => ({
-                ...a,
-                levelLabel: levelLabel(a.level, '—'),
-                outcome: a.status === 'enrolled' ? `Enrolled ${formatDate(a.enrolledOn)}`
-                    : a.status === 'rejected' ? (a.rejectionReason || 'Declined')
-                    : 'In progress'
-            }))
-            .sort((a, b) => (b.appliedOn || '').localeCompare(a.appliedOn || '')),
-        totals: null,
-        note: `${rows.filter((a) => a.status === 'enrolled').length} of ${rows.length} applications resulted in an enrolment.`
-    };
-}
-
-async function buildPrograms({ from, to, branchId }) {
-    let rows = (await programs$.all()).filter((p) => p.date >= from && p.date <= to);
-    if (branchId) rows = rows.filter((p) => p.branchId === branchId);
-
-    return {
-        rows: rows
-            .map((p) => ({
-                ...p,
-                typeLabel: p.type,
-                participantCount: p.participants?.length || 0,
-                net: (p.income || 0) - (p.expenditure || 0)
-            }))
-            .sort((a, b) => a.date.localeCompare(b.date)),
-        totals: {
-            label: 'Net result',
-            value: money(rows.reduce((sum, p) => sum + ((p.income || 0) - (p.expenditure || 0)), 0))
-        }
-    };
-}
-
-async function buildCertificates({ from, to, branchId }) {
-    let rows = (await certificates$.all()).filter((c) => c.issuedOn >= from && c.issuedOn <= to);
-    if (branchId) rows = rows.filter((c) => c.branchId === branchId);
-
-    return {
-        rows: rows
-            .map((c) => ({ ...c, templateName: c.templateId }))
-            .sort((a, b) => b.issuedOn.localeCompare(a.issuedOn)),
-        totals: null,
-        note: rows.filter((c) => c.status === 'revoked').length
-            ? `${rows.filter((c) => c.status === 'revoked').length} of these have since been revoked.`
-            : null
-    };
-}
-
-/* ==========================================================================
-   EXPORT — CSV
-   ========================================================================== */
-
-/**
- * CSV, with the quoting rules actually applied rather than assumed. A student
- * called "Rao, Sruthi" or an expense described as `10" cymbals` will otherwise
- * shift every subsequent column, and the school will not notice until the
- * numbers stop reconciling.
- */
-async function buildStaffRoster({ branchId, status }) {
-    const [team, batches, students] = await Promise.all([
-        staff$.all(), batches$.all(), students$.active()
-    ]);
-
-    const roster = new Map();
-    for (const student of students) {
-        if (student.batchId) roster.set(student.batchId, (roster.get(student.batchId) || 0) + 1);
-    }
-
-    let rows = branchId ? team.filter((s) => s.branchId === branchId) : team;
-    rows = rows.filter((s) => (status ? s.status === status : s.status !== 'inactive'));
-
-    return {
-        rows: rows
-            .map((member) => {
-                const own = batches.filter((b) => b.teacherId === member.id && b.status !== 'closed');
-                return {
-                    ...member,
-                    roleLabel: member.role,
-                    batchCount: own.length,
-                    studentCount: own.reduce((sum, b) => sum + (roster.get(b.id) || 0), 0),
-                    weeklySessions: own.reduce((sum, b) => sum + (b.days?.length || 0), 0)
-                };
-            })
-            .sort((a, b) => a.name.localeCompare(b.name, 'en-IN')),
-        totals: {
-            label: 'Monthly wage bill',
-            value: money(rows.reduce((sum, s) => sum + (s.monthlySalary || 0), 0))
-        }
-    };
-}
-
-async function buildPayroll({ from, to, branchId }) {
-    const fromPeriod = monthKey(from);
-    const toPeriod = monthKey(to);
-
-    let rows = (await salaries$.all())
-        .filter((s) => s.period >= fromPeriod && s.period <= toPeriod);
-    if (branchId) rows = rows.filter((s) => s.branchId === branchId);
-
-    return {
-        rows: rows.sort((a, b) =>
-            b.period.localeCompare(a.period) || a.staffName.localeCompare(b.staffName, 'en-IN')),
-        totals: {
-            label: 'Net paid',
-            value: money(rows.filter((s) => s.status === 'paid').reduce((sum, s) => sum + s.net, 0))
-        },
-        note: rows.some((s) => s.status !== 'paid')
-            ? `${rows.filter((s) => s.status !== 'paid').length} lines in this range are still unpaid.`
-            : null
-    };
-}
-
-/**
- * The one report that deliberately ignores the active branch: comparing
- * branches is the whole point, so scoping it to one would produce a table with
- * a single row and no meaning.
- */
-async function buildBranchPerformance({ from, to }) {
-    const all = await branches$.active();
-
-    const rows = await Promise.all(all.map(async (branch) => {
-        const [roll, batchRows, team, marks, collection, pl] = await Promise.all([
-            students$.active(branch.id),
-            batches$.active(branch.id),
-            staff$.activeStaff(branch.id),
-            attendance$.between(from, to, branch.id),
-            collectionSummary({ from, to, branchId: branch.id }),
-            profitAndLoss({ from, to, branchId: branch.id })
-        ]);
-
-        return {
-            branchId: branch.id,
-            branchName: branch.name,
-            students: roll.length,
-            batches: batchRows.length,
-            staff: team.length,
-            attendanceRate: AttendanceMath.rateOf(marks),
-            collected: collection.collected,
-            outstanding: collection.outstanding,
-            net: pl.net
-        };
+    const lines = Array.from({ length: periods }, (_, index) => ({
+        amount: perPeriod,
+        description: periods > 1
+            ? `${plan.name} — ${cadence.label.toLowerCase()} fee ${index + 1} of ${periods}`
+            : `${plan.name} — ${cadence.label.toLowerCase()} fee`,
+        dueDate: index === 0 ? from : addDays(from, index * cadence.dayGap)
     }));
 
+    if (includeExtras && plan.registrationFee > 0 && !existing.length) {
+        lines.unshift({ amount: plan.registrationFee, description: 'Registration fee', dueDate: from });
+    }
+    if (includeExtras && plan.costumeFee > 0) {
+        lines.push({ amount: plan.costumeFee, description: 'Costume and accessories', dueDate: addDays(from, 30) });
+    }
+
+    const created = [];
+    for (const line of lines) {
+        created.push(await createInvoice({
+            studentId: student.id,
+            branchId: student.branchId,
+            feePlanId: plan.id,
+            amount: line.amount,
+            description: line.description,
+            dueDate: line.dueDate
+        }));
+    }
+
+    return { invoices: created, skipped: false };
+}
+
+/**
+ * A single invoice. The number is allocated from the settings counter inside
+ * the same transaction as the row itself, so two invoices raised in the same
+ * tick cannot share a number.
+ */
+export async function createInvoice({ studentId, branchId, feePlanId = null, amount, description, dueDate, discount = 0, discountReason = null }) {
+    session.require('fee.collect', 'raise invoices');
+
+    const student = await students$.findOrFail(studentId);
+    const gross = Math.round(Number(amount) || 0);
+    const reduction = Math.round(Number(discount) || 0);
+
+    if (gross <= 0) throw new Error('An invoice must be for more than zero.');
+    if (reduction < 0) throw new Error('A discount cannot be negative.');
+    if (reduction > gross) throw new Error('A discount cannot exceed the invoice amount.');
+    if (reduction > 0 && !discountReason?.trim()) {
+        throw new Error('A discount needs a reason — it is the only record of why the family paid less.');
+    }
+    if (!dueDate) throw new Error('An invoice needs a due date.');
+    if (!description?.trim()) throw new Error('Describe what is being billed.');
+
+    const year = academicYearOf().start;
+    const seq = await settings$.nextSequence('invoice');
+
+    const invoice = reconcile({
+        id: uid('INV'),
+        number: sequenceNumber('NAT/INV', year, seq),
+        studentId: student.id,
+        studentName: student.name,
+        branchId: branchId || student.branchId,
+        feePlanId,
+        academicYear: year,
+        description: description.trim(),
+        grossAmount: gross,
+        discount: reduction,
+        discountReason: reduction > 0 ? discountReason.trim() : null,
+        amount: gross - reduction,
+        paidAmount: 0,
+        dueDate,
+        issuedOn: localDate(),
+        status: INVOICE_STATUS.OPEN,
+        createdAt: nowISO(),
+        createdBy: session.actorId(),
+        updatedAt: nowISO(),
+        updatedBy: session.actorId(),
+        deletedAt: null
+    });
+
+    await db.put('invoices', invoice);
+    bus.emit(EVENTS.INVOICE_CREATED, { invoice });
+    return invoice;
+}
+
+/* ==========================================================================
+   COLLECTION
+   ========================================================================== */
+
+/**
+ * Records money received against an invoice.
+ *
+ * The whole operation — invoice update, payment row, ledger income entry —
+ * happens in one transaction. The receipt number is allocated first, outside
+ * the transaction, because the sequence counter lives in its own unit of work
+ * and nesting the two would deadlock the settings store against itself.
+ *
+ * @returns {Promise<{payment: object, invoice: object}>}
+ */
+export async function recordPayment({ invoiceId, amount, mode, reference = null, paidOn = null, note = null }) {
+    session.require('fee.collect', 'collect fees');
+
+    const invoice = await invoices$.findOrFail(invoiceId);
+    const value = Math.round(Number(amount) || 0);
+    const date = paidOn || localDate();
+
+    /* -------- Validation, in the order a person would notice a problem ---- */
+    if (value <= 0) throw new Error('Enter an amount greater than zero.');
+    if (invoice.status === INVOICE_STATUS.CANCELLED) throw new Error('This invoice was cancelled. Raise a new one.');
+    if (invoice.status === INVOICE_STATUS.WAIVED) throw new Error('This invoice was waived, so there is nothing to collect.');
+    if (invoice.balance <= 0) throw new Error(`Invoice ${invoice.number} is already settled.`);
+    if (value > invoice.balance) {
+        throw new Error(`That is more than the ₹${(invoice.balance / 100).toFixed(2)} outstanding on this invoice. Split it across invoices instead.`);
+    }
+    if (date > localDate()) throw new Error('A payment cannot be dated in the future.');
+
+    const modeDef = PAYMENT_MODES.find((m) => m.value === mode);
+    if (!modeDef) throw new Error('Choose how the payment was made.');
+    if (modeDef.needsReference && !reference?.trim()) {
+        throw new Error(`A ${modeDef.label.toLowerCase()} payment needs a reference number — it is what reconciles the bank statement.`);
+    }
+
+    const year = academicYearOf().start;
+    const seq = await settings$.nextSequence('receipt');
+    const receiptNo = sequenceNumber('NAT/RCP', year, seq);
+
+    const payment = {
+        id: uid('PAY'),
+        receiptNo,
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.number,
+        studentId: invoice.studentId,
+        studentName: invoice.studentName,
+        branchId: invoice.branchId,
+        amount: value,
+        mode,
+        reference: reference?.trim() || null,
+        note: note?.trim() || null,
+        paidOn: date,
+        status: PAYMENT_STATUS.CLEARED,
+        collectedBy: session.actorId(),
+        collectedByName: session.actorName(),
+        createdAt: nowISO(),
+        createdBy: session.actorId(),
+        updatedAt: nowISO(),
+        updatedBy: session.actorId(),
+        deletedAt: null
+    };
+
+    const nextInvoice = reconcile({
+        ...invoice,
+        paidAmount: (invoice.paidAmount || 0) + value,
+        updatedAt: nowISO(),
+        updatedBy: session.actorId()
+    });
+
+    const ledgerEntry = {
+        id: uid('LDG'),
+        branchId: invoice.branchId,
+        date,
+        period: monthKey(date),
+        account: 'Tuition fees',
+        type: 'income',
+        amount: value,
+        narration: `${invoice.studentName} — receipt ${receiptNo}`,
+        sourceType: 'payment',
+        sourceId: payment.id,
+        createdAt: nowISO(),
+        createdBy: session.actorId(),
+        updatedAt: nowISO(),
+        updatedBy: session.actorId()
+    };
+
+    await db.unit(['invoices', 'payments', 'ledgerEntries', 'auditLog'], async (s) => {
+        await request(s.invoices.put(nextInvoice));
+        await request(s.payments.put(payment));
+        await request(s.ledgerEntries.put(ledgerEntry));
+        await request(s.auditLog.put(auditRow('Payment', payment.id, 'create', {
+            receiptNo, amount: value, invoice: invoice.number
+        })));
+    }, 'fee:payment');
+
+    bus.emit(EVENTS.PAYMENT_RECORDED, { payment, invoice: nextInvoice });
+    bus.emit(EVENTS.LEDGER_POSTED, { entry: ledgerEntry });
+    return { payment, invoice: nextInvoice };
+}
+
+/**
+ * Reverses a payment. The original row is kept and marked refunded rather than
+ * deleted, and a contra ledger entry is posted rather than the income entry
+ * being removed: a receipt handed to a parent must remain findable, and an
+ * auditor needs to see the reversal, not an absence.
+ */
+export async function refundPayment(paymentId, { reason, refundedOn = null }) {
+    session.require('fee.refund', 'refund a payment');
+
+    const payment = await payments$.findOrFail(paymentId);
+    if (payment.status === PAYMENT_STATUS.REFUNDED) throw new Error('This payment has already been refunded.');
+    if (!reason?.trim()) throw new Error('A refund needs a reason.');
+
+    const date = refundedOn || localDate();
+    const invoice = await invoices$.find(payment.invoiceId);
+
+    const nextPayment = {
+        ...payment,
+        status: PAYMENT_STATUS.REFUNDED,
+        refundedOn: date,
+        refundReason: reason.trim(),
+        refundedBy: session.actorId(),
+        updatedAt: nowISO(),
+        updatedBy: session.actorId()
+    };
+
+    const nextInvoice = invoice ? reconcile({
+        ...invoice,
+        paidAmount: Math.max(0, (invoice.paidAmount || 0) - payment.amount),
+        updatedAt: nowISO(),
+        updatedBy: session.actorId()
+    }) : null;
+
+    const contra = {
+        id: uid('LDG'),
+        branchId: payment.branchId,
+        date,
+        period: monthKey(date),
+        account: 'Tuition fees',
+        type: 'expense',
+        amount: payment.amount,
+        narration: `Refund of receipt ${payment.receiptNo} — ${reason.trim()}`,
+        sourceType: 'refund',
+        sourceId: payment.id,
+        createdAt: nowISO(),
+        createdBy: session.actorId(),
+        updatedAt: nowISO(),
+        updatedBy: session.actorId()
+    };
+
+    await db.unit(['invoices', 'payments', 'ledgerEntries', 'auditLog'], async (s) => {
+        await request(s.payments.put(nextPayment));
+        if (nextInvoice) await request(s.invoices.put(nextInvoice));
+        await request(s.ledgerEntries.put(contra));
+        await request(s.auditLog.put(auditRow('Payment', payment.id, 'refund', { reason: reason.trim(), amount: payment.amount })));
+    }, 'fee:refund');
+
+    bus.emit(EVENTS.PAYMENT_REFUNDED, { payment: nextPayment, invoice: nextInvoice });
+    return { payment: nextPayment, invoice: nextInvoice };
+}
+
+/**
+ * Writes off an invoice — scholarship, hardship, goodwill. Distinct from a
+ * discount, which reduces the amount before billing; a waiver forgives money
+ * already owed and therefore always needs a reason on record.
+ */
+export async function waiveInvoice(invoiceId, { reason }) {
+    session.require('fee.waive', 'waive fees');
+
+    const invoice = await invoices$.findOrFail(invoiceId);
+    if (!reason?.trim()) throw new Error('A waiver needs a reason.');
+    if (invoice.status === INVOICE_STATUS.PAID) throw new Error('This invoice is already paid in full.');
+    if (invoice.status === INVOICE_STATUS.CANCELLED) throw new Error('This invoice was cancelled.');
+
+    const next = {
+        ...invoice,
+        status: INVOICE_STATUS.WAIVED,
+        waivedAmount: invoice.balance,
+        waiverReason: reason.trim(),
+        waivedOn: localDate(),
+        waivedBy: session.actorId(),
+        balance: 0,
+        updatedAt: nowISO(),
+        updatedBy: session.actorId()
+    };
+
+    await db.unit(['invoices', 'auditLog'], async (s) => {
+        await request(s.invoices.put(next));
+        await request(s.auditLog.put(auditRow('Invoice', invoice.id, 'waive', { amount: invoice.balance, reason: reason.trim() })));
+    }, 'fee:waive');
+
+    return next;
+}
+
+/** Cancels an unpaid invoice raised in error. Paid invoices must be refunded. */
+export async function cancelInvoice(invoiceId, { reason }) {
+    session.require('fee.collect', 'cancel an invoice');
+
+    const invoice = await invoices$.findOrFail(invoiceId);
+    if ((invoice.paidAmount || 0) > 0) {
+        throw new Error('Money has been received against this invoice. Refund the receipt first, then cancel.');
+    }
+    if (!reason?.trim()) throw new Error('Say why this invoice is being cancelled.');
+
+    const next = {
+        ...invoice,
+        status: INVOICE_STATUS.CANCELLED,
+        balance: 0,
+        cancelReason: reason.trim(),
+        cancelledOn: localDate(),
+        updatedAt: nowISO(),
+        updatedBy: session.actorId()
+    };
+
+    await db.unit(['invoices', 'auditLog'], async (s) => {
+        await request(s.invoices.put(next));
+        await request(s.auditLog.put(auditRow('Invoice', invoice.id, 'cancel', { reason: reason.trim() })));
+    }, 'fee:cancel');
+
+    return next;
+}
+
+/* ==========================================================================
+   MAINTENANCE & REPORTING READS
+   ========================================================================== */
+
+/**
+ * Moves open invoices past their due date to overdue. Run at boot rather than
+ * on a timer: the app may be closed for a fortnight, and a book that only ages
+ * while someone is watching it is wrong every Monday morning.
+ */
+export async function sweepOverdue() {
+    const stale = await invoices$.needingOverdueSweep();
+    if (!stale.length) return 0;
+
+    const updated = stale.map((i) => ({ ...i, status: INVOICE_STATUS.OVERDUE }));
+    await db.putMany('invoices', updated);
+    return updated.length;
+}
+
+/** The complete fee position for one student, as the profile page shows it. */
+export async function studentFeeSummary(studentId) {
+    const [invoices, receipts] = await Promise.all([
+        invoices$.forStudent(studentId),
+        payments$.forStudent(studentId)
+    ]);
+
+    const live = invoices.filter((i) => i.status !== INVOICE_STATUS.CANCELLED);
+    const billed = live.reduce((s, i) => s + (i.amount || 0), 0);
+    const collected = live.reduce((s, i) => s + (i.paidAmount || 0), 0);
+    const outstanding = live.reduce((s, i) => s + (i.balance || 0), 0);
+    const overdue = live
+        .filter((i) => i.balance > 0 && i.dueDate < localDate())
+        .reduce((s, i) => s + i.balance, 0);
+
+    const oldest = live
+        .filter((i) => i.balance > 0)
+        .sort((a, b) => a.dueDate.localeCompare(b.dueDate))[0] || null;
+
     return {
-        rows: rows.sort((a, b) => b.net - a.net),
-        totals: {
-            label: 'Combined net',
-            value: money(rows.reduce((sum, r) => sum + r.net, 0))
-        }
+        invoices, receipts, billed, collected, outstanding, overdue,
+        oldestDue: oldest?.dueDate || null,
+        onTrack: outstanding === 0,
+        timeline: buildTimeline(live, receipts)
     };
 }
 
-export function toCSV(result) {
-    const { report, rows, totals } = result;
-    const lines = [report.columns.map((c) => csvCell(c.label)).join(',')];
-
-    for (const row of rows) {
-        lines.push(report.columns.map((column) => {
-            const raw = row[column.key];
-            // Money and counts export as plain numbers so the spreadsheet can
-            // sum them; formatting is for reading, not for arithmetic.
-            if (column.numeric) return String(toRupees(raw || 0));
-            return csvCell(column.format ? column.format(raw) : raw);
-        }).join(','));
-    }
-
-    if (totals) lines.push(`\n${csvCell(totals.label)},${csvCell(totals.value)}`);
-    return lines.join('\n');
+/** Invoices and receipts interleaved, newest first — the payment timeline. */
+function buildTimeline(invoices, receipts) {
+    const events = [
+        ...invoices.map((i) => ({
+            at: i.issuedOn, kind: 'invoice', title: i.description,
+            detail: i.number, amount: i.amount, status: i.status, id: i.id
+        })),
+        ...receipts.map((p) => ({
+            at: p.paidOn,
+            kind: p.status === PAYMENT_STATUS.REFUNDED ? 'refund' : 'payment',
+            title: p.status === PAYMENT_STATUS.REFUNDED ? `Refunded — ${p.refundReason}` : `Received by ${p.mode}`,
+            detail: p.receiptNo, amount: p.amount, status: p.status, id: p.id
+        }))
+    ];
+    return events.sort((a, b) => (b.at || '').localeCompare(a.at || ''));
 }
-
-export function downloadCSV(result) {
-    const filename = `${result.report.id}-${localDate()}.csv`;
-    // The BOM makes Excel open UTF-8 correctly, which matters for ₹ and for
-    // Telugu names.
-    downloadFile(filename, `\ufeff${toCSV(result)}`, 'text/csv;charset=utf-8');
-    return filename;
-}
-
-function csvCell(value) {
-    if (value === null || value === undefined) return '';
-    const text = String(value);
-    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-}
-
-/* ==========================================================================
-   EXPORT — SPREADSHEET
-   ========================================================================== */
 
 /**
- * SpreadsheetML 2003: plain XML that Excel, LibreOffice and Google Sheets all
- * open natively. Unlike CSV it carries types, so amounts arrive as numbers
- * rather than text, and the header row can be bold — which is the entire
- * practical difference for a report a treasurer prints once a month.
+ * Collection position across a date range — the numbers behind the fee
+ * dashboard and the collections report.
  */
-export function toSpreadsheetXML(result) {
-    const { report, rows, totals, filters, generatedAt, generatedBy } = result;
+export async function collectionSummary({ from, to, branchId = null }) {
+    const [receipts, outstanding] = await Promise.all([
+        payments$.between(from, to, branchId),
+        invoices$.outstanding(branchId)
+    ]);
 
-    const cell = (value, type = 'String') =>
-        `<Cell><Data ss:Type="${type}">${escapeHtml(String(value ?? ''))}</Data></Cell>`;
+    const cleared = receipts.filter((p) => p.status === PAYMENT_STATUS.CLEARED);
+    const refunded = receipts.filter((p) => p.status === PAYMENT_STATUS.REFUNDED);
+    const today = localDate();
 
-    const header = report.columns.map((c) =>
-        `<Cell ss:StyleID="head"><Data ss:Type="String">${escapeHtml(c.label)}</Data></Cell>`).join('');
+    const ageBuckets = [
+        { label: 'Not yet due', test: (i) => i.dueDate >= today },
+        { label: '1–30 days',   test: (i) => i.dueDate < today && i.dueDate >= addDays(today, -30) },
+        { label: '31–60 days',  test: (i) => i.dueDate < addDays(today, -30) && i.dueDate >= addDays(today, -60) },
+        { label: 'Over 60 days',test: (i) => i.dueDate < addDays(today, -60) }
+    ].map((bucket) => {
+        const rows = outstanding.filter(bucket.test);
+        return { label: bucket.label, count: rows.length, amount: rows.reduce((s, i) => s + i.balance, 0) };
+    });
 
-    const body = rows.map((row) => `<Row>${report.columns.map((column) => {
-        const raw = row[column.key];
-        if (column.numeric) return `<Cell ss:StyleID="money"><Data ss:Type="Number">${toRupees(raw || 0)}</Data></Cell>`;
-        return cell(column.format ? column.format(raw) : raw);
-    }).join('')}</Row>`).join('');
-
-    return `<?xml version="1.0"?>
-<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
- <Styles>
-  <Style ss:ID="head"><Font ss:Bold="1"/><Interior ss:Color="#EDEDF2" ss:Pattern="Solid"/></Style>
-  <Style ss:ID="money"><NumberFormat ss:Format="#,##0.00"/></Style>
-  <Style ss:ID="title"><Font ss:Bold="1" ss:Size="14"/></Style>
- </Styles>
- <Worksheet ss:Name="${escapeHtml(report.name.slice(0, 31))}">
-  <Table>
-   <Row><Cell ss:StyleID="title"><Data ss:Type="String">${escapeHtml(report.name)}</Data></Cell></Row>
-   <Row>${cell(`${formatDate(filters.from)} to ${formatDate(filters.to)}`)}</Row>
-   <Row>${cell(`Generated ${formatDateTime(generatedAt)} by ${generatedBy}`)}</Row>
-   <Row></Row>
-   <Row>${header}</Row>
-   ${body}
-   ${totals ? `<Row></Row><Row><Cell ss:StyleID="head"><Data ss:Type="String">${escapeHtml(totals.label)}</Data></Cell>${cell(totals.value)}</Row>` : ''}
-  </Table>
- </Worksheet>
-</Workbook>`;
+    return {
+        collected: cleared.reduce((s, p) => s + p.amount, 0),
+        refunded: refunded.reduce((s, p) => s + p.amount, 0),
+        receiptCount: cleared.length,
+        outstanding: outstanding.reduce((s, i) => s + i.balance, 0),
+        outstandingCount: outstanding.length,
+        byMode: modeBreakdown(cleared),
+        ageing: ageBuckets
+    };
 }
 
-export function downloadSpreadsheet(result) {
-    const filename = `${result.report.id}-${localDate()}.xls`;
-    downloadFile(filename, toSpreadsheetXML(result), 'application/vnd.ms-excel');
-    return filename;
+function modeBreakdown(payments) {
+    return PAYMENT_MODES
+        .map((m) => ({
+            mode: m.value,
+            label: m.label,
+            amount: payments.filter((p) => p.mode === m.value).reduce((s, p) => s + p.amount, 0)
+        }))
+        .filter((row) => row.amount > 0)
+        .sort((a, b) => b.amount - a.amount);
 }
-
-/* ==========================================================================
-   EXPORT — PRINT / PDF
-   ========================================================================== */
 
 /**
- * Renders a report as a standalone printable document and opens the browser's
- * print dialogue, where "Save as PDF" is available on every platform this app
- * runs on.
- *
- * The letterhead is built from the institute settings so a printed fee
- * statement carries the school's own name and address rather than looking like
- * a database dump — which is the actual reason a school asks for PDF export.
+ * Everything a printed receipt needs, resolved in one call so the print view
+ * has no queries of its own.
  */
-export async function printReport(result) {
-    const org = await institute();
-    const { report, rows, totals, filters, note, generatedAt, generatedBy } = result;
-
-    const head = report.columns
-        .map((c) => `<th${c.align === 'right' ? ' class="r"' : ''}>${escapeHtml(c.label)}</th>`).join('');
-
-    const body = rows.map((row) => `<tr>${report.columns.map((column) => {
-        const raw = row[column.key];
-        const text = column.format ? column.format(raw) : (raw ?? '');
-        return `<td${column.align === 'right' ? ' class="r"' : ''}${row.emphasis ? ' class="b"' : ''}>${escapeHtml(String(text))}</td>`;
-    }).join('')}</tr>`).join('');
-
-    const html = `<!doctype html>
-<html><head><meta charset="utf-8"><title>${escapeHtml(report.name)} — ${escapeHtml(org.name)}</title>
-<style>
-  @page { size: A4; margin: 16mm 14mm; }
-  * { box-sizing: border-box; }
-  body { font: 11px/1.5 "Segoe UI", system-ui, sans-serif; color: #14141c; margin: 0; }
-  header { border-bottom: 2px solid #2f2a6b; padding-bottom: 10px; margin-bottom: 16px; }
-  .org { font-size: 16px; font-weight: 700; color: #2f2a6b; letter-spacing: -0.01em; }
-  .sub { color: #5c5c6e; font-size: 10px; margin-top: 2px; }
-  h1 { font-size: 13px; margin: 14px 0 2px; }
-  .meta { color: #5c5c6e; font-size: 10px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-  th { text-align: left; font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.05em;
-       color: #5c5c6e; border-bottom: 1px solid #c9c9d4; padding: 6px 6px 5px; }
-  td { padding: 5px 6px; border-bottom: 1px solid #ededf2; }
-  .r { text-align: right; font-variant-numeric: tabular-nums; }
-  .b { font-weight: 600; }
-  tbody tr:nth-child(even) { background: #fafafc; }
-  .totals { margin-top: 14px; padding-top: 10px; border-top: 2px solid #2f2a6b;
-            display: flex; justify-content: space-between; font-weight: 700; font-size: 12px; }
-  footer { margin-top: 20px; padding-top: 8px; border-top: 1px solid #ededf2;
-           color: #8a8a9a; font-size: 9px; display: flex; justify-content: space-between; }
-  @media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
-</style></head>
-<body>
-  <header>
-    <div class="org">${escapeHtml(org.name)}</div>
-    <div class="sub">${[org.address, org.phone, org.email].filter(Boolean).map(escapeHtml).join(' · ')}</div>
-  </header>
-  <h1>${escapeHtml(report.name)}</h1>
-  <div class="meta">${formatDate(filters.from)} to ${formatDate(filters.to)}${note ? ` · ${escapeHtml(note)}` : ''}</div>
-  <table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>
-  ${totals ? `<div class="totals"><span>${escapeHtml(totals.label)}</span><span>${escapeHtml(totals.value)}</span></div>` : ''}
-  <footer>
-    <span>Generated ${formatDateTime(generatedAt)} by ${escapeHtml(generatedBy)}</span>
-    <span>${rows.length} record${rows.length === 1 ? '' : 's'}</span>
-  </footer>
-</body></html>`;
-
-    const frame = document.createElement('iframe');
-    frame.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;';
-    document.body.appendChild(frame);
-
-    frame.srcdoc = html;
-    await new Promise((resolve) => { frame.onload = resolve; });
-
-    frame.contentWindow.focus();
-    frame.contentWindow.print();
-
-    // Left in the document until the print dialogue has certainly been read
-    // from; removing it immediately cancels the job in some browsers.
-    setTimeout(() => frame.remove(), 60000);
-    return true;
+export async function receiptData(paymentId) {
+    const payment = await payments$.findOrFail(paymentId);
+    const [invoice, student, institute] = await Promise.all([
+        invoices$.find(payment.invoiceId),
+        students$.find(payment.studentId),
+        settings$.get('institute', {})
+    ]);
+    return { payment, invoice, student, institute };
 }
 
 /* ------------------------------------------------------------------ HELPERS */
 
-
-export { startOfMonth, endOfMonth, monthKey, academicYearOf };
