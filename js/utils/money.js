@@ -37,19 +37,6 @@ export function percentOf(paise, percent) {
     return Math.round(((Math.round(Number(paise)) || 0) * (Number(percent) || 0)) / 100);
 }
 
-/**
- * Splits an amount into n instalments without losing or inventing a paisa.
- * The remainder goes onto the first instalment, so the last one is never the
- * odd amount a parent has to query.
- */
-export function splitInstalments(totalPaise, count) {
-    const total = Math.round(Number(totalPaise)) || 0;
-    const n = Math.max(1, Math.floor(count));
-    const base = Math.floor(total / n);
-    const remainder = total - base * n;
-    return Array.from({ length: n }, (_, i) => (i === 0 ? base + remainder : base));
-}
-
 /* ------------------------------------------------------------- FORMATTING */
 
 const INR = new Intl.NumberFormat('en-IN', {

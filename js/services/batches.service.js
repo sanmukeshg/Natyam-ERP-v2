@@ -48,7 +48,7 @@ export async function findConflicts(candidate) {
     for (const other of others) {
         if (!sharesDay(candidate, other) || !overlaps(candidate, other)) continue;
 
-        const days = (candidate.days || []).filter((d) => other.days.includes(d));
+        const days = (candidate.days || []).filter((d) => (other.days || []).includes(d));
         const when = `${days.join(', ')} ${other.startTime}–${other.endTime}`;
 
         if (candidate.teacherId && candidate.teacherId === other.teacherId) {

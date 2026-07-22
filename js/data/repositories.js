@@ -18,7 +18,7 @@ import { db, request } from '../core/db.js';
 import { localDate, monthKey } from '../utils/date.js';
 import {
     STUDENT_STATUS, ADMISSION_STATUS, INVOICE_STATUS,
-    ATTENDANCE_STATUS, LEVELS
+    ATTENDANCE_STATUS, LEVELS, CURRICULUM_STATUS, DEFAULT_FEE_FREQUENCY, feeFrequency
 } from '../config/app.config.js';
 
 /* ==========================================================================
@@ -471,11 +471,19 @@ class FeePlanRepository extends Repository {
     }
 
     beforeSave(record) {
+        // A plan stores what is due each period plus the period itself. Plans
+        // written before the monthly change carried a yearly figure split into
+        // instalments; those are read through here so an un-migrated record
+        // still resolves to a sensible monthly amount.
+        const frequency = record.frequency || DEFAULT_FEE_FREQUENCY;
+        const legacyMonthly = record.annualAmount != null
+            ? Math.round(Number(record.annualAmount) / 12)
+            : 0;
         return {
             ...record,
             status: record.status || 'active',
-            annualAmount: Math.round(Number(record.annualAmount) || 0),
-            instalments: Math.max(1, Number(record.instalments) || 1),
+            frequency,
+            amount: Math.round(Number(record.amount ?? legacyMonthly) || 0),
             registrationFee: Math.round(Number(record.registrationFee) || 0),
             costumeFee: Math.round(Number(record.costumeFee) || 0)
         };
@@ -484,8 +492,8 @@ class FeePlanRepository extends Repository {
     validate(record) {
         if (!record.name?.trim()) throw new Error('A fee plan needs a name.');
         if (!record.level) throw new Error('A fee plan applies to a level.');
-        if (record.annualAmount <= 0) throw new Error('The annual amount must be more than zero.');
-        if (record.instalments > 12) throw new Error('Twelve instalments is the maximum.');
+        if (record.amount <= 0) throw new Error('The monthly fee must be more than zero.');
+        if (!feeFrequency(record.frequency)) throw new Error('That fee frequency is not recognised.');
     }
 
     async active() {
@@ -873,6 +881,79 @@ class UserRepository extends Repository {
     }
 }
 
+/* ==========================================================================
+   CURRICULUM & ACADEMIC STRUCTURE (Phase 2)
+   Independent of batches. A curriculum owns its Level → Stage → Lesson tree
+   in `structure`; the level vocabulary lives in its own store so it can be
+   edited without code changes.
+   ========================================================================== */
+
+class CurriculumRepository extends Repository {
+    constructor() {
+        super({ store: 'curricula', prefix: 'CUR', entity: 'Curriculum', searchFields: ['name', 'code'] });
+    }
+
+    beforeSave(record) {
+        return {
+            ...record,
+            code: String(record.code || '').trim().toUpperCase(),
+            name: String(record.name || '').trim(),
+            status: record.status || CURRICULUM_STATUS.ACTIVE,
+            sortOrder: Number(record.sortOrder) || 0,
+            structure: record.structure && typeof record.structure === 'object'
+                ? { levels: Array.isArray(record.structure.levels) ? record.structure.levels : [] }
+                : { levels: [] }
+        };
+    }
+
+    validate(record) {
+        if (!record.name) throw new Error('A curriculum needs a name.');
+        if (!record.code) throw new Error('A curriculum needs a short code, e.g. KUCHI-FND.');
+    }
+
+    async active() {
+        return (await this.all())
+            .filter((c) => c.status === CURRICULUM_STATUS.ACTIVE)
+            .sort((a, b) => (a.sortOrder - b.sortOrder) || a.name.localeCompare(b.name));
+    }
+
+    async ordered() {
+        return (await this.all())
+            .sort((a, b) => (a.sortOrder - b.sortOrder) || a.name.localeCompare(b.name));
+    }
+}
+
+class CurriculumLevelRepository extends Repository {
+    constructor() {
+        super({ store: 'curriculumLevels', prefix: 'CLV', entity: 'Curriculum level', searchFields: ['name', 'code'] });
+    }
+
+    beforeSave(record) {
+        return {
+            ...record,
+            code: String(record.code || '').trim().toUpperCase(),
+            name: String(record.name || '').trim(),
+            status: record.status || CURRICULUM_STATUS.ACTIVE,
+            sortOrder: Number(record.sortOrder) || 0
+        };
+    }
+
+    validate(record) {
+        if (!record.name) throw new Error('A level needs a name.');
+    }
+
+    async active() {
+        return (await this.all())
+            .filter((l) => l.status === CURRICULUM_STATUS.ACTIVE)
+            .sort((a, b) => (a.sortOrder - b.sortOrder) || a.name.localeCompare(b.name));
+    }
+
+    async ordered() {
+        return (await this.all())
+            .sort((a, b) => (a.sortOrder - b.sortOrder) || a.name.localeCompare(b.name));
+    }
+}
+
 /**
  * Settings are key/value, not entities: no ids, no audit noise, no soft
  * delete. A thin wrapper rather than a Repository subclass, because none of
@@ -951,6 +1032,8 @@ export const documents$     = new DocumentRepository();
 export const notifications$ = new NotificationRepository();
 export const audit$         = new AuditRepository();
 export const users$         = new UserRepository();
+export const curricula$        = new CurriculumRepository();
+export const curriculumLevels$ = new CurriculumLevelRepository();
 
 /** Static analysis helpers re-exported so pages import from one place. */
 export const AttendanceMath = AttendanceRepository;

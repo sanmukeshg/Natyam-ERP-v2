@@ -31,7 +31,7 @@ import { session } from '../../core/session.js';
 import { EVENTS } from '../../core/bus.js';
 import { formatMoney, formatNumber } from '../../utils/money.js';
 import { formatDate, formatDateTime, relativeTime, localDate } from '../../utils/date.js';
-import { LEVELS, PROGRAM_TYPES, EXPENSE_CATEGORIES, ROLES, STORE_NAMES } from '../../config/app.config.js';
+import { PROGRAM_TYPES, EXPENSE_CATEGORIES, STORE_NAMES, curriculum, levelLabel, roleTable, roleLabel, exposedFeeFrequencies, DEFAULT_FEE_FREQUENCY } from '../../config/app.config.js';
 
 import {
     institute, updateInstitute, listBranches, createBranch, updateBranch, closeBranch,
@@ -47,7 +47,6 @@ import { IMPORTERS, readFile, dryRun, commit } from '../../services/import.servi
 const TABS = [
     { key: 'institute', label: 'Institute' },
     { key: 'branches', label: 'Branches' },
-    { key: 'years', label: 'Academic years' },
     { key: 'fees', label: 'Fee plans' },
     { key: 'curriculum', label: 'Curriculum' },
     { key: 'users', label: 'Users' },
@@ -120,7 +119,6 @@ export default class SettingsPage extends Page {
         const builders = {
             institute: () => this.institutePanel(),
             branches: () => this.branchesPanel(),
-            years: () => this.yearsPanel(),
             fees: () => this.feesPanel(),
             curriculum: () => this.curriculumPanel(),
             users: () => this.usersPanel(),
@@ -178,7 +176,8 @@ export default class SettingsPage extends Page {
     /* ------------------------------------------------------------- INSTITUTE */
 
     async institutePanel() {
-        const org = await institute();
+        const [org, years] = await Promise.all([institute(), listAcademicYears()]);
+        const current = years.find((y) => y.isCurrent) || years[0] || null;
 
         return html`
             <div class="card">
@@ -204,6 +203,37 @@ export default class SettingsPage extends Page {
                         ['Registration', org.registrationNo],
                         ['Tax number', org.taxNo]
                     ])}
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">Current academic year</h2>
+                    <p class="card-subtitle">
+                        The dance year runs June to May. Past years are kept for reporting.
+                    </p>
+                    ${session.can('settings.edit') ? html`
+                        <div class="card-actions">
+                            <button class="btn btn-sm" data-do="new-year">Add a year</button>
+                        </div>
+                    ` : ''}
+                </div>
+                <div class="card-body">
+                    ${current ? html`
+                        <p class="type-lg type-strong">${current.label}</p>
+                        <p class="type-caption type-muted">
+                            ${formatDate(current.startsOn)} — ${formatDate(current.endsOn)}
+                        </p>
+                        ${years.length > 1 && session.can('settings.edit') ? html`
+                            <div class="row row-wrap" style="margin-top: var(--space-3); gap: var(--space-2);">
+                                ${years.filter((y) => !y.isCurrent).map((year) => html`
+                                    <button class="btn btn-sm btn-ghost" data-do="set-year" data-id="${year.id}">
+                                        Switch to ${year.label}
+                                    </button>
+                                `)}
+                            </div>
+                        ` : ''}
+                    ` : html`<p class="type-caption type-muted">No academic year set.</p>`}
                 </div>
             </div>
         `;
@@ -338,54 +368,6 @@ export default class SettingsPage extends Page {
 
     /* ----------------------------------------------------------------- YEARS */
 
-    async yearsPanel() {
-        const years = await listAcademicYears();
-
-        return html`
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">Academic years</h2>
-                    <p class="card-subtitle">
-                        The Indian dance year runs June to May, which is why the default period is not January.
-                    </p>
-                    ${session.can('settings.edit') ? html`
-                        <div class="card-actions">
-                            <button class="btn btn-sm btn-primary" data-do="new-year">Add a year</button>
-                        </div>
-                    ` : ''}
-                </div>
-                <div class="card-body card-body-flush">
-                    ${years.length ? html`
-                        <div class="table-wrap"><table class="table">
-                            <thead><tr>
-                                <th scope="col">Year</th><th scope="col">From</th>
-                                <th scope="col">To</th><th scope="col">Status</th><th scope="col"></th>
-                            </tr></thead>
-                            <tbody>
-                                ${years.map((year) => html`
-                                    <tr>
-                                        <th scope="row">${year.label}</th>
-                                        <td>${formatDate(year.startsOn)}</td>
-                                        <td>${formatDate(year.endsOn)}</td>
-                                        <td>${year.isCurrent
-                                            ? html`<span class="badge badge-success">Current</span>`
-                                            : html`<span class="badge badge-neutral">Past</span>`}</td>
-                                        <td class="text-right">
-                                            ${!year.isCurrent && session.can('settings.edit') ? html`
-                                                <button class="btn btn-sm btn-ghost"
-                                                        data-do="set-year" data-id="${year.id}">Make current</button>
-                                            ` : ''}
-                                        </td>
-                                    </tr>
-                                `)}
-                            </tbody>
-                        </table></div>
-                    ` : html`<div class="empty empty-compact"><p class="empty-text">No academic years defined.</p></div>`}
-                </div>
-            </div>
-        `;
-    }
-
     async newYear() {
         const saved = await formOverlay({
             title: 'Add an academic year',
@@ -422,7 +404,7 @@ export default class SettingsPage extends Page {
                 <div class="card-header">
                     <h2 class="card-title">Fee plans</h2>
                     <p class="card-subtitle">
-                        The fee for a year and how many instalments it is split into. Changing a plan
+                        What each student pays a month. Changing a plan
                         does not alter invoices already raised — a bill the family has already been
                         given does not change because the price list did.
                     </p>
@@ -436,9 +418,8 @@ export default class SettingsPage extends Page {
                     <div class="table-wrap"><table class="table">
                         <thead><tr>
                             <th scope="col">Plan</th><th scope="col">Level</th>
-                            <th scope="col" class="text-right">Instalments</th>
-                            <th scope="col" class="text-right">Each</th>
-                            <th scope="col" class="text-right">Per year</th>
+                            <th scope="col" class="text-right">Monthly fee</th>
+                            <th scope="col" class="text-right">Year total</th>
                             <th scope="col">Status</th><th scope="col"></th>
                         </tr></thead>
                         <tbody>
@@ -454,12 +435,9 @@ export default class SettingsPage extends Page {
                                                 ].filter(Boolean).join(' and ')}
                                             </div>` : ''}
                                     </th>
-                                    <td>${LEVELS.find((l) => l.value === plan.level)?.label || 'Any'}</td>
-                                    <td class="text-right">${plan.instalments || 1}</td>
-                                    <td class="text-right">
-                                        ${formatMoney(Math.round(plan.annualAmount / (plan.instalments || 1)))}
-                                    </td>
-                                    <td class="text-right type-strong">${formatMoney(plan.annualAmount)}</td>
+                                    <td>${levelLabel(plan.level, 'Any')}</td>
+                                    <td class="text-right type-strong">${formatMoney(plan.amount)}</td>
+                                    <td class="text-right type-muted">${formatMoney(plan.yearlyTotal)}</td>
                                     <td><span class="badge ${plan.status === 'active' ? 'badge-success' : 'badge-neutral'}">
                                         ${plan.status || 'active'}</span></td>
                                     <td class="text-right">
@@ -495,13 +473,20 @@ export default class SettingsPage extends Page {
                 {
                     name: 'level', label: 'Level', type: 'select', width: 'half', value: plan?.level,
                     placeholder: 'Any level',
-                    options: LEVELS.map((l) => ({ value: l.value, label: l.label }))
+                    options: curriculum().map((l) => ({ value: l.value, label: l.label }))
                 },
-                { name: 'annualAmount', label: 'Fee for the year', type: 'money', required: true,
-                  width: 'half', value: plan?.annualAmount },
-                { name: 'instalments', label: 'Split into', type: 'number', required: true,
-                  width: 'half', value: plan?.instalments ?? 12, min: 1, max: 12,
-                  hint: 'Twelve for monthly, four for termly, one for a single annual bill.' },
+                { name: 'amount', label: 'Monthly fee', type: 'money', required: true,
+                  width: 'half', value: plan?.amount,
+                  hint: 'Collected every month of the academic year.' },
+                // NATYAM collects monthly, so with a single exposed frequency
+                // there is nothing to choose and no field is shown. Marking
+                // another frequency `exposed` in the config surfaces this
+                // automatically — no change needed here.
+                ...(exposedFeeFrequencies().length > 1 ? [{
+                    name: 'frequency', label: 'Billing frequency', type: 'select', required: true,
+                    width: 'half', value: plan?.frequency || DEFAULT_FEE_FREQUENCY,
+                    options: exposedFeeFrequencies().map((f) => ({ value: f.value, label: f.label }))
+                }] : []),
                 { name: 'registrationFee', label: 'One-off registration fee', type: 'money',
                   width: 'half', value: plan?.registrationFee },
                 { name: 'costumeFee', label: 'Costume fee', type: 'money',
@@ -565,7 +550,7 @@ export default class SettingsPage extends Page {
                             <th scope="col">Typical duration</th><th scope="col">Description</th>
                         </tr></thead>
                         <tbody>
-                            ${LEVELS.map((level, index) => html`
+                            ${curriculum().map((level, index) => html`
                                 <tr>
                                     <td>${index + 1}</td>
                                     <th scope="row">${level.label}</th>
@@ -647,7 +632,7 @@ export default class SettingsPage extends Page {
                                             ? html`<span class="badge badge-accent badge-sm">you</span>` : ''}
                                         <div class="type-caption type-muted">${user.email || ''}</div>
                                     </th>
-                                    <td>${ROLES[user.role]?.label || user.role}</td>
+                                    <td>${roleLabel(user.role) || user.role}</td>
                                     <td>${user.branchName || 'All branches'}</td>
                                     <td class="type-caption">
                                         ${user.lastSeenAt ? relativeTime(user.lastSeenAt) : 'never'}
@@ -687,7 +672,7 @@ export default class SettingsPage extends Page {
                 {
                     name: 'role', label: 'Role', type: 'select', required: true, width: 'half',
                     value: user?.role || 'registrar',
-                    options: Object.entries(ROLES).map(([value, role]) => ({
+                    options: Object.entries(roleTable()).map(([value, role]) => ({
                         value, label: role.label, note: role.description
                     }))
                 },

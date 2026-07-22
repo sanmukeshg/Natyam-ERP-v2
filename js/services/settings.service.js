@@ -18,8 +18,8 @@ import { bus, EVENTS } from '../core/bus.js';
 import { session } from '../core/session.js';
 import { db } from '../core/db.js';
 import { localDate } from '../utils/date.js';
-import { toPaise, splitInstalments } from '../utils/money.js';
-import { LEVELS, ROLES, CAPABILITIES, PREFERENCE_DEFAULTS } from '../config/app.config.js';
+import { toPaise } from '../utils/money.js';
+import { CAPABILITIES, PREFERENCE_DEFAULTS, curriculum, levelLabel, roleTable, roleCapabilities, roleLabel, configureCurriculum, configureRoles, DEFAULT_FEE_FREQUENCY, feeFrequency } from '../config/app.config.js';
 import {
     settings$, branches$, academicYears$, feePlans$, users$, students$, staff$, batches$, invoices$
 } from '../data/repositories.js';
@@ -69,6 +69,41 @@ export async function setSetting(key, value) {
     await settings$.set(key, value);
     bus.emit(EVENTS.SETTINGS_CHANGED, { key, value });
     return value;
+}
+
+/**
+ * Settings keys under which the school's edited curriculum ladder and role
+ * matrix are stored once those editors exist. Named here so the future editor
+ * and this loader can never disagree on the key.
+ */
+const STRUCTURAL_OVERRIDE_KEYS = Object.freeze({
+    curriculum: 'curriculum.override',
+    roles: 'roles.override'
+});
+
+/**
+ * Installs any database-stored curriculum/role overrides into the resolution
+ * seam in app.config, once, at boot — before the session hydrates, so a
+ * customised matrix already governs capability gating.
+ *
+ * No override has been written yet, so both reads return null and this is a
+ * genuine no-op that leaves the frozen defaults in force. A malformed override
+ * must never brick start-up, so failures fall back to defaults with a warning
+ * rather than propagating.
+ */
+export async function applyStructuralOverrides() {
+    try {
+        const [levels, roles] = await Promise.all([
+            getSetting(STRUCTURAL_OVERRIDE_KEYS.curriculum, null),
+            getSetting(STRUCTURAL_OVERRIDE_KEYS.roles, null)
+        ]);
+        configureCurriculum(levels);
+        configureRoles(roles);
+    } catch (err) {
+        console.warn('Could not load structural overrides; using built-in defaults.', err);
+        configureCurriculum(null);
+        configureRoles(null);
+    }
 }
 
 /* ==========================================================================
@@ -209,9 +244,12 @@ export async function listFeePlans({ includeInactive = false } = {}) {
 
     return rows.map((plan, i) => ({
         ...plan,
-        levelLabel: LEVELS.find((l) => l.value === plan.level)?.label || plan.level || 'Any level',
+        levelLabel: levelLabel(plan.level, 'Any level'),
         inUse: counts[i],
-        instalmentAmounts: splitInstalments(plan.annualAmount, plan.instalments || 1)
+        frequencyLabel: feeFrequency(plan.frequency).label,
+        // What the year adds up to, derived from the cadence rather than stored,
+        // so it stays correct if a future frequency is introduced.
+        yearlyTotal: (Number(plan.amount) || 0) * feeFrequency(plan.frequency).periodsPerYear
     })).sort((a, b) => (a.levelOrder || 0) - (b.levelOrder || 0) || a.name.localeCompare(b.name));
 }
 
@@ -248,21 +286,26 @@ export async function retireFeePlan(id) {
 }
 
 function normalisePlan(data) {
-    const annual = typeof data.annualAmount === 'number' ? data.annualAmount : toPaise(data.annualAmount || 0);
+    // The form supplies `amount` in paise. A plan written before the monthly
+    // change is read through its yearly figure so an edit never zeroes it.
+    const supplied = data.amount != null
+        ? data.amount
+        : (data.annualAmount != null ? Math.round(Number(data.annualAmount) / 12) : 0);
+    const amount = typeof supplied === 'number' ? supplied : toPaise(supplied || 0);
     const record = {
         ...data,
         name: String(data.name || '').trim(),
-        annualAmount: Math.round(annual),
-        instalments: Math.max(1, Number(data.instalments) || 1),
+        frequency: data.frequency || DEFAULT_FEE_FREQUENCY,
+        amount: Math.round(amount),
         registrationFee: Math.round(Number(data.registrationFee) || 0),
         costumeFee: Math.round(Number(data.costumeFee) || 0),
-        levelOrder: LEVELS.find((l) => l.value === data.level)?.order || 0,
+        levelOrder: curriculum().find((l) => l.value === data.level)?.order || 0,
         status: data.status || 'active'
     };
 
     if (!record.name) throw new Error('A fee plan needs a name.');
-    if (record.annualAmount <= 0) throw new Error('The annual amount must be more than zero.');
-    if (record.instalments > 12) throw new Error('A plan can have at most twelve instalments.');
+    if (record.amount <= 0) throw new Error('The monthly fee must be more than zero.');
+    if (!feeFrequency(record.frequency)) throw new Error('That fee frequency is not recognised.');
     return record;
 }
 
@@ -281,8 +324,8 @@ export async function listUsers() {
     const rows = await users$.all();
     return rows.map((user) => ({
         ...user,
-        roleLabel: ROLES[user.role]?.label || user.role,
-        capabilities: ROLES[user.role]?.capabilities || []
+        roleLabel: roleLabel(user.role) || user.role,
+        capabilities: roleCapabilities(user.role)
     }));
 }
 
@@ -298,7 +341,7 @@ export async function createUser(data) {
     };
 
     if (!record.name) throw new Error('A user needs a name.');
-    if (!record.role || !ROLES[record.role]) throw new Error('Choose a valid role.');
+    if (!record.role || !roleTable()[record.role]) throw new Error('Choose a valid role.');
 
     const clash = record.email && (await users$.all()).find((u) => u.email === record.email);
     if (clash) throw new Error(`${clash.name} already uses that email address.`);
@@ -310,7 +353,7 @@ export async function updateUser(id, changes) {
     session.require('settings.edit', 'edit a user');
 
     const existing = await users$.findOrFail(id);
-    if (changes.role && !ROLES[changes.role]) throw new Error('Choose a valid role.');
+    if (changes.role && !roleTable()[changes.role]) throw new Error('Choose a valid role.');
 
     // The school must not be able to lock itself out of its own owner account.
     if (existing.role === 'owner' && changes.role && changes.role !== 'owner') {
@@ -339,7 +382,7 @@ export function roleMatrix() {
     const capabilities = Object.entries(CAPABILITIES).map(([key, label]) => ({ key, label }));
     return {
         capabilities,
-        roles: Object.entries(ROLES).map(([value, role]) => ({
+        roles: Object.entries(roleTable()).map(([value, role]) => ({
             value,
             label: role.label,
             description: role.description,

@@ -32,8 +32,15 @@ import {
     WEEK, listBatches, batchDetail, createBatch, updateBatch, closeBatch, reopenBatch
 } from '../../services/batches.service.js';
 import { availableTeachers } from '../../services/staff.service.js';
+import { listBranches } from '../../services/settings.service.js';
 
-const DAY_LABELS = { mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat', sun: 'Sun' };
+// Keys must match the WEEK values exported by batches.service (capitalised),
+// otherwise every lookup misses and the label silently falls back to the raw
+// value. Full names are friendlier in the day picker than the short form.
+const DAY_LABELS = {
+    Mon: 'Monday', Tue: 'Tuesday', Wed: 'Wednesday', Thu: 'Thursday',
+    Fri: 'Friday', Sat: 'Saturday', Sun: 'Sunday'
+};
 
 export default class BatchesPage extends Page {
     constructor(context) {
@@ -185,16 +192,35 @@ export default class BatchesPage extends Page {
     /* ------------------------------------------------------------ CREATE/EDIT */
 
     async batchFields(existing = null) {
-        const teachers = await availableTeachers({
-            branchId: session.branch(),
-            excludeBatchId: existing?.id || null
-        });
+        const [teachers, branches] = await Promise.all([
+            availableTeachers({
+                branchId: session.branch(),
+                excludeBatchId: existing?.id || null
+            }),
+            listBranches()
+        ]);
+
+        // A batch must belong to a branch. The form supplies one rather than
+        // leaving the service to reject a create with no branch attached:
+        //  - single-branch installs and a selected active branch default
+        //    automatically, so nothing extra is asked of the user;
+        //  - with several branches and "All branches" in view, the field is a
+        //    real, required choice — which is what future multi-branch needs.
+        const defaultBranchId = existing?.branchId
+            || session.branch()
+            || (branches.length === 1 ? branches[0].id : '');
 
         return [
             { name: 'name', label: 'Batch name', required: true, width: 'half', value: existing?.name,
               placeholder: 'Prarambhika Morning' },
-            { name: 'code', label: 'Code', width: 'half', value: existing?.code, placeholder: 'PRA-M1',
+            { name: 'code', label: 'Code', required: true, width: 'half', value: existing?.code, placeholder: 'PRA-M1',
               hint: 'Short label used on registers and reports.' },
+            {
+                name: 'branchId', label: 'Branch', type: 'select', required: true, width: 'half',
+                value: defaultBranchId,
+                options: optionsFrom(branches, { label: (b) => b.name }),
+                hint: branches.length > 1 ? 'Which branch this batch runs at.' : null
+            },
             {
                 name: 'level', label: 'Level', type: 'select', required: true, width: 'half', value: existing?.level,
                 options: LEVELS.map((l) => ({ value: l.value, label: l.label })),

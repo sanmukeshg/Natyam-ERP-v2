@@ -85,13 +85,14 @@ export async function seedIfEmpty() {
     }
 
     const students = await seedStudents(branches, batches, plans);
+    await seedCurriculum(students);
     await seedAdmissions(branches, plans);
     await seedAttendance(students, batches);
     const invoices = await seedFeeBook(students, plans, branches);
     await seedFinance(branches, staff, invoices);
     await seedPrograms(branches);
     await seedNotifications(students);
-    await seedSettings(years[0]);
+    await seedSettings(years[0], invoices.sequences);
 
     return {
         seeded: true,
@@ -328,8 +329,8 @@ async function seedFeePlans(year) {
         name: `${level.label} — annual tuition`,
         level: level.value,
         academicYearId: year.id,
-        annualAmount: toPaise(12000 + index * 4500),
-        instalments: index < 2 ? 2 : 4,
+        amount: toPaise(1000 + index * 375),
+        frequency: 'monthly',
         registrationFee: toPaise(index === 0 ? 2500 : 0),
         costumeFee: toPaise(index >= 2 ? 3500 : 0),
         status: 'active',
@@ -424,6 +425,72 @@ async function seedStudents(branches, batches, plans) {
 
     await db.putMany('students', students);
     return students;
+}
+
+/**
+ * One worked example curriculum so a fresh install shows the module in use
+ * rather than an empty screen. The default level vocabulary (Beginner /
+ * Intermediate / Advanced) is created by the schema migration, so this only
+ * builds a curriculum on top of it and assigns it to a slice of students —
+ * independently of their batch, which is the whole point of the separation.
+ */
+async function seedCurriculum(students) {
+    const curriculum = stamp({
+        id: uid('CUR'),
+        code: 'KUCHI-FND',
+        name: 'Kuchipudi Foundation',
+        description: 'The foundational course of study — posture, adavus and the first pure-dance items.',
+        durationValue: 24,
+        durationUnit: 'months',
+        sortOrder: 1,
+        status: 'active',
+        searchKey: 'kuchipudi foundation kuchi-fnd',
+        structure: {
+            levels: [
+                {
+                    id: uid('CLN'), levelId: 'CLV-FND-1', levelName: 'Foundation - Level 1', sortOrder: 1,
+                    stages: [
+                        {
+                            id: uid('STG'), name: 'Foundations', sortOrder: 1,
+                            lessons: [
+                                { id: uid('LSN'), name: 'Namaskaram', sortOrder: 1 },
+                                { id: uid('LSN'), name: 'Araimandi (half-sitting posture)', sortOrder: 2 }
+                            ]
+                        },
+                        {
+                            id: uid('STG'), name: 'Adavus', sortOrder: 2,
+                            lessons: [
+                                { id: uid('LSN'), name: 'Tatta Adavu', sortOrder: 1 },
+                                { id: uid('LSN'), name: 'Natta Adavu', sortOrder: 2 }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    id: uid('CLN'), levelId: 'CLV-INT-CERT', levelName: 'Intermediate - Certificate', sortOrder: 2,
+                    stages: [
+                        {
+                            id: uid('STG'), name: 'Nritta items', sortOrder: 1,
+                            lessons: [
+                                { id: uid('LSN'), name: 'Jatiswaram', sortOrder: 1 },
+                                { id: uid('LSN'), name: 'Sabdam', sortOrder: 2 }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+
+    await db.putMany('curricula', [curriculum]);
+
+    // Assign to roughly a third of active students, re-writing only those rows.
+    const assigned = students
+        .filter((s) => s.status === STUDENT_STATUS.ACTIVE && chance(0.34))
+        .map((s) => ({ ...s, curriculumId: curriculum.id, updatedAt: nowISO() }));
+    if (assigned.length) await db.putMany('students', assigned);
+
+    return curriculum;
 }
 
 async function seedAdmissions(branches, plans) {
@@ -528,12 +595,12 @@ async function seedFeeBook(students, plans, branches) {
         if (student.status === STUDENT_STATUS.INACTIVE) continue;
 
         const plan = plans.find((p) => p.id === student.feePlanId) || plans[0];
-        const count = plan.instalments;
-        const each = Math.round(plan.annualAmount / count);
+        const count = 12;
+        const each = Number(plan.amount) || 0;
 
         for (let i = 0; i < count; i += 1) {
             const dueDate = addDays(student.joinedOn, i * Math.round(365 / count));
-            // Only bill instalments whose due date has arrived or is near.
+            // Only bill months whose due date has arrived or is near.
             if (dueDate > addDays(localDate(), 45)) continue;
 
             invoiceSeq += 1;
@@ -557,7 +624,7 @@ async function seedFeeBook(students, plans, branches) {
                 studentName: student.name,
                 branchId: student.branchId,
                 feePlanId: plan.id,
-                description: `${plan.name} — instalment ${i + 1} of ${count}`,
+                description: `${plan.name} — monthly fee ${i + 1} of ${count}`,
                 amount: each,
                 paidAmount,
                 balance: each - paidAmount,
@@ -588,6 +655,10 @@ async function seedFeeBook(students, plans, branches) {
 
     await db.putMany('invoices', invoices);
     await db.putMany('payments', payments);
+    // The next real invoice must not reuse a seeded number. Returning the
+    // counters actually reached keeps the sequences correct no matter how many
+    // rows the fixture happens to produce.
+    invoices.sequences = { invoice: invoiceSeq, receipt: receiptSeq };
     return invoices;
 }
 
@@ -686,11 +757,15 @@ async function seedNotifications(students) {
     await db.putMany('notifications', items);
 }
 
-async function seedSettings(year) {
+async function seedSettings(year, sequences = {}) {
     await db.putMany('settings', [
         { key: 'institute', value: { name: 'NATYAM — School of Kuchipudi', founded: 2016, principal: 'Acharya Mohan Krishna', gstin: null } },
         { key: 'currentAcademicYearId', value: year.id },
-        { key: 'sequences', value: { admission: 88, application: 12, invoice: 400, receipt: 340, certificate: 24 } },
+        { key: 'sequences', value: {
+            admission: 88, application: 12, certificate: 24,
+            invoice: sequences.invoice ?? 400,
+            receipt: sequences.receipt ?? 340
+        } },
         { key: 'seededAt', value: nowISO() }
     ]);
 }

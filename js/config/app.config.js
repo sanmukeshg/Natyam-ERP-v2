@@ -8,7 +8,7 @@
 
 export const APP = Object.freeze({
     name: 'Natyam ERP',
-    version: '2.0.0',
+    version: '2.2.1',
     organisation: 'NATYAM — School of Kuchipudi',
     locale: 'en-IN',
     currency: 'INR',
@@ -26,7 +26,7 @@ export const APP = Object.freeze({
 
 export const SCHEMA = Object.freeze({
     name: 'natyam_erp',
-    version: 1,
+    version: 4,
 
     stores: {
         branches:       { keyPath: 'id', indexes: [['code', 'code', { unique: true }], ['status', 'status']] },
@@ -35,6 +35,7 @@ export const SCHEMA = Object.freeze({
         students:       { keyPath: 'id', indexes: [
             ['branchId', 'branchId'], ['status', 'status'], ['batchId', 'batchId'],
             ['admissionNo', 'admissionNo', { unique: true }], ['level', 'level'],
+            ['curriculumId', 'curriculumId'],
             ['searchKey', 'searchKey'], ['createdAt', 'createdAt']
         ]},
 
@@ -92,7 +93,18 @@ export const SCHEMA = Object.freeze({
         notifications:  { keyPath: 'id', indexes: [['read', 'read'], ['createdAt', 'createdAt'], ['kind', 'kind']] },
         auditLog:       { keyPath: 'id', indexes: [['entity', 'entity'], ['action', 'action'], ['at', 'at'], ['actorId', 'actorId']] },
         settings:       { keyPath: 'key' },
-        users:          { keyPath: 'id', indexes: [['role', 'role'], ['status', 'status']] }
+        users:          { keyPath: 'id', indexes: [['role', 'role'], ['status', 'status']] },
+
+        /* Curriculum & academic structure (Phase 2). Independent of batches —
+           a student's curriculum and their batch are separate assignments.
+           `curricula` carries its Level → Stage → Lesson tree in `structure`,
+           edited as one document; `curriculumLevels` is the reusable, editable
+           level vocabulary (Beginner / Intermediate / Advanced, extensible). */
+        curricula:       { keyPath: 'id', indexes: [
+            ['code', 'code', { unique: true }], ['status', 'status'],
+            ['sortOrder', 'sortOrder'], ['searchKey', 'searchKey']
+        ]},
+        curriculumLevels:{ keyPath: 'id', indexes: [['status', 'status'], ['sortOrder', 'sortOrder']] }
     },
 
     /**
@@ -104,6 +116,108 @@ export const SCHEMA = Object.freeze({
         {
             to: 1,
             note: 'Initial 2.0 schema. Imports any 1.0 data found on the device.'
+        },
+        {
+            to: 2,
+            note: 'Curriculum & academic structure. Seeds the default, editable level vocabulary.',
+            /* Runs inside the version-change transaction, after the store
+               reconciliation loop has created curriculumLevels. Deterministic
+               ids make this idempotent: a device that somehow re-runs it simply
+               overwrites the same three rows rather than duplicating them. The
+               school is free to rename, reorder, retire or add to these. */
+            upgrade(db, tx) {
+                const at = new Date().toISOString();
+                const store = tx.objectStore('curriculumLevels');
+                [
+                    { code: 'BEGINNER', name: 'Beginner', sortOrder: 1 },
+                    { code: 'INTERMEDIATE', name: 'Intermediate', sortOrder: 2 },
+                    { code: 'ADVANCED', name: 'Advanced', sortOrder: 3 }
+                ].forEach((level) => {
+                    store.put({
+                        id: `CLV-${level.code}`,
+                        code: level.code,
+                        name: level.name,
+                        sortOrder: level.sortOrder,
+                        status: 'active',
+                        createdAt: at,
+                        updatedAt: at,
+                        deletedAt: null
+                    });
+                });
+            }
+        },
+        {
+            to: 3,
+            note: 'Replaces the placeholder level vocabulary with the approved Level / Qualification list.',
+            /* v2.2.0 seeded three placeholder levels (Beginner / Intermediate /
+               Advanced) that were never the approved list. This installs the
+               approved defaults on every device — new and existing — and
+               removes the placeholders so they do not linger in the picker.
+               Deterministic ids keep it idempotent. A level the school has
+               already renamed is left alone: only the untouched placeholders
+               are removed, and a curriculum that referenced one keeps working
+               because the structure caches the level name it was added under. */
+            upgrade(db, tx) {
+                const at = new Date().toISOString();
+                const store = tx.objectStore('curriculumLevels');
+
+                DEFAULT_CURRICULUM_LEVELS.forEach((level, index) => {
+                    store.put({
+                        id: `CLV-${level.code}`,
+                        code: level.code,
+                        name: level.name,
+                        sortOrder: index + 1,
+                        status: 'active',
+                        createdAt: at,
+                        updatedAt: at,
+                        deletedAt: null
+                    });
+                });
+
+                // Drop the placeholders only where they are still exactly as
+                // seeded — anything the school edited is their data, not ours.
+                [
+                    { id: 'CLV-BEGINNER', name: 'Beginner' },
+                    { id: 'CLV-INTERMEDIATE', name: 'Intermediate' },
+                    { id: 'CLV-ADVANCED', name: 'Advanced' }
+                ].forEach((placeholder) => {
+                    const request = store.get(placeholder.id);
+                    request.onsuccess = () => {
+                        const existing = request.result;
+                        if (existing && existing.name === placeholder.name) store.delete(placeholder.id);
+                    };
+                });
+            }
+        },
+        {
+            to: 4,
+            note: 'Fee plans move from a yearly amount split into instalments to a monthly amount.',
+            /* NATYAM collects monthly. A plan previously stored the whole year
+               and how many instalments to split it into; it now stores what is
+               due each period plus the period itself. Existing plans convert by
+               dividing the year by twelve, so a school upgrading keeps working
+               fee plans without re-entering them. The original annual figure is
+               retained on the record for reference and reporting history. */
+            upgrade(db, tx) {
+                const store = tx.objectStore('feePlans');
+                const request = store.openCursor();
+                request.onsuccess = (event) => {
+                    const cursor = event.target.result;
+                    if (!cursor) return;
+                    const plan = cursor.value;
+                    if (plan && plan.amount == null) {
+                        const annual = Number(plan.annualAmount) || 0;
+                        cursor.update({
+                            ...plan,
+                            amount: Math.round(annual / 12),
+                            frequency: 'monthly',
+                            legacyAnnualAmount: annual,
+                            updatedAt: new Date().toISOString()
+                        });
+                    }
+                    cursor.continue();
+                };
+            }
         }
     ]
 });
@@ -138,6 +252,67 @@ export const ATTENDANCE_STATUS = Object.freeze({
     EXCUSED: 'excused',
     HOLIDAY: 'holiday'
 });
+
+/* Curriculum & academic structure (Phase 2). Curricula and curriculum levels
+   share the same simple active/inactive lifecycle; retiring one keeps its
+   history and any student assignments intact while hiding it from new use. */
+export const CURRICULUM_STATUS = Object.freeze({
+    ACTIVE:   'active',
+    INACTIVE: 'inactive'
+});
+
+export const DURATION_UNITS = Object.freeze([
+    { value: 'months', label: 'Months' },
+    { value: 'years',  label: 'Years' }
+]);
+
+/* Fee collection frequency. NATYAM collects monthly, which is the only option
+   offered in the UI. The others are declared so a future release can expose one
+   without reshaping fee plans, invoices or the schedule generator: everything
+   downstream reads periodsPerYear and dayGap from this table rather than
+   assuming a cadence. Set `exposed: true` to surface one in the form. */
+const FEE_FREQUENCIES = Object.freeze([
+    { value: 'monthly',     label: 'Monthly',     periodsPerYear: 12, dayGap: 30,  exposed: true },
+    { value: 'quarterly',   label: 'Quarterly',   periodsPerYear: 4,  dayGap: 91,  exposed: false },
+    { value: 'half_yearly', label: 'Half-yearly', periodsPerYear: 2,  dayGap: 182, exposed: false },
+    { value: 'annual',      label: 'Annual',      periodsPerYear: 1,  dayGap: 365, exposed: false },
+    { value: 'workshop',    label: 'Workshop',    periodsPerYear: 1,  dayGap: 0,   exposed: false },
+    { value: 'one_time',    label: 'One-time',    periodsPerYear: 1,  dayGap: 0,   exposed: false }
+]);
+
+export const DEFAULT_FEE_FREQUENCY = 'monthly';
+
+/** Resolves a frequency, falling back to monthly for unknown or legacy values. */
+export function feeFrequency(value) {
+    return FEE_FREQUENCIES.find((f) => f.value === value)
+        || FEE_FREQUENCIES.find((f) => f.value === DEFAULT_FEE_FREQUENCY);
+}
+
+/** Only the frequencies a user may currently choose. */
+export function exposedFeeFrequencies() {
+    return FEE_FREQUENCIES.filter((f) => f.exposed);
+}
+
+/* The default Level / Qualification vocabulary. "Foundation", "Intermediate"
+   and "Advanced" are display prefixes inside a single flat list — not separate
+   fields, groups or selectors. These are seed values only: the school edits,
+   reorders, retires and extends the list from the Curriculum module, and
+   nothing in the application branches on these names or codes. */
+const DEFAULT_CURRICULUM_LEVELS = Object.freeze([
+    { code: 'FND-1',    name: 'Foundation - Level 1' },
+    { code: 'FND-2',    name: 'Foundation - Level 2' },
+    { code: 'FND-3',    name: 'Foundation - Level 3' },
+    { code: 'FND-4',    name: 'Foundation - Level 4' },
+    { code: 'FND-5',    name: 'Foundation - Level 5' },
+    { code: 'FND-6',    name: 'Foundation - Level 6' },
+    { code: 'FND-7',    name: 'Foundation - Level 7' },
+    { code: 'FND-8',    name: 'Foundation - Level 8' },
+    { code: 'INT-CERT', name: 'Intermediate - Certificate' },
+    { code: 'INT-DIP',  name: 'Intermediate - Diploma' },
+    { code: 'ADV-MAS',  name: 'Advanced - Masters' },
+    { code: 'ADV-THY',  name: 'Advanced - Theory' },
+    { code: 'ADV-PRC',  name: 'Advanced - Practical' }
+]);
 
 export const INVOICE_STATUS = Object.freeze({
     DRAFT:    'draft',
@@ -296,7 +471,9 @@ export const NAVIGATION = Object.freeze([
             { path: '/programs', label: 'Programmes', icon: 'star', cap: CAPABILITIES.PROGRAM_VIEW,
               load: () => import('../modules/programs/programs.page.js') },
             { path: '/certificates', label: 'Certificates', icon: 'award', cap: CAPABILITIES.PROGRAM_VIEW,
-              load: () => import('../modules/certificates/certificates.page.js') }
+              load: () => import('../modules/certificates/certificates.page.js') },
+            { path: '/curriculum', label: 'Curriculum', icon: 'file-text', cap: CAPABILITIES.SETTINGS_VIEW,
+              load: () => import('../modules/curriculum/curriculum.page.js') }
         ]
     },
     {
@@ -323,6 +500,58 @@ export const NAVIGATION = Object.freeze([
     }
 ]);
 
+/* ==========================================================================
+   REFERENCE-DATA RESOLUTION SEAM
+   --------------------------------------------------------------------------
+   Two pieces of structural reference data — the curriculum ladder (LEVELS) and
+   the role → capability matrix (ROLES) — are defined above as frozen defaults.
+   A confirmed business decision makes both of these editable by the school in a
+   later phase, with the edits persisted to the database.
+
+   Rather than have that later change hunt down every reader of LEVELS and ROLES,
+   all resolution now flows through the accessors below. Today they return the
+   frozen defaults unchanged, so behaviour is identical; when a later phase loads
+   overrides from the database it calls configureCurriculum()/configureRoles()
+   once at boot and every consumer follows without further edits.
+
+   The frozen tables remain the source of truth until an override is installed,
+   and remain the fallback if one is ever cleared. Nothing mutates the frozen
+   objects themselves — the overrides are held in these private slots.
+   ========================================================================== */
+
+let _curriculumOverride = null;
+let _rolesOverride = null;
+
+/** Install a database-sourced curriculum. Pass null/empty to fall back to LEVELS. */
+export function configureCurriculum(levels) {
+    _curriculumOverride = Array.isArray(levels) && levels.length ? levels : null;
+}
+
+/** Install a database-sourced role matrix. Pass null/empty to fall back to ROLES. */
+export function configureRoles(roles) {
+    _rolesOverride = roles && typeof roles === 'object' && Object.keys(roles).length ? roles : null;
+}
+
+/** The active curriculum ladder — the override when present, otherwise the frozen default. */
+export function curriculum() {
+    return _curriculumOverride || LEVELS;
+}
+
+/** The active role matrix — the override when present, otherwise the frozen default. */
+export function roleTable() {
+    return _rolesOverride || ROLES;
+}
+
+/** Capabilities granted to a role, resolved through the active matrix. */
+export function roleCapabilities(roleKey) {
+    return roleTable()[roleKey]?.capabilities || [];
+}
+
+/** Display label for a role, resolved through the active matrix. */
+export function roleLabel(roleKey) {
+    return roleTable()[roleKey]?.label || null;
+}
+
 /**
  * The display name for a level value.
  *
@@ -332,9 +561,12 @@ export const NAVIGATION = Object.freeze([
  * missing level read differently depending on which screen showed it. The
  * fallback is now an argument, because a table cell and a sentence genuinely
  * want different things.
+ *
+ * Resolves through curriculum() rather than the frozen LEVELS directly, so a
+ * later editable-curriculum phase relabels every screen through this one point.
  */
 export function levelLabel(value, fallback = null) {
-    return LEVELS.find((l) => l.value === value)?.label || value || fallback;
+    return curriculum().find((l) => l.value === value)?.label || value || fallback;
 }
 
 /**

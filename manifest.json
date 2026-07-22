@@ -1,64 +1,23 @@
-<!doctype html>
-<html lang="en" data-theme="light" data-density="comfortable">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <title>NATYAM — School of Kuchipudi</title>
-    <meta name="description" content="School management for NATYAM — admissions, attendance, fees, finance and certificates. Works entirely offline.">
-
-    <meta name="theme-color" content="#2f2a6b" media="(prefers-color-scheme: light)">
-    <meta name="theme-color" content="#14141c" media="(prefers-color-scheme: dark)">
-    <meta name="color-scheme" content="light dark">
-
-    <link rel="manifest" href="manifest.json">
-    <link rel="icon" href="assets/icons/icon.svg" type="image/svg+xml">
-    <link rel="apple-touch-icon" href="assets/icons/icon-192.png">
-
-    <link rel="stylesheet" href="assets/css/tokens.css">
-    <link rel="stylesheet" href="assets/css/base.css">
-    <link rel="stylesheet" href="assets/css/components.css">
-    <link rel="stylesheet" href="assets/css/shell.css">
-    <link rel="stylesheet" href="assets/css/modules.css">
-
-    <!--
-      The theme is applied before the stylesheets finish and before any module
-      loads. Without this the app paints light, then repaints dark a moment
-      later, which looks broken on every reload for anyone using dark mode.
-      It is inline and tiny for exactly that reason.
-    -->
-    <script>
-        (function () {
-            try {
-                var stored = JSON.parse(localStorage.getItem('natyam.session') || '{}');
-                var prefs = stored.prefs || {};
-                var theme = prefs.theme || 'light';
-                if (theme === 'system') {
-                    theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-                }
-                document.documentElement.dataset.theme = theme;
-                document.documentElement.dataset.density = prefs.density || 'comfortable';
-            } catch (e) { /* defaults in the markup are already correct */ }
-        })();
-    </script>
-</head>
-<body>
-    <div id="app"></div>
-
-    <div id="boot" class="boot">
-        <div class="boot-mark" aria-hidden="true">॥</div>
-        <p class="boot-text">NATYAM – School of Kuchipudi</p>
-    </div>
-
-    <noscript>
-        <div class="fatal">
-            <h1>JavaScript is required</h1>
-            <p>
-                NATYAM keeps all of the school’s records inside this browser and needs
-                JavaScript to read them. Please enable it and reload the page.
-            </p>
-        </div>
-    </noscript>
-
-    <script type="module" src="js/app.js"></script>
-</body>
-</html>
+{
+    "name": "NATYAM — School of Kuchipudi",
+    "short_name": "NATYAM",
+    "description": "Admissions, attendance, fees, finance and certificates for a Kuchipudi dance school. Works entirely offline.",
+    "start_url": "./index.html",
+    "scope": "./",
+    "display": "standalone",
+    "orientation": "any",
+    "background_color": "#f7f6f3",
+    "theme_color": "#2f2a6b",
+    "categories": ["education", "productivity", "business"],
+    "icons": [
+        { "src": "assets/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+        { "src": "assets/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+        { "src": "assets/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+        { "src": "assets/icons/icon-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    ],
+    "shortcuts": [
+        { "name": "Mark attendance", "url": "./index.html#/attendance" },
+        { "name": "Record a payment", "url": "./index.html#/fees" },
+        { "name": "New application", "url": "./index.html#/admissions" }
+    ]
+}

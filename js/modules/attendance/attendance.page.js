@@ -31,10 +31,10 @@ import {
 import { listBatches } from '../../services/batches.service.js';
 
 const MARKS = [
-    { value: ATTENDANCE_STATUS.PRESENT, label: 'Present', short: 'P', tone: 'success' },
-    { value: ATTENDANCE_STATUS.ABSENT, label: 'Absent', short: 'A', tone: 'danger' },
-    { value: ATTENDANCE_STATUS.LATE, label: 'Late', short: 'L', tone: 'warning' },
-    { value: ATTENDANCE_STATUS.EXCUSED, label: 'Excused', short: 'E', tone: 'info' }
+    { value: ATTENDANCE_STATUS.PRESENT, label: 'Present', short: 'P', tone: 'positive' },
+    { value: ATTENDANCE_STATUS.ABSENT, label: 'Absent', short: 'A', tone: 'negative' },
+    { value: ATTENDANCE_STATUS.LATE, label: 'Late', short: 'L', tone: 'caution' },
+    { value: ATTENDANCE_STATUS.EXCUSED, label: 'Excused', short: 'E', tone: 'neutral' }
 ];
 
 export default class AttendancePage extends Page {

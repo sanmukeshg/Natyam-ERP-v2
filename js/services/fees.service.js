@@ -18,10 +18,9 @@ import { bus, EVENTS } from '../core/bus.js';
 import { session } from '../core/session.js';
 import { uid, sequenceNumber } from '../utils/id.js';
 import { localDate, nowISO, addDays, monthKey, academicYearOf } from '../utils/date.js';
-import { splitInstalments } from '../utils/money.js';
 import { auditRow } from './audit.service.js';
 import {
-    INVOICE_STATUS, PAYMENT_STATUS, PAYMENT_MODES
+    INVOICE_STATUS, PAYMENT_STATUS, PAYMENT_MODES, feeFrequency
 } from '../config/app.config.js';
 import {
     invoices$, payments$, students$, feePlans$, settings$
@@ -84,13 +83,18 @@ export async function raiseSchedule(studentId, { feePlanId = null, startDate = n
     }
 
     const from = startDate || student.joinedOn || localDate();
-    const parts = splitInstalments(plan.annualAmount, plan.instalments);
-    const gap = Math.round(365 / plan.instalments);
+    // Cadence comes from the frequency table, so adding a future frequency is a
+    // data change rather than a rewrite of this generator.
+    const cadence = feeFrequency(plan.frequency);
+    const periods = cadence.periodsPerYear;
+    const perPeriod = Number(plan.amount) || 0;
 
-    const lines = parts.map((amount, index) => ({
-        amount,
-        description: `${plan.name} — instalment ${index + 1} of ${plan.instalments}`,
-        dueDate: index === 0 ? from : addDays(from, index * gap)
+    const lines = Array.from({ length: periods }, (_, index) => ({
+        amount: perPeriod,
+        description: periods > 1
+            ? `${plan.name} — ${cadence.label.toLowerCase()} fee ${index + 1} of ${periods}`
+            : `${plan.name} — ${cadence.label.toLowerCase()} fee`,
+        dueDate: index === 0 ? from : addDays(from, index * cadence.dayGap)
     }));
 
     if (includeExtras && plan.registrationFee > 0 && !existing.length) {

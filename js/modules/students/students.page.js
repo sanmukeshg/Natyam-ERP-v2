@@ -36,7 +36,8 @@ import {
     levels as LEVELS
 } from '../../services/students.service.js';
 import { listBatches } from '../../services/batches.service.js';
-import { listFeePlans } from '../../services/settings.service.js';
+import { listFeePlans, listBranches } from '../../services/settings.service.js';
+import { listCurricula } from '../../services/curriculum.service.js';
 import { historyOf, describe as describeAudit } from '../../services/audit.service.js';
 import { requestLeave } from '../../services/attendance.service.js';
 
@@ -170,6 +171,22 @@ export default class StudentsPage extends Page {
     bind() {
         this.onDispose(on(this.container, 'click', '[data-action="new"]', () => this.newStudent()));
         this.onDispose(on(this.container, 'click', '[data-action="contact-sheet"]', () => this.exportContacts()));
+        // Row actions. The table suppresses row-click for anything inside a
+        // button, so these never open the profile by accident.
+        this.onDispose(on(this.container, 'click', '[data-student-act]', async (event, target) => {
+            event.stopPropagation();
+            const id = target.dataset.id;
+            const act = target.dataset.studentAct;
+            try {
+                if (act === 'view') return await this.openProfile(id);
+                const { student } = await profile(id);
+                if (act === 'edit') return await this.editStudent(student);
+                if (act === 'archive') return await this.archiveStudent(student);
+                if (act === 'restore') return await this.profileAction('restore', student);
+            } catch (err) {
+                toast.error(err.message);
+            }
+        }));
         this.onDispose(on(this.container, 'change', '[data-filter]', (_e, target) => {
             this.filters[target.dataset.filter] = target.value;
             this.load();
@@ -254,6 +271,28 @@ export default class StudentsPage extends Page {
                     key: 'status', label: 'Status', sortable: true,
                     render: (row) => html`<span class="badge ${STATUS_BADGE[row.status] || 'badge-neutral'}">
                         ${String(row.status).replace(/_/g, ' ')}</span>`
+                },
+                {
+                    // The profile drawer still holds the full set of operations,
+                    // but View / Edit / Archive were reachable only by knowing
+                    // to click the row and then a second "Actions" button. The
+                    // three everyday actions now sit on the row itself.
+                    key: 'rowActions', label: '', align: 'right', sortable: false,
+                    render: (row) => html`
+                        <span class="row-actions">
+                            <button class="btn btn-sm btn-ghost" data-student-act="view" data-id="${row.id}"
+                                    title="View profile" aria-label="View ${row.name}">View</button>
+                            ${canEdit ? html`
+                                <button class="btn btn-sm btn-ghost" data-student-act="edit" data-id="${row.id}"
+                                        title="Edit details" aria-label="Edit ${row.name}">Edit</button>
+                                ${row.deletedAt
+                                    ? html`<button class="btn btn-sm btn-ghost" data-student-act="restore" data-id="${row.id}"
+                                                   title="Restore student" aria-label="Restore ${row.name}">Restore</button>`
+                                    : html`<button class="btn btn-sm btn-danger-quiet" data-student-act="archive" data-id="${row.id}"
+                                                   title="Archive student" aria-label="Archive ${row.name}">Archive</button>`}
+                            ` : ''}
+                        </span>
+                    `
                 }
             ],
             bulkActions: canEdit ? [
@@ -292,12 +331,23 @@ export default class StudentsPage extends Page {
     /* ------------------------------------------------------------ ADD / EDIT */
 
     async studentFields(existing = null) {
-        const [batches, plans] = await Promise.all([
+        const [batches, plans, curricula, branches] = await Promise.all([
             listBatches(session.branch()),
-            listFeePlans()
+            listFeePlans(),
+            listCurricula({ includeInactive: false }),
+            listBranches()
         ]);
 
         const open = batches.filter((b) => b.status !== 'closed');
+
+        // Every student must belong to a branch — the repository enforces it.
+        // A student created against a batch inherits that batch's branch, but a
+        // student without a batch had no way to supply one, so the save was
+        // rejected with no field to correct. Default to the branch in view, or
+        // the only branch when the school has one.
+        const defaultBranchId = existing?.branchId
+            || session.branch()
+            || (branches.length === 1 ? branches[0].id : '');
 
         return [
             { name: 'name', label: 'Full name', required: true, width: 'half', value: existing?.name, autofocus: true },
@@ -309,6 +359,12 @@ export default class StudentsPage extends Page {
                     { value: 'male', label: 'Male' },
                     { value: 'other', label: 'Other' }
                 ]
+            },
+            {
+                name: 'branchId', label: 'Branch', type: 'select', required: true, width: 'half',
+                value: defaultBranchId,
+                options: optionsFrom(branches, { label: (b) => b.name }),
+                hint: branches.length > 1 ? 'Which branch this student attends.' : null
             },
             {
                 name: 'level', label: 'Level', type: 'select', required: true, width: 'half',
@@ -328,7 +384,13 @@ export default class StudentsPage extends Page {
             },
             {
                 name: 'feePlanId', label: 'Fee plan', type: 'select', width: 'half', value: existing?.feePlanId,
-                options: optionsFrom(plans, { label: (p) => p.name, note: (p) => formatMoney(p.annualAmount) })
+                options: optionsFrom(plans, { label: (p) => p.name, note: (p) => `${formatMoney(p.amount)}/month` })
+            },
+            {
+                name: 'curriculumId', label: 'Curriculum', type: 'select', width: 'half', value: existing?.curriculumId,
+                placeholder: 'Assign later',
+                options: optionsFrom(curricula, { label: (c) => c.name, note: (c) => c.code }),
+                hint: 'The course of study. Independent of the batch — a student can follow any curriculum.'
             },
             { name: 'joinedOn', label: 'Joined on', type: 'date', width: 'half', value: existing?.joinedOn || localDate() },
 
@@ -370,7 +432,7 @@ export default class StudentsPage extends Page {
 
         toast.success(`${result.student.name} is on the roll.`);
         if (result.billing?.invoices?.length) {
-            toast.info(`${result.billing.invoices.length} fee instalments raised.`);
+            toast.info(`${result.billing.invoices.length} monthly fees raised.`);
         }
         await this.load();
         this.openProfile(result.student.id);
@@ -715,6 +777,7 @@ export default class StudentsPage extends Page {
                     ['Admission number', s.admissionNo],
                     ['Level', data.level?.label],
                     ['Batch', data.batch ? `${data.batch.name}` : 'Not placed'],
+                    ['Curriculum', data.curriculum ? data.curriculum.name : 'Not assigned'],
                     ['Status', String(s.status).replace(/_/g, ' ')],
                     ['Joined', s.joinedOn ? formatDateLong(s.joinedOn) : null],
                     ['Date of birth', s.dateOfBirth ? `${formatDate(s.dateOfBirth)} (${data.age})` : null],

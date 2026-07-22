@@ -23,7 +23,7 @@ import { localDate, nowISO, academicYearOf, ageFrom, daysBetween, addDays } from
 import { STUDENT_STATUS, LEVELS, INVOICE_STATUS, levelLabel } from '../config/app.config.js';
 import {
     students$, batches$, invoices$, payments$, attendance$, certificates$,
-    documents$, programs$, settings$, AttendanceMath
+    documents$, programs$, settings$, curricula$, AttendanceMath
 } from '../data/repositories.js';
 import { studentFeeSummary, raiseSchedule } from './fees.service.js';
 
@@ -219,13 +219,14 @@ export async function restore(studentId) {
 export async function profile(studentId) {
     const student = await students$.findOrFail(studentId);
 
-    const [batch, fees, attendanceRows, certs, docs, allPrograms] = await Promise.all([
+    const [batch, fees, attendanceRows, certs, docs, allPrograms, curriculum] = await Promise.all([
         student.batchId ? batches$.find(student.batchId) : null,
         studentFeeSummary(studentId),
         attendance$.forStudent(studentId),
         certificates$.forStudent(studentId),
         documents$.forOwner(studentId),
-        programs$.all()
+        programs$.all(),
+        student.curriculumId ? curricula$.find(student.curriculumId) : null
     ]);
 
     const since90 = addDays(localDate(), -90);
@@ -237,6 +238,7 @@ export async function profile(studentId) {
         age: student.dateOfBirth ? ageFrom(student.dateOfBirth) : null,
         tenureDays: student.joinedOn ? daysBetween(student.joinedOn, localDate()) : 0,
         level: LEVELS.find((l) => l.value === student.level) || null,
+        curriculum: curriculum && !curriculum.deletedAt ? curriculum : null,
         guardian: guardianOf(student),
         fees,
         attendance: {
@@ -485,6 +487,9 @@ function normalise(data) {
     const out = { ...data };
     if (out.name) out.name = String(out.name).trim().replace(/\s+/g, ' ');
     if (out.guardianEmail) out.guardianEmail = String(out.guardianEmail).trim().toLowerCase();
+    // Curriculum assignment is optional and independent of the batch. An empty
+    // selection clears it rather than storing a blank string.
+    if ('curriculumId' in out) out.curriculumId = out.curriculumId || null;
     return out;
 }
 

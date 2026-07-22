@@ -14,7 +14,7 @@
  * and that should be said plainly rather than implied by a lock icon.
  */
 
-import { ROLES, PREFERENCE_DEFAULTS } from '../config/app.config.js';
+import { roleCapabilities, roleLabel as resolveRoleLabel, PREFERENCE_DEFAULTS } from '../config/app.config.js';
 import { bus, EVENTS } from './bus.js';
 
 const STORAGE_KEY = 'natyam.session';
@@ -36,7 +36,7 @@ class Session {
         const candidate = activeBranchId || remembered || this.branches[0]?.id || null;
         this.activeBranchId = this.branches.some((b) => b.id === candidate) ? candidate : (this.branches[0]?.id || null);
 
-        this._capabilities = new Set(ROLES[user?.role]?.capabilities || []);
+        this._capabilities = new Set(roleCapabilities(user?.role));
         this._persist();
     }
 
@@ -45,7 +45,7 @@ class Session {
     actorId()   { return this.user?.id || 'system'; }
     actorName() { return this.user?.name || 'System'; }
     role()      { return this.user?.role || 'owner'; }
-    roleLabel() { return ROLES[this.role()]?.label || 'User'; }
+    roleLabel() { return resolveRoleLabel(this.role()) || 'User'; }
 
     /* ----------------------------------------------------------- CAPABILITY */
 

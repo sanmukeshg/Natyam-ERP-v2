@@ -268,7 +268,7 @@ export default class AdmissionsPage extends Page {
         const branchOptions = optionsFrom(this.reference.branches, { label: (b) => b.name });
         const planOptions = optionsFrom(this.reference.plans, {
             label: (p) => p.name,
-            note: (p) => formatMoney(p.annualAmount)
+            note: (p) => `${formatMoney(p.amount)}/month`
         });
 
         const step = (key, config) => ({
@@ -423,7 +423,7 @@ export default class AdmissionsPage extends Page {
                             ['Phone', data.guardianPhone],
                             ['Branch', branch?.name],
                             ['Level', LEVELS.find((l) => l.value === data.level)?.label],
-                            ['Fee plan', plan ? `${plan.name} — ${formatMoney(plan.annualAmount)}` : null],
+                            ['Fee plan', plan ? `${plan.name} — ${formatMoney(plan.amount)}/month` : null],
                             ['Previous training', data.priorExperience],
                             ['Medical', data.medicalNotes]
                         ])}
@@ -687,7 +687,7 @@ export default class AdmissionsPage extends Page {
                 {
                     name: 'feePlanId', label: 'Fee plan', type: 'select', value: row.feePlanId,
                     options: optionsFrom(this.reference.plans, {
-                        label: (p) => p.name, note: (p) => formatMoney(p.annualAmount)
+                        label: (p) => p.name, note: (p) => `${formatMoney(p.amount)}/month`
                     })
                 },
                 { name: 'joinedOn', label: 'Joining date', type: 'date', value: localDate(), width: 'half' },
@@ -703,7 +703,7 @@ export default class AdmissionsPage extends Page {
             toast.warning(`The student is enrolled, but fees were not raised: ${result.billingError}. `
                 + 'Raise them from the fee screen.');
         } else if (result.billing?.invoices?.length) {
-            toast.info(`${result.billing.invoices.length} instalments raised.`);
+            toast.info(`${result.billing.invoices.length} monthly fees raised.`);
         }
 
         await this.load();

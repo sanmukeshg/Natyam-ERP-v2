@@ -9,14 +9,18 @@
  *   2. Open the database and run migrations.
  *   3. Seed if empty, so a fresh install is a working school rather than a
  *      set of empty tables with no way in.
- *   4. Hydrate the session — who is using this, which branches exist.
- *   5. Mount the shell and router, and show the first screen.
- *   6. *Then* run maintenance: sweeping overdue invoices and recomputing
+ *   4. Apply any school-defined structural overrides (curriculum ladder, role
+ *      matrix) into the resolution seam, before the session hydrates, so
+ *      capability gating already reflects a customised matrix. A no-op until an
+ *      editor writes one.
+ *   5. Hydrate the session — who is using this, which branches exist.
+ *   6. Mount the shell and router, and show the first screen.
+ *   7. *Then* run maintenance: sweeping overdue invoices and recomputing
  *      alerts. These are deliberately last and deliberately not awaited by
  *      the render path; the school should see its dashboard immediately, not
  *      wait on a sweep of last term's invoices.
  *
- * Anything that fails during 2–4 is fatal and gets an honest screen with the
+ * Anything that fails during 2–5 is fatal and gets an honest screen with the
  * actual error, because "something went wrong" in an offline app with no
  * telemetry leaves the user with nothing to tell anyone.
  */
@@ -30,6 +34,7 @@ import { Shell, applyTheme, applyDensity } from './ui/shell.js';
 import { commandPalette } from './ui/palette.js';
 import { toast } from './ui/toast.js';
 import { seedIfEmpty } from './data/seed.js';
+import { applyStructuralOverrides } from './services/settings.service.js';
 import { branches$, drafts$, notifications$ } from './data/repositories.js';
 import { sweepOverdue } from './services/fees.service.js';
 import { refreshAlerts } from './services/notifications.service.js';
@@ -42,6 +47,7 @@ async function boot() {
     try {
         await db.open();
         await seedIfEmpty();
+        await applyStructuralOverrides();   // installs any edited curriculum/roles; a no-op until one exists
         await hydrateSession();
     } catch (err) {
         console.error('Start-up failed', err);

@@ -72,11 +72,15 @@ export function field(config) {
     }
 
     if (type === 'checkbox' || type === 'switch') {
+        const controlBox = type === 'switch'
+            ? html`<span class="switch-track" aria-hidden="true"></span>`
+            : html`<span class="check-box" aria-hidden="true"></span>`;
         return html`
             <div class="field" data-width="${config.width || 'full'}">
                 <label class="${type === 'switch' ? 'switch' : 'check'}">
                     <input type="checkbox" name="${name}" id="${id}"
                            ${value ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+                    ${controlBox}
                     <span>${label}</span>
                 </label>
                 ${hint ? html`<p class="field-hint" id="${id}-hint">${hint}</p>` : ''}
@@ -100,6 +104,7 @@ export function field(config) {
                                    ${selected.has(String(option.value)) ? 'checked' : ''}
                                    ${option.disabled ? 'disabled' : ''}
                                    ${autofocus && index === 0 ? 'autofocus' : ''}>
+                            <span class="check-box" aria-hidden="true"></span>
                             <span>${option.label}</span>
                         </label>
                     `)}
@@ -121,6 +126,7 @@ export function field(config) {
                                    ${String(value) === String(option.value) ? 'checked' : ''}
                                    ${option.disabled ? 'disabled' : ''}
                                    ${autofocus && index === 0 ? 'autofocus' : ''}>
+                            <span class="check-box check-radio" aria-hidden="true"></span>
                             <span>${option.label}</span>
                         </label>
                     `)}
